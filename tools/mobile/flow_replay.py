@@ -1,7 +1,7 @@
 """Auto-replay in the explore lane: the server drives a learned flow, the model steps in.
 
 Called by ``explore_runner.next_turn`` after the screen is observed. When the screen
-matches the first step of a saved flow (or the step a replay stopped waiting at), the
+matches a step of a saved flow (or the step a replay stopped waiting at), the
 flow runs on its own, each step checked against the screen recorded for it. On any
 divergence it stops and the model gets the screen it is really on, plus a note saying
 which step was reached and why the replay ended. Never raises.
@@ -10,6 +10,7 @@ which step was reached and why the replay ended. Never raises.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, NamedTuple
 
 from tools.mobile import (
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 #: Flows chained in one turn (packets of one goal follow each other).
 MAX_CHAIN = 4
+#: Seconds one turn may spend replaying chained flows before the model takes over.
+MAX_CHAIN_SECONDS = 120.0
 #: Longest trace carried to the next submit.
 MAX_TRACE = 40
 
@@ -54,8 +57,7 @@ def _resume(body: dict, key: str, package: str) -> tuple:
         pos = int(last.get("pos") or 0)
         if got and flow_replay_match.starts(got, key, pos):
             return name, got, pos
-    name, got = flow_replay_match.pick(package, key, last.get("done") or ())
-    return name, got, 0
+    return flow_replay_match.pick(package, key, last.get("done") or ())
 
 
 def _note(head: tuple, walk: flow_replay_run.Walk) -> str:
@@ -106,9 +108,10 @@ async def run(run_id: str, ctx: Any, auto: Auto) -> Auto:
         auto.body.pop("auto_trace", None)
         if isinstance(auto.body.get("auto_replay"), dict):
             auto.body["auto_replay"]["note"] = ""
+        deadline = time.monotonic() + MAX_CHAIN_SECONDS
         for _ in range(MAX_CHAIN):
             auto, stop = await _one(run_id, ctx, auto)
-            if stop:
+            if stop or time.monotonic() > deadline:
                 break
     except Exception:
         logger.exception("flow replay failed")

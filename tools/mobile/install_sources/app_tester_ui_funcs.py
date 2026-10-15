@@ -8,6 +8,7 @@ from tools.device_manager import valid_package_name
 from tools.mobile.app_info import AppVersion
 from tools.mobile.install_errors import code_from_dialog_text, explain, to_outcome
 from tools.mobile.install_source import InstallOutcome, InstallRequest, Release
+from tools.mobile.install_sources import app_tester_ui_memory as memory
 from tools.mobile.install_sources.app_tester_ui_consts import (
     _PROGRESS_STARTS,
     _VERSION_RE,
@@ -52,6 +53,8 @@ def _already_current(
     before: Optional[AppVersion], request: InstallRequest
 ) -> Optional[InstallOutcome]:
     target = request.target_version_code
+    if target is None and request.latest:  # the newest build the page last listed
+        target = memory.known_latest(request.serial, request.package)
     code = before.version_code if before else None
     if target is None or code is None or code < target:
         return None

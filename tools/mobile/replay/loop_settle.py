@@ -12,6 +12,7 @@ from tools.mobile.replay.guard import _confirmed
 from tools.mobile.replay.settle import SettleJob, SettleOpts, _settle
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
 from tools.mobile.replay.verdicts import Landing, _brought_to_front
+from tools.mobile.replay.waits_spec import _wait_spec
 
 
 class Acted(NamedTuple):
@@ -57,13 +58,25 @@ def _extra_expected(step: _Step) -> tuple:
     return (package,) if step.op == "launch" else ()
 
 
-def _device_opts(step: _Step, front: bool) -> SettleOpts:
+def _before_change_wait(run: _ReplayRun, step: _Step) -> bool:
+    """True when the script's very next op waits for the screen to change."""
+    at = int((getattr(step, "entry", None) or {}).get("index", -1)) + 1
+    if not 0 < at < len(run.items):
+        return False
+    nxt = run.items[at]
+    if str(getattr(nxt, "op", "") or "") not in actions_mod.WAIT_OPS:
+        return False
+    return _wait_spec(nxt, run.items)[0] == "changed"
+
+
+def _device_opts(run: _ReplayRun, step: _Step, front: bool) -> SettleOpts:
     """The settle options of a device action; a front landing skips the redump."""
     return SettleOpts(
         redump=not front,
         mark_no_change=True,
         op=step.op,
         extra_expected=_extra_expected(step),
+        before_change_wait=_before_change_wait(run, step),
     )
 
 
@@ -79,7 +92,7 @@ async def _settle_device(
         step_timing.mark("dump_skipped")
     if step.op in actions_mod.MUTATING_OPS:
         job = SettleJob(run.ctx, entry, run.trace, entry["index"])
-        screen, stop = await _settle(job, screen, _device_opts(step, front))
+        screen, stop = await _settle(job, screen, _device_opts(run, step, front))
         if stop is not None:
             return screen, _reply(stop)
     _close(run, StepAt(entry["index"], entry, screen))

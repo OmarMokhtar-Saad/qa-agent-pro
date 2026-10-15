@@ -14,7 +14,7 @@ from tools.mobile.replay.dump import _dump, _focus_probe
 from tools.mobile.replay.screen import _screen_hash
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_poll import _wait_deadline
-from tools.mobile.replay.waits_prior import already_changed
+from tools.mobile.replay.waits_prior import _spinning, already_changed
 from tools.mobile.replay.waits_spec import _secs
 from tools.mobile.replay.waits_types import AfterWait
 
@@ -32,6 +32,20 @@ async def _focus_moved(serial: str, before_focus: str, deadline: float) -> bool:
     """True when the focused window is a known one different from *before_focus*."""
     focus = await _focus_probe(serial, deadline - time.monotonic())
     return bool(focus and focus != before_focus)
+
+
+async def _change_reusable(ctx: Context, screen: object, focus: tuple) -> bool:
+    """True when a poll's changed screen may stand for the post-wait screen.
+
+    It must be no spinner (a transient state) and the focused window, probed
+    AFTER the read, must still be the one the wait started on: the app did not
+    move under the dump, so the settle need not dump the same screen again.
+    """
+    before_focus, deadline = focus
+    if not before_focus or _spinning(screen):
+        return False
+    now = await _focus_probe(ctx.serial, deadline - time.monotonic())
+    return now == before_focus
 
 
 async def _changed_poll(ctx: Context, deadline: float) -> tuple:
@@ -81,7 +95,9 @@ async def _changed_poll(ctx: Context, deadline: float) -> tuple:
 # byte-identical -- which made this loop blind to the one event it exists to
 # catch. ``_settle`` was moved to the hash for the same reason.
 #
-# ``reusable`` is True in ONE case only: the screen never changed and the wait
+# ``reusable`` is also True for a change a poll SAW when it is no spinner and the
+# focus, probed after the read, is still the one the wait started on.
+# Otherwise it is True in ONE case only: the screen never changed and the wait
 # ended on a poll whose dump SUCCEEDED, so that dump is the post-wait screen and
 # the caller's settle skips its own (``redump=not reusable``). Every early
 # return is ``reusable=False``. That screen can be up to one :data:`WAIT_POLL_S`
@@ -106,7 +122,7 @@ async def _wait_until_changed(ctx: Context, screen: object, ms: int) -> tuple:
         return screen, True, True
     deadline = _wait_deadline(ctx, _capped_ms(ctx, ms) / 1000.0)
     before_focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
-    current, fresh = screen, False
+    current, fresh, focus = screen, False, (before_focus, deadline)
     ticker = watch.Ticker("waiting for the screen to change")
     while time.monotonic() < deadline:
         await ticker.tick()
@@ -117,7 +133,7 @@ async def _wait_until_changed(ctx: Context, screen: object, ms: int) -> tuple:
             return current, False, fresh and kind == "cut"
         current, fresh = content, True
         if _screen_hash(current) != before:
-            return current, True, False
+            return current, True, await _change_reusable(ctx, current, focus)
     return current, False, fresh
 
 

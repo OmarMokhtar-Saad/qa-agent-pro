@@ -56,6 +56,8 @@ class _Run:
     offsets: dict = field(default_factory=dict)
     #: current offset (scrolls) from the screen the scan started on.
     pos: int = 0
+    #: scroll offset of the proven list top (None when not proven).
+    top_pos: Optional[int] = None
     #: one (direction, rows seen, new rows, offset) entry per scroll made.
     scrolls: list = field(default_factory=list)
 
@@ -74,6 +76,10 @@ class Seen(NamedTuple):
 class _Flow(Protocol):
     _sleep: SleepFn
     _ui_factory: UiFactory
+    _staged: Any
+    _versions: VersionFn
+
+    async def _scan_and_stage(self, run: _Run, xml: str, firebase_id: str) -> Any: ...
 
     async def _own_app(self, run: _Run) -> Optional[InstallOutcome]: ...
 

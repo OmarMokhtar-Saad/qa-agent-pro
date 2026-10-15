@@ -1,8 +1,8 @@
 """Auto-replay: which saved flow fits the screen in front, and what each step needs.
 
 Pure reads of the app's saved flows. A flow matches when the screen key (sk2) of one
-of its steps equals the live screen's: its first step on a fresh run, or the step a
-stopped replay was waiting at. Never raises.
+of its steps equals the live screen's: any step on a fresh run (the flow resumes
+there), or the step a stopped replay was waiting at. Never raises.
 """
 
 from __future__ import annotations
@@ -48,24 +48,33 @@ def starts(template: dict, key: str, at: int) -> bool:
     return at < len(before) and bool(key) and before[at] == key
 
 
+def _first_at(template: dict, key: str) -> int:
+    """The earliest step whose recorded screen is *key*, or ``-1``."""
+    before = (template.get("meta") or {}).get("before") or []
+    return before.index(key) if key and key in before else -1
+
+
 def _rank(item: tuple) -> tuple:
-    template = item[1]
+    name, template, at = item
     reached = bool((template.get("meta") or {}).get("reached"))
-    return (reached, len(template.get("steps") or []))
+    return (reached, len(template.get("steps") or []) - at, -at)
 
 
 def pick(package: str, key: str, skip: Any = ()) -> tuple:
-    """``(name, template)`` of the best flow starting on *key*, else ``("", {})``.
+    """``(name, template, step)`` of the best flow passing *key*, else ``("", {}, 0)``.
 
-    A flow that reaches the goal beats one that does not, then the longer beats the
-    shorter. Names in *skip* (already replayed this run) are never offered again.
+    The flow may reach the live screen at any step, not only its first (a one-time
+    first-launch screen is skipped on the next run). A flow that reaches the goal
+    beats one that does not, then the longer remaining suffix, then the earlier step.
+    Names in *skip* (already replayed this run) are never offered again.
     """
+    skipped = set(skip)
     fits = [
-        item
-        for item in _templates(package)
-        if item[0] not in set(skip) and starts(item[1], key, 0)
+        (name, template, at)
+        for name, template in _templates(package)
+        if name not in skipped and (at := _first_at(template, key)) >= 0
     ]
-    return max(fits, key=_rank) if fits else ("", {})
+    return max(fits, key=_rank) if fits else ("", {}, 0)
 
 
 def needed(step: dict) -> str:

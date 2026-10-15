@@ -97,7 +97,8 @@ async def _settle_unchanged(job: SettleJob, screen: Any, opts: SettleOpts) -> tu
     # AUTO-SETTLE only on a read this call took itself: a skipped redump
     # (`launch` brought to front) already decided nothing moved, and a wait's
     # own poll (`mark_no_change=False`) is its own settle.
-    skip = str(opts.op or "") in NO_AUTO_SETTLE_OPS
+    # A script whose next op waits for the screen to change observes it anyway.
+    skip = str(opts.op or "") in NO_AUTO_SETTLE_OPS or opts.before_change_wait
     if unchanged and opts.redump and before.content_hash and not skip:
         read = await _auto_settle(job.ctx, screen, before.content_hash)
         _stamp_after(job.entry, read)

@@ -8,6 +8,8 @@ from tools.mobile import adb as mobile_adb
 from tools.mobile import app_alias, app_stage_pick, resolve_cache, run_store
 from tools.mobile.install_source import InstallOutcome, InstallRequest
 from tools.mobile.install_sources.app_tester_ui import AppTesterUiSource
+from tools.mobile.install_sources.app_tester_ui_funcs import _label_required
+from tools.mobile.install_sources.app_tester_ui_memory import parse_app_id
 from tools.mobile.install_sources.app_tester_ui_pick import ListedApp
 from tools.mobile.render_install import (
     APP_TESTER_HINT,
@@ -18,6 +20,11 @@ from tools.mobile.render_install import (
 _INSTALLING = (
     "Installing the app through App Tester: its Download button, then the "
     "system installer."
+)
+
+_ALREADY_LATEST = (
+    "The installed app already is the latest build App Tester listed: nothing to "
+    "download."
 )
 
 
@@ -49,6 +56,9 @@ async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
     """Find the app's row, then Download and install it: ``("", package)`` once
     the installed version is confirmed, else the outcome message."""
     source = AppTesterUiSource()
+    if want.package and await source.is_latest(call.serial, want.package):
+        await _common.emit(call.progress, _ALREADY_LATEST)
+        return "", want.package
     ask = _mobile_ask(call.choose)
     bundle = await source.find_listed_app(want, ask)
     if isinstance(bundle, InstallOutcome):
@@ -81,8 +91,10 @@ async def app_tester_stage(call: _AppCall, target: str) -> tuple:
     tester = await installed_tester(call.serial)
     if not tester:
         return await _open_tester_store(call.serial), target
-    label = call.value or target
+    label = "" if parse_app_id(call.value) else call.value or target
     known = await known_package(call.serial, label)
+    if not label and not known:  # nothing names the app: ask before any launch
+        return _failed(_label_required()), ""
     link = call.source_text
     want = ListedApp(call.serial, label, tester, known, link)
     return await _install_listed(call, want)

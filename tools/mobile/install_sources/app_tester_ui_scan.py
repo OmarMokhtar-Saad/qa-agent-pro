@@ -60,6 +60,10 @@ class _Scan:
     def found(self) -> bool:
         return any(row.bundle == self.run.request.package for row in self.rows)
 
+    def past_read(self) -> bool:
+        """True when the scan is below every offset read so far (not a rescan)."""
+        return self.pos > max(self.run.offsets.values(), default=-1)
+
     def alive(self, steps: int, extra: int = 0) -> bool:
         return steps < MAX_LISTING_SCROLLS + extra and time.monotonic() < self.deadline
 
@@ -82,6 +86,9 @@ class _Scan:
                 return
             if rows != prev:  # moved (also over rows already read: a rescan)
                 self.pos += 1
+                if not fresh and self.past_read():  # nothing new below: the end
+                    self.end = True
+                    return
             elif await settled_rows(self.run.ui) == rows:
                 self.end = True
                 return
@@ -113,13 +120,12 @@ class _Scan:
         self.note(rows, pages, below=True)
         self.pos = pages
 
-    def remember(self) -> None:
-        """Keep the page the package was found at (from the proven top)."""
-        run, at = self.run, self.run.offsets.get(self.run.request.package)
-        if at is not None and self.top_pos is not None and self.found():
-            memory.remember_page(
-                run.request.serial, run.request.package, at - self.top_pos
-            )
+
+def remember_row(run: _Run, bundle: str) -> None:
+    """Keep the page *bundle*'s row was read at (counted from the proven top)."""
+    at = run.offsets.get(bundle)
+    if at is not None and run.top_pos is not None:
+        memory.remember_page(run.request.serial, bundle, at - run.top_pos)
 
 
 async def _try_cached(scan: _Scan) -> None:
@@ -150,5 +156,5 @@ async def scan_listing(run: _Run, xml: str) -> tuple:
     if not scan.found() and not scan.top:
         await scan.up()
     run.pos = scan.pos
-    scan.remember()
+    run.top_pos = scan.top_pos
     return scan.rows, scan.found() or (scan.end and scan.top)

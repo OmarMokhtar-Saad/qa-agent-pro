@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional, cast
 
 from tools.mobile.install_source import InstallOutcome, release_candidates
+from tools.mobile.install_sources import app_tester_ui_memory as memory
 from tools.mobile.install_sources.app_tester_ui_consts import (
     ACTION_LABELS,
     APP_TESTER_POLL_S,
@@ -21,10 +22,19 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
 from tools.mobile.resolve import PickOpts, decide, resolve_or_ask
 
 
+def _note_latest(run: _Run, texts) -> None:
+    """Remember the newest build the page lists (read once, before any tap)."""
+    codes = [rel.version_code for rel in parse_releases(texts) if rel.version_code]
+    if codes:
+        memory.remember_latest(run.request.serial, run.request.package, max(codes))
+
+
 class _DetailMixin:
     """The app-page steps of the flow."""
 
     async def _detail(self: _Flow, run: _Run, texts) -> Optional[InstallOutcome]:
+        if not run.tapped:
+            _note_latest(run, texts)
         if not (run.release_done or run.tapped or run.request.latest):
             releases = parse_releases(texts)
             if len(releases) > 1:

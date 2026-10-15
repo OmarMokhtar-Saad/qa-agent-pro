@@ -22,7 +22,7 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
 )
 from tools.mobile.install_sources.app_tester_ui_link import open_by_link
 from tools.mobile.install_sources.app_tester_ui_rows import is_listing, matching_rows
-from tools.mobile.install_sources.app_tester_ui_scan import scan_listing
+from tools.mobile.install_sources.app_tester_ui_scan import remember_row, scan_listing
 from tools.mobile.resolve import Candidate, PickOpts, resolve_or_ask
 from tools.untrusted import wrap_untrusted
 
@@ -49,13 +49,10 @@ class _CardMixin:
         listing = await _to_listing(run, xml, self._sleep)
         if listing is None:
             return _not_on_list()
-        rows, whole = await scan_listing(run, listing)
-        label = run.request.app_label.strip()
-        hits = matching_rows(label, rows) if label else []
-        listed = any(row.bundle == run.request.package for row in rows)
-        if listed and len(hits) < 2:
-            return run.request.package
-        return await _pick_by_label(run, label, (hits, rows, whole))
+        picked = await _choose_row(run, await scan_listing(run, listing))
+        if isinstance(picked, str):
+            remember_row(run, picked)
+        return picked
 
     async def _tap_card(
         self: _Flow, run: _Run, text: str, scroll_back: bool = False
@@ -71,6 +68,16 @@ class _CardMixin:
         run.card_tapped = True
         await _wait_left_listing(run, self._sleep)
         return None
+
+
+async def _choose_row(run: _Run, scanned: tuple) -> Union[str, InstallOutcome]:
+    rows, whole = scanned
+    label = run.request.app_label.strip()
+    hits = matching_rows(label, rows) if label else []
+    listed = any(row.bundle == run.request.package for row in rows)
+    if listed and len(hits) < 2:
+        return run.request.package
+    return await _pick_by_label(run, label, (hits, rows, whole))
 
 
 async def _pick_by_label(

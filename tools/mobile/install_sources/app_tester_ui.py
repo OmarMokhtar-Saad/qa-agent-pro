@@ -84,6 +84,7 @@ class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
         self._ui_factory = ui_factory or AdbDeviceUi
         self._versions = versions or read_version
         self._sleep = sleep or asyncio.sleep
+        self._staged: Any = None  # the run find_listed_app left on the app page
 
     async def available(self, serial: str) -> bool:
         listing = await adb.installed_packages(serial)
@@ -112,6 +113,14 @@ class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
         current = _already_current(before, request)
         if current is not None:
             return current
+        staged = self._take_staged(request, ask, before)
+        if staged is not None:
+            return await self._drive(staged)
+        return await self._launch_and_drive(request, ask, before)
+
+    async def _launch_and_drive(
+        self, request: InstallRequest, ask: Optional[AskCb], before: Any
+    ) -> InstallOutcome:
         ui = self._ui_factory(request.serial)
         if not await ui.launch(APP_TESTER_PACKAGE):
             return InstallOutcome(

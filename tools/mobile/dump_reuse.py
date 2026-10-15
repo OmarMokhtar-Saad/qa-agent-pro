@@ -21,6 +21,8 @@ from __future__ import annotations
 import copy
 import time
 
+from tools.mobile import dump_neutral
+
 #: Seconds a held dump may stand for the next read. The next packet is built
 #: within one call of the replay, so a few seconds is the real window; past it
 #: a reused screen is a guess (the tester can touch the phone).
@@ -73,8 +75,8 @@ def is_read_only(cmd: list[str]) -> bool:
     """True only for a command known not to change the screen."""
     body = _body_of(cmd)
     if body:
-        return body.startswith(READ_ONLY_PREFIXES)
-    return any(v in cmd[1:] for v in READ_ONLY_VERBS)
+        return body.startswith(READ_ONLY_PREFIXES) or dump_neutral.neutral_body(body)
+    return any(v in cmd[1:] for v in READ_ONLY_VERBS) or dump_neutral.neutral_pull(cmd)
 
 
 def note_command(cmd: list[str]) -> None:
@@ -123,6 +125,19 @@ def take(serial: str) -> dict | None:
     if time.monotonic() - held[1] > REUSE_MAX_AGE_S:
         return None
     return held[0]
+
+
+def take_aged(serial: str) -> tuple[dict, float] | None:
+    """``(dump, age_s)`` of the held dump when nothing actuated since; used at most once.
+
+    For a caller that validates an older dump itself (the focus probe); the
+    plain :func:`take` age bound does not apply here.
+    """
+    key = str(serial or "")
+    held = _HELD.pop(key, None)
+    if held is None or held[2] != token(key):
+        return None
+    return held[0], time.monotonic() - held[1]
 
 
 def _only_fresh_serial(now: float) -> str:

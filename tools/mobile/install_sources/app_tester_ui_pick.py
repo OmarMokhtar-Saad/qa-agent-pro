@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, Union
+import time
+from dataclasses import replace
+from typing import Any, NamedTuple, Optional, Union
 
 from tools.mobile.install_source import InstallOutcome, InstallRequest
 from tools.mobile.install_sources import app_tester_ui_memory as memory
@@ -13,6 +15,9 @@ from tools.mobile.install_sources.app_tester_ui_consts import (
 )
 from tools.mobile.install_sources.app_tester_ui_link import open_by_link
 from tools.mobile.resolve import AskCb
+
+#: Seconds a run left on the app page stays usable by install().
+STAGE_TTL_S = 120
 
 
 class ListedApp(NamedTuple):
@@ -34,23 +39,57 @@ _LAUNCH_FAILED = InstallOutcome(
 )
 
 
+def _stage(flow: _Flow, run: _Run, bundle: str) -> str:
+    """Leave the run on the app's page: install() carries on from there."""
+    flow._staged = (bundle, run, time.monotonic())
+    return bundle
+
+
 class _PickMixin:
     """Find an app's row in the App Tester list."""
 
     async def find_listed_app(
         self: _Flow, want: ListedApp, ask: Optional[AskCb] = None
     ) -> Union[str, InstallOutcome]:
-        """Open App Tester, go back to its app list, scroll it, and return the
-        bundle id of the one row matching the label (asking only when several
-        match). Taps no row and installs nothing."""
+        """Open App Tester, go back to its app list, scroll it, open the one row
+        matching the label (asking only when several match) and return its
+        bundle id. Installs nothing; install() continues from the app page."""
         ui = self._ui_factory(want.serial)
-        if not await ui.launch(want.tester):
-            return _LAUNCH_FAILED
-        shot = await ui.screen()
+        shot = await ui.screen() if await ui.launch(want.tester) else None
         if shot is None:
             return _LAUNCH_FAILED
         run = _Run(ui, InstallRequest(want.serial, want.package, want.label), ask, None)
         memory.remember_app_id(want.package, want.firebase_id)
         if await open_by_link(run, want.tester, self._sleep):
-            return want.package
-        return await self._pick_row(run, shot.xml)
+            run.card_tapped = True
+            return _stage(self, run, want.package)
+        return await self._scan_and_stage(run, shot.xml, want.firebase_id)
+
+    async def _scan_and_stage(
+        self: _Flow, run: _Run, xml: str, firebase_id: str
+    ) -> Union[str, InstallOutcome]:
+        picked = await self._pick_row(run, xml)
+        if isinstance(picked, InstallOutcome):
+            return picked
+        memory.remember_app_id(picked, firebase_id)
+        opened = await self._tap_card(run, picked, scroll_back=True)
+        return opened if opened is not None else _stage(self, run, picked)
+
+    def _take_staged(
+        self: _Flow, request: InstallRequest, ask: Optional[AskCb], before: Any
+    ) -> Optional[_Run]:
+        """The staged run when it is for this app and still fresh (used once)."""
+        staged, self._staged = self._staged, None
+        if staged is None or staged[0] != request.package:
+            return None
+        if time.monotonic() - staged[2] > STAGE_TTL_S:
+            return None
+        return replace(staged[1], request=request, ask=ask, before=before)
+
+    async def is_latest(self: _Flow, serial: str, package: str) -> bool:
+        """True when the installed copy already is the newest build the app's
+        page listed a moment ago (no App Tester screen is driven for it)."""
+        latest = memory.known_latest(serial, package)
+        have = await self._versions(serial, package) if latest else None
+        code = have.version_code if have else None
+        return code is not None and latest is not None and code >= latest
