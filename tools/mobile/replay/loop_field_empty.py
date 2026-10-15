@@ -26,12 +26,20 @@ ADVANCED_NOTE = (
 
 
 async def reconcile_empty_field(run: _ReplayRun, acted: Acted) -> dict:
-    """The outcome to act on: ``unknown`` instead of ``no`` for an empty field."""
+    """The outcome to act on: ``unknown`` instead of ``no`` for an empty field.
+
+    When the app moved on, ``read_screen`` carries the post-action screen that
+    proved it, so the settle that follows does not dump again.
+    """
     outcome = acted.outcome
     unknown = outcome.get("if_screen_changed")
     if not (outcome.get("error") and isinstance(unknown, dict)):
         return outcome
-    moved = moved_on_masked if outcome.get("masked") else moved_on_by_deadline
-    if await moved(run.ctx, acted.screen):
-        return {"error": None, "content": {"detail": ADVANCED_NOTE}}
+    probe = moved_on_masked if outcome.get("masked") else moved_on_by_deadline
+    moved = await probe(run.ctx, acted.screen)
+    if moved.moved:
+        reply: dict = {"error": None, "content": {"detail": ADVANCED_NOTE}}
+        if moved.screen is not None:
+            reply["read_screen"] = moved.screen
+        return reply
     return unknown

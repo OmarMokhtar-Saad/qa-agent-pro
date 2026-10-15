@@ -17,6 +17,7 @@ from tools.mobile import (
     flow_replay_match,
     flow_replay_run,
     flow_replay_state,
+    flow_replay_switch,
     held_inputs,
     media,
     session_explore_ids,
@@ -50,6 +51,9 @@ def _inputs(run_id: str, ctx: Any) -> dict:
 
 def _resume(body: dict, key: str, package: str) -> tuple:
     """``(name, template, pos)`` of the replay to continue, else a fresh pick."""
+    back = flow_replay_switch.resume(body, key, package)
+    if back[1]:
+        return back
     last = body.get("auto_replay") or {}
     name = str(last.get("name") or "")
     if name and last.get("retry"):
@@ -99,7 +103,8 @@ async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
         ctx, plan, flow_replay_run.Walk(auto.screen, pos, [])
     )
     _record(auto.body, (name, len(template["steps"]), pos), walk)
-    return Auto(walk.screen, auto.body, True), bool(walk.why)
+    detour = flow_replay_switch.detour(auto.body, (name, walk.pos), walk.why)
+    return Auto(walk.screen, auto.body, True), bool(walk.why) and not detour
 
 
 async def run(run_id: str, ctx: Any, auto: Auto) -> Auto:
@@ -108,6 +113,7 @@ async def run(run_id: str, ctx: Any, auto: Auto) -> Auto:
         if flow_replay_state.opted_out(run_id):
             return auto
         auto.body.pop("auto_trace", None)
+        flow_replay_switch.clear(auto.body)
         if isinstance(auto.body.get("auto_replay"), dict):
             auto.body["auto_replay"]["note"] = ""
         deadline = time.monotonic() + MAX_CHAIN_SECONDS
@@ -117,4 +123,5 @@ async def run(run_id: str, ctx: Any, auto: Auto) -> Auto:
                 break
     except Exception:
         logger.exception("flow replay failed")
+    flow_replay_switch.clear(auto.body)
     return auto

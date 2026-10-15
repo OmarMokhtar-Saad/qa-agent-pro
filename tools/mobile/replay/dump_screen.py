@@ -9,6 +9,7 @@ from typing import Any
 
 from tools.mobile import (
     adb,
+    dump_cut_keep,
     dump_latency,
     dump_reuse,
     step_timing,
@@ -58,11 +59,16 @@ async def _fetched(serial: str, deadline: float | None) -> dict:
         await dump_latency.join(serial)
     elif not await dump_latency.join(serial, deadline - time.monotonic()):
         return _cut()
+    kept = dump_cut_keep.take(serial)
+    if kept is not None:
+        step_timing.mark("dump_cut_served")
+        return kept
     under = dump_reuse.token(serial)
     task = dump_latency.start(serial, _raw_dump(serial))
     try:
         raw = await _awaited(task, deadline)
     except asyncio.TimeoutError:
+        dump_cut_keep.keep_when_done(serial, under, task)
         return _cut()
     dump_reuse.store(serial, under, raw)
     return raw

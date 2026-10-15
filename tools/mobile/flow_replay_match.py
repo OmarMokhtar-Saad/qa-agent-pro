@@ -74,16 +74,48 @@ def _keys(key: Any) -> tuple:
     return tuple(k for k in keys if k)
 
 
+def _meta(template: dict, which: str) -> list:
+    return (template.get("meta") or {}).get(which) or []
+
+
+def landing_keys(template: dict, at: int) -> tuple:
+    """Screen keys that count as "step *at* may run here".
+
+    ``before[at]`` and ``after[at - 1]`` name one screen (the step before ended where
+    this one starts), but a transient read can stamp either, so both are accepted.
+    """
+    before, after = _meta(template, "before"), _meta(template, "after")
+    keys = [
+        before[at] if at < len(before) else "",
+        after[at - 1] if 0 < at <= len(after) else "",
+    ]
+    return tuple(dict.fromkeys(k for k in keys if k))
+
+
 def starts(template: dict, key: str, at: int) -> bool:
-    before = (template.get("meta") or {}).get("before") or []
-    return at < len(before) and bool(key) and before[at] in _keys(key)
+    """Whether step *at* may start on *key* (one key or several)."""
+    if at >= len(template.get("steps") or []):
+        return False
+    return bool(set(_keys(key)) & set(landing_keys(template, at)))
 
 
 def _first_at(template: dict, key: str) -> int:
-    """The earliest step whose recorded screen is *key*, or ``-1``."""
-    before = (template.get("meta") or {}).get("before") or []
-    hits = [before.index(k) for k in _keys(key) if k in before]
-    return min(hits) if hits else -1
+    """The earliest step that may start on *key*, or ``-1``."""
+    for at in range(len(template.get("steps") or [])):
+        if starts(template, key, at):
+            return at
+    return -1
+
+
+def known_keys(package: str) -> frozenset:
+    """Every screen key any saved flow of *package* recorded (never raises)."""
+    try:
+        rows = _templates(package)
+    except Exception:
+        logger.exception("flow replay: known keys failed")
+        return frozenset()
+    keys = [k for _n, t in rows for w in ("before", "after") for k in _meta(t, w)]
+    return frozenset(k for k in keys if k)
 
 
 def _rank(item: tuple) -> tuple:

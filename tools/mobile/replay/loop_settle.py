@@ -13,7 +13,6 @@ from tools.mobile.replay.guard import _confirmed
 from tools.mobile.replay.settle import SettleJob, SettleOpts, _settle
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
 from tools.mobile.replay.verdicts import Landing, _brought_to_front
-from tools.mobile.replay.waits_spec import _wait_spec
 
 
 class Acted(NamedTuple):
@@ -22,11 +21,12 @@ class Acted(NamedTuple):
     outcome: dict
     entry: dict
     screen: Any
+    fresh: bool = False  # read AFTER the action: no redump needed
 
 
 def _device_error_stop(run: _ReplayRun, acted: Acted) -> dict:
     """The reply for a device action that came back with an error."""
-    outcome, entry, screen = acted
+    outcome, entry, screen = acted.outcome, acted.entry, acted.screen
     if outcome.get("mask_text") and isinstance(entry.get("action"), dict):
         for key in ("text", "value"):
             if key in entry["action"]:
@@ -60,14 +60,17 @@ def _extra_expected(step: _Step) -> tuple:
 
 
 def _before_change_wait(run: _ReplayRun, step: _Step) -> bool:
-    """True when the script's very next op waits for the screen to change."""
+    """True when the script's very next op observes the screen itself.
+
+    Any wait (``wait_until_*``, ``wait``) and ``tap_text_if_present`` read the
+    screen before they act, so an auto-settle dump after this step would only
+    be a second read of the same moment.
+    """
     at = int((getattr(step, "entry", None) or {}).get("index", -1)) + 1
     if not 0 < at < len(run.items):
         return False
-    nxt = run.items[at]
-    if str(getattr(nxt, "op", "") or "") not in actions_mod.WAIT_OPS:
-        return False
-    return _wait_spec(nxt, run.items)[0] == "changed"
+    op = str(getattr(run.items[at], "op", "") or "")
+    return op in actions_mod.WAIT_OPS or op == "tap_text_if_present"
 
 
 def _next_op(run: _ReplayRun, step: _Step) -> str:
@@ -124,17 +127,17 @@ def _device_opts(run: _ReplayRun, step: _Step, front: bool) -> SettleOpts:
 async def _settle_device(
     run: _ReplayRun, step: _Step, acted: Acted
 ) -> tuple[Any, dict | None]:
-    """Settle after a device action: ``(screen, reply)``.
-
-    ``reply`` is ``None`` when the replay goes on to the next action.
-    """
-    front, entry, screen = _front_landing(run, step, acted), acted.entry, acted.screen
-    front = front or _typed_in_place(run, step, acted)
-    if front:
+    """Settle after a device action: ``(screen, reply)``; ``reply`` None = go on."""
+    entry, screen = acted.entry, acted.screen
+    front = _front_landing(run, step, acted) or acted.fresh
+    typed = _typed_in_place(run, step, acted)
+    if front or typed:
         step_timing.mark("dump_skipped")
     if step.op in actions_mod.MUTATING_OPS:
         job = SettleJob(run.ctx, entry, run.trace, entry["index"])
-        screen, stop = await _settle(job, screen, _device_opts(run, step, front))
+        opts = _device_opts(run, step, front or typed)
+        opts = opts._replace(mark_no_change=not typed)  # not re-read != unchanged
+        screen, stop = await _settle(job, screen, opts)
         if stop is not None:
             return screen, _reply(stop)
     _close(run, StepAt(entry["index"], entry, screen))

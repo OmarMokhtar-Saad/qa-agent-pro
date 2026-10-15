@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import time
 from typing import Any, NamedTuple
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import adb, dialog_handlers
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.context_consts import DIALOG_SETTLE_S, MAX_DIALOG_TAPS
-from tools.mobile.replay.dump import _drop_carried, _dump, dump_raw
+from tools.mobile.replay.dump import _drop_carried, _dump, _focus_probe, dump_raw
 from tools.mobile.replay.elements import (
     _center,
     actuated_element,
@@ -23,6 +23,7 @@ from tools.mobile.replay.guard import (
     guard_detail,
     screen_hit,
 )
+from tools.mobile.replay.loop_field_moved import _focus_left
 from tools.mobile.replay.settle_cut import CutView, _cut_of, _expected_here
 from tools.mobile.replay.settle_mark import SettleJob
 
@@ -108,10 +109,23 @@ def _dialog_gate(ctx: Context, action: Any, screen: Any) -> tuple:
     return point, _dialog_tap_refusal(ctx, action, DialogTarget(element, screen))
 
 
+async def _dialog_gone(ctx: Context, focus: str) -> None:
+    """Wait, bounded by ``DIALOG_SETTLE_S``, until the focused window leaves *focus*.
+
+    A condition wait, never a sleep: the dialog's own window is the one in
+    focus before the tap, and the answer is a different window. An unknown
+    focus (probe failed) or a dialog that shares its window's focus just runs
+    out the bound.
+    """
+    if focus:
+        await _focus_left(ctx, focus, time.monotonic() + DIALOG_SETTLE_S)
+
+
 async def _tap_and_reread(ctx: Context, tap: Tap) -> dict | None:
     """Perform the tap, wait for the app to settle, re-read: the answered-dialog result."""
     back = tap.action.kind == dialog_handlers.BACK
     _drop_carried(ctx.serial)
+    focus = await _focus_probe(ctx.serial, DIALOG_SETTLE_S)
     if back:
         tapped = await adb.keyevent(ctx.serial, "KEYCODE_BACK")
     else:
@@ -119,7 +133,7 @@ async def _tap_and_reread(ctx: Context, tap: Tap) -> dict | None:
     if tapped.get("error"):
         return None
     label = "back" if back else str(tap.action.value)[:MAX_GUARD_NODE_CHARS]
-    await asyncio.sleep(DIALOG_SETTLE_S)
+    await _dialog_gone(ctx, focus)
     dumped = await _dump(ctx)
     if dumped.get("error"):
         return {"label": label, "screen": tap.screen, "stop": True}

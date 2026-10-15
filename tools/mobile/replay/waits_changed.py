@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import time
 
-from tools.mobile import watch
+from tools.mobile import screen_probe, watch
+from tools.mobile.replay.changed_probe import Plan, probed_changed
 from tools.mobile.replay.context import Context, _sleep
 from tools.mobile.replay.context_consts import (
     EXPLORE_CHANGED_WAIT_MAX_MS,
@@ -121,6 +122,15 @@ async def _wait_until_changed(ctx: Context, screen: object, ms: int) -> tuple:
     if already_changed(ctx, before, screen):
         return screen, True, True
     deadline = _wait_deadline(ctx, _capped_ms(ctx, ms) / 1000.0)
+    base = await screen_probe.baseline(ctx.serial, deadline - time.monotonic())
+    if base is not None:
+        return await probed_changed(ctx, screen, Plan(base, deadline))
+    return await _dumped_changed(ctx, screen, deadline)
+
+
+async def _dumped_changed(ctx: Context, screen: object, deadline: float) -> tuple:
+    """The wait without a usable frame probe: a focus check and a dump per poll."""
+    before = _screen_hash(screen)
     before_focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
     current, fresh, focus = screen, False, (before_focus, deadline)
     ticker = watch.Ticker("waiting for the screen to change")

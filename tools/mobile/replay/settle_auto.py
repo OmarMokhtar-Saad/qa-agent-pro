@@ -5,10 +5,12 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from tools.mobile import dump_latency, latency_scale
+from tools.mobile import dump_latency, latency_scale, screen_anchor
 from tools.mobile.replay.context import Context, _sleep
 from tools.mobile.replay.context_consts import AUTO_SETTLE_MAX_S, WAIT_POLL_S
 from tools.mobile.replay.dump import _dump, _focus_probe
+from tools.mobile.replay.probe_gate import wait_moved
+from tools.mobile.replay.screen import _screen_hash
 from tools.mobile.replay.waits_changed import _focus_moved
 
 
@@ -58,9 +60,24 @@ async def _focus_stable(ctx: Context, until: float) -> None:
 async def _auto_settle(ctx: Context, screen: Any, before_hash: str) -> Any:
     """After an action whose first read showed no change: probe cheaply, read once."""
     deadline = _settle_deadline(ctx)
-    before_focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
     until = deadline - dump_latency.p90_ms(ctx.serial) / 1000.0
-    if await _focus_moves(ctx, before_focus, until):
+    base = await screen_anchor.trusted_baseline(
+        ctx.serial, _screen_hash(screen), deadline - time.monotonic()
+    )
+    if base is not None and time.monotonic() < until:
+        # Frame probe equal before and after the read's own dump: a frame that
+        # never moves leaves the first read standing, with NO second dump.
+        if await wait_moved(ctx, base, until) is None:
+            return screen
         await _focus_stable(ctx, until)
+    else:
+        await _focus_wait(ctx, deadline, until)
     dumped = await _dump(ctx)
     return screen if dumped.get("error") else dumped.get("content")
+
+
+async def _focus_wait(ctx: Context, deadline: float, until: float) -> None:
+    """The focus-only wait used when no frame probe is available (error, FLAG_SECURE)."""
+    before_focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
+    if await _focus_moves(ctx, before_focus, until):
+        await _focus_stable(ctx, until)

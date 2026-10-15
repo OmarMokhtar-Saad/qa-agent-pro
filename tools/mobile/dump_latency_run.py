@@ -7,10 +7,11 @@ import functools
 import time
 from typing import Any, Awaitable
 
-from tools.mobile.dump_latency_state import _INFLIGHT, _record
+from tools.mobile.dump_latency_state import _INFLIGHT, _record, before_dump
 
 
 async def _timed(serial: str, awaitable: Awaitable[Any]) -> Any:
+    before_dump(serial)  # e.g. screen_anchor's "before" probe
     started = time.monotonic()
     try:
         result = await awaitable

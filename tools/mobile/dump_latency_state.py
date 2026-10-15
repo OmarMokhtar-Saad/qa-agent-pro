@@ -64,3 +64,14 @@ def describe(serial: str) -> str:
         + str(len(samples))
         + " on this device"
     )
+
+
+# Callbacks run just before every timed dump, by serial. A module that needs a
+# reading beside each dump registers here, so the dump path imports nothing of it.
+BEFORE_DUMP: list = []
+
+
+def before_dump(serial: str) -> None:
+    """Run every registered before-dump callback for *serial*."""
+    for hook in BEFORE_DUMP:
+        hook(serial)

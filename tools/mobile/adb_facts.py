@@ -54,6 +54,9 @@ def _focused_component(text: str) -> str:
     return ""
 
 
+focused_component = _focused_component
+
+
 # The uiautomator dump does NOT carry the activity, so `perception` took it as
 # a parameter and every caller passed the empty default -- the value was
 # threaded end to end with no producer anywhere. `screen_id` therefore hashed

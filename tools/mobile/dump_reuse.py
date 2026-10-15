@@ -21,7 +21,7 @@ from __future__ import annotations
 import copy
 import time
 
-from tools.mobile import dump_neutral
+from tools.mobile import dump_ime_neutral, dump_neutral
 
 #: Seconds a held dump may stand for the next read. The next packet is built
 #: within one call of the replay, so a few seconds is the real window; past it
@@ -84,11 +84,20 @@ def note_command(cmd: list[str]) -> None:
     if is_read_only(cmd):
         return
     serial = _serial_of(cmd)
+    if serial and _keyboard_switch_is_neutral(serial, cmd):
+        return
     if serial:
         bump(serial)
         return
     for key in set(_GEN) | set(_HELD):
         bump(key)
+
+
+def _keyboard_switch_is_neutral(serial: str, cmd: list[str]) -> bool:
+    """A keyboard switch while no held dump shows a keyboard leaves them valid."""
+    entries = (_HELD.get(serial), _LAST.get(serial))
+    held = [e[0].get("content") for e in entries if e]
+    return dump_ime_neutral.keeps_held(serial, _body_of(cmd), held)
 
 
 def bump(serial: str) -> None:

@@ -52,17 +52,46 @@ class Plan(NamedTuple):
     ref: media.ClipRef
 
 
-async def _land(ctx: Any, screen: Any, want: str) -> tuple:
-    """``(landed, screen)``: wait until the live key is *want* (no key recorded: landed)."""
-    if not want or want in flow_replay_match.live_keys(screen, ctx):
+def _at(ctx: Any, screen: Any, wants: tuple) -> bool:
+    return bool(set(wants) & set(flow_replay_match.live_keys(screen, ctx)))
+
+
+def _branch(ctx: Any, known: frozenset, start: Any) -> Any:
+    """Condition: the live screen is steady, is not where the wait began, and is a
+    screen some saved flow knows (a branch the app took, not a slow load)."""
+
+    def met(previous: Any, current: Any) -> bool:
+        if previous is None:
+            return False
+        own = flow_replay_match.live_key(current, ctx)
+        steady = own == flow_replay_match.live_key(previous, ctx)
+        moved = own != flow_replay_match.live_key(start, ctx)
+        return (
+            steady
+            and moved
+            and bool(set(flow_replay_match.live_keys(current, ctx)) & known)
+        )
+
+    return met
+
+
+async def _land(ctx: Any, screen: Any, wants: tuple) -> tuple:
+    """``(landed, screen)``: wait until the live key is one of *wants* (none: landed).
+
+    The wait also ends, not landed, once the screen is steady on a key another saved
+    flow knows: the app took a branch, so the replay need not sit out the timeout.
+    """
+    if not wants or _at(ctx, screen, wants):
         return True, screen
+    package = str(getattr(ctx, "package", "") or "")
+    branch = _branch(ctx, flow_replay_match.known_keys(package), screen)
     probe = Probe(
         LANDING_WAIT_MS,
-        lambda _p, cur: want in flow_replay_match.live_keys(cur, ctx),
+        lambda prev, cur: _at(ctx, cur, wants) or branch(prev, cur),
         "waiting for the recorded screen",
     )
-    found, latest, _timed_out = await _wait_for(ctx, screen, probe)
-    return bool(found), latest
+    _found, latest, _timed_out = await _wait_for(ctx, screen, probe)
+    return _at(ctx, latest, wants), latest
 
 
 async def _run_batch(ctx: Any, ref: media.ClipRef, steps: list) -> dict:
@@ -95,9 +124,9 @@ def _gate(ctx: Any, plan: Plan, batch: flow_replay_batch.Batch) -> Any:
     """
 
     async def gate(index: int, screen: Any) -> tuple:
-        want = flow_replay_batch.wanted(plan.template, batch.origin[index])
+        want = flow_replay_match.landing_keys(plan.template, batch.origin[index])
         if index == 0:
-            ok = not want or want in flow_replay_match.live_keys(screen, ctx)
+            ok = not want or _at(ctx, screen, want)
             return screen, ("" if ok else WRONG_SCREEN)
         landed, latest = await _land(ctx, screen, want)
         return latest, ("" if landed else WRONG_SCREEN)
@@ -112,8 +141,8 @@ async def _finish(ctx: Any, plan: Plan, walk: Walk) -> Walk:
     if cut:
         return walk._replace(why=cut)
     meta = plan.template.get("meta") or {}
-    want = (meta.get("after") or [""] * walk.pos)[walk.pos - 1]
-    landed, screen = await _land(ctx, walk.screen, want)
+    after = (meta.get("after") or [""] * walk.pos)[walk.pos - 1]
+    landed, screen = await _land(ctx, walk.screen, (after,) if after else ())
     why = "" if landed else flow_replay_stop.UNRECORDED
     return Walk(screen, walk.pos, walk.trace, why)
 

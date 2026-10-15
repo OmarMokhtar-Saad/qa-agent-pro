@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tools.mobile.replay.context import Context
+from tools.mobile.replay.probe_gate import TEXT
 from tools.mobile.replay.screen import _screen_has, _screen_hash
 from tools.mobile.replay.waits_poll import _wait_for
 from tools.mobile.replay.waits_types import Probe, TextWait
@@ -26,7 +27,7 @@ async def _wait_until_text(ctx: Context, screen: object, want: TextWait) -> tupl
     def met(_previous: object, current: object) -> bool:
         return _screen_has(current, text) != gone
 
-    return await _wait_for(ctx, screen, Probe(ms, met, label))
+    return await _wait_for(ctx, screen, Probe(ms, met, label, TEXT))
 
 
 async def _wait_until_idle(ctx: Context, screen: object, ms: int) -> tuple:

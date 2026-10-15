@@ -11,9 +11,10 @@ from tools.mobile.replay.context_consts import (
     WAIT_POLL_S,
 )
 from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
+from tools.mobile.replay.probe_gate import TEXT, open_gate, rebased
 from tools.mobile.replay.screen import _screen_has_element
 from tools.mobile.replay.waits_interrupt import _interruption_of
-from tools.mobile.replay.waits_types import Pace, Probe
+from tools.mobile.replay.waits_types import Pace, Poll, Probe
 
 
 def _wait_deadline(ctx: Context, seconds: float) -> float:
@@ -62,27 +63,54 @@ def _pause_after(took: float) -> float:
     return 0.0 if took >= WAIT_POLL_S else WAIT_POLL_S
 
 
+async def _poll(ctx: Context, current: object, poll: Poll) -> tuple:
+    """One poll: ``(final, content, took, verdict)``. Verdict ``"calm"`` means
+    the gate vouched for *current* and no dump was taken."""
+    gate, deadline, took = poll
+    verdict = await gate.verdict(current, deadline) if gate else ""
+    if verdict == "calm":
+        return None, current, took, verdict
+    pause = 0.0 if verdict else _pause_after(took)
+    final, content, took = await _next_read(ctx, current, Pace(deadline, pause))
+    return final, content, took, verdict
+
+
+def _interrupted(ctx: Context, current: object, screen: object) -> bool:
+    """Name a device interruption on *ctx*; True when the wait must stop."""
+    found = _interruption_of(ctx, current, screen)
+    if found:
+        ctx.wait_interruption = found
+    return bool(found)
+
+
+async def _begin(ctx: Context, screen: object, probe: Probe) -> tuple:
+    """``(deadline, ticker, gate)`` a watched poll starts from."""
+    budget = (probe.ms / 1000.0) if probe.ms else DEFAULT_WAIT_UNTIL_TEXT_S
+    gate = await open_gate(ctx, screen, probe.gate)
+    return _wait_deadline(ctx, budget), watch.Ticker(probe.label), gate
+
+
 # ``probe.met(previous, current)`` is the condition; ``previous`` is ``None``
 # until a poll has replaced the screen the wait started on.
 async def _wait_for(ctx: Context, screen: object, probe: Probe) -> tuple:
     """THE watched condition poll behind the text, gone and idle waits."""
-    budget = (probe.ms / 1000.0) if probe.ms else DEFAULT_WAIT_UNTIL_TEXT_S
-    deadline = _wait_deadline(ctx, budget)
+    deadline, ticker, gate = await _begin(ctx, screen, probe)
     previous, current, took = None, screen, 0.0
-    ticker = watch.Ticker(probe.label)
     while True:
         if probe.met(previous, current):
             return True, current, False
-        interruption = _interruption_of(ctx, current, screen)
-        if interruption:
-            ctx.wait_interruption = interruption
+        if _interrupted(ctx, current, screen):
             return False, current, False
-        final, content, took = await _next_read(
-            ctx, current, Pace(deadline, _pause_after(took))
+        final, content, took, verdict = await _poll(
+            ctx, current, Poll(gate, deadline, took)
         )
+        if verdict == "calm":
+            previous = current
+            continue
         if final:
             return final
         previous, current = current, content
+        gate = await rebased(gate, content) if verdict == "dump" else None
         await ticker.tick()
 
 
@@ -101,5 +129,6 @@ async def _wait_until_element(ctx: Context, screen: object, want: tuple) -> tupl
             ms,
             lambda _previous, current: _screen_has_element(current, rid, text) != gone,
             label,
+            TEXT,
         ),
     )

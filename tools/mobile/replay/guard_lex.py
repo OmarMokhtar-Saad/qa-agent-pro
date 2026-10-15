@@ -112,6 +112,14 @@ def is_destructive(text: object) -> bool:
     return bool(destructive_hit(text))
 
 
+def _script_moved(trace: object) -> bool:
+    """Whether the script as a whole ended on another screen than it started on."""
+    rows = [e for e in trace if isinstance(e, dict)] if isinstance(trace, list) else []
+    first = str(rows[0].get("before_screen_id") or "") if rows else ""
+    last = str(rows[-1].get("after_screen_id") or "") if rows else ""
+    return bool(first and last and first != last)
+
+
 # The ops in *trace* that ran, were meant to actuate, and moved nothing.
 #
 # In script order and DE-DUPLICATED, so three taps that each did nothing read
@@ -124,6 +132,8 @@ def is_destructive(text: object) -> bool:
 def inert_ops(trace: object) -> list[str]:
     """The ops in *trace* that ran, were meant to actuate, and moved nothing."""
     out: list[str] = []
+    if _script_moved(trace):
+        return out
     for entry in trace if isinstance(trace, list) else []:
         if not isinstance(entry, dict):
             continue

@@ -11,6 +11,7 @@ class Probe(NamedTuple):
     ms: int
     met: Any
     label: str
+    gate: str = ""
 
 
 class Pace(NamedTuple):
@@ -18,6 +19,14 @@ class Pace(NamedTuple):
 
     deadline: float
     pause: float
+
+
+class Poll(NamedTuple):
+    """One gated poll: the probe gate (or ``None``), the deadline, the last read's seconds."""
+
+    gate: Any
+    deadline: float
+    took: float
 
 
 class TextWait(NamedTuple):

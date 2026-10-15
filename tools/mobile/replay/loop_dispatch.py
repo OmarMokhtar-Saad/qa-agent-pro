@@ -40,6 +40,19 @@ async def _wait_step(
 # ONE rectangle for the guard and the device -- see
 # `_swipe_points`. Both read this packet's own root_bounds
 # rather than each asking adb, whose answer expires.
+def _note_ok(step: _Step, outcome: dict) -> None:
+    """Record the acted step as ok with its confirmed detail and notes."""
+    entry = step.entry
+    entry["outcome"] = "ok"
+    entry["detail"] = _confirmed(
+        entry, str((outcome.get("content") or {}).get("detail") or "")
+    )
+    if entry.get("fill_note"):
+        entry["detail"] = (entry["fill_note"] + " " + entry["detail"]).strip()
+    if step.scroll_missed:
+        entry["detail"] = (SCROLL_TARGET_MISSED + " " + entry["detail"]).strip()
+
+
 async def _device_step(
     run: _ReplayRun, step: _Step, screen: Any
 ) -> tuple[Any, dict | None]:
@@ -49,17 +62,15 @@ async def _device_step(
     note_action(run.ctx, _screen_hash(screen))
     outcome = await _perform(touch, run.ctx)
     outcome = await reconcile_empty_field(run, Acted(outcome, entry, screen))
+    read = outcome.get("read_screen")
+    if read is not None:
+        screen = read
     if outcome.get("error"):
         return screen, _device_error_stop(run, Acted(outcome, entry, screen))
-    entry["outcome"] = "ok"
-    entry["detail"] = _confirmed(
-        entry, str((outcome.get("content") or {}).get("detail") or "")
+    _note_ok(step, outcome)
+    return await _settle_device(
+        run, step, Acted(outcome, entry, screen, read is not None)
     )
-    if entry.get("fill_note"):
-        entry["detail"] = (entry["fill_note"] + " " + entry["detail"]).strip()
-    if step.scroll_missed:
-        entry["detail"] = (SCROLL_TARGET_MISSED + " " + entry["detail"]).strip()
-    return await _settle_device(run, step, Acted(outcome, entry, screen))
 
 
 async def _dispatch_op(

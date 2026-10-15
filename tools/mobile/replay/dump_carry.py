@@ -11,6 +11,7 @@ from typing import Any
 from tools.mobile import (
     adb,
     dump_reuse,
+    screen_anchor,
     step_timing,
 )
 from tools.mobile.replay.context_ctx import Context
@@ -49,13 +50,18 @@ def _drop_carried(serial: str) -> None:
 
 def _remember(ctx: Context, observed: Any) -> None:
     """Keep a successful observation for the next call when the context allows."""
+    screen_anchor.note_read(ctx.serial, observed)
     if not ctx.carry_screen:
         return
     content = observed.get("content") if isinstance(observed, dict) else None
     if not isinstance(content, dict) or observed.get("error"):
         _drop_carried(ctx.serial)
         return
-    key = str(ctx.serial or "")
+    _carry(str(ctx.serial or ""), observed, content)
+
+
+def _carry(key: str, observed: dict, content: dict) -> None:
+    """Carry *observed* for *key* (least recently read first out) and anchor it."""
     _CARRIED.pop(key, None)
     _CARRIED[key] = _Carried(
         copy.deepcopy(observed),
@@ -64,17 +70,29 @@ def _remember(ctx: Context, observed: Any) -> None:
         str(content.get("activity") or ""),
         dump_reuse.token(key),
     )
+    screen_anchor.schedule(key, dump_reuse.token(key))
     while len(_CARRIED) > MAX_CARRIED_SERIALS:
         del _CARRIED[next(iter(_CARRIED))]
 
 
 def _is_current(held: _Carried | None, ctx: Context) -> bool:
-    """Young, same package, and nothing actuated since it was read."""
-    if held is None or time.monotonic() - held.taken > REUSE_MAX_AGE_S:
+    """Same package, nothing actuated since it was read, and young or probe-anchored.
+
+    Past the age cap it only stands when a probe reading was kept for its
+    generation; :func:`_take_carried` then requires a fresh probe to equal it.
+    """
+    if held is None:
+        return False
+    if _aged(held) and not screen_anchor.anchored(ctx.serial, held.gen):
         return False
     if ctx.package and held.package != ctx.package:
         return False
     return held.gen == dump_reuse.token(str(ctx.serial or ""))
+
+
+def _aged(held: _Carried) -> bool:
+    """True when the carried screen is past :data:`REUSE_MAX_AGE_S`."""
+    return time.monotonic() - held.taken > REUSE_MAX_AGE_S
 
 
 async def _take_carried(ctx: Context) -> dict | None:
@@ -92,6 +110,8 @@ async def _take_carried(ctx: Context) -> dict | None:
         return None
     focus = await _focus_probe(ctx.serial, REUSE_PROBE_S)
     if not focus or focus != held.activity:
+        return None
+    if _aged(held) and not await screen_anchor.unmoved(ctx.serial, held.gen):
         return None
     step_timing.mark("dump_carried")
     return held.result

@@ -8,13 +8,13 @@ import logging
 from config.settings_guard import never_raise
 from tools.mobile import adb
 from tools.mobile.providers import composite
-from tools.mobile.replay.dump import dump_raw
+from tools.mobile.replay.dump import dump_raw_reusing
 
 logger = logging.getLogger("tools.mobile.session")
 
 
 async def _capture(serial: str) -> dict | None:
-    dumped = await dump_raw(serial)
+    dumped = await dump_raw_reusing(serial)
     if dumped.get("error"):
         return None
     sized = await adb.display_size(serial)

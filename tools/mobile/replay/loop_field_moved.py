@@ -12,6 +12,7 @@ changes it and the field is still dead.
 from __future__ import annotations
 
 import time
+from typing import Any, NamedTuple
 
 from tools.mobile import dump_latency, latency_scale
 from tools.mobile.replay.context import Context, _sleep
@@ -19,6 +20,17 @@ from tools.mobile.replay.context_consts import AUTO_SETTLE_MAX_S, WAIT_POLL_S
 from tools.mobile.replay.dump import _dump, _focus_probe
 from tools.mobile.replay.waits_changed import _changed_poll, _focus_moved
 from tools.mobile.screen_key import screen_key
+
+
+class Moved(NamedTuple):
+    """Whether the app moved on, and the post-action screen read that proved it.
+
+    ``screen`` is ``None`` when the proof was the focus probe alone (nothing was
+    read) or the app did not move.
+    """
+
+    moved: bool
+    screen: Any = None
 
 
 def _fields(screen: dict) -> int:
@@ -65,26 +77,33 @@ async def _focus_left(ctx: Context, focus: str, deadline: float) -> bool:
     return False
 
 
-async def moved_on_masked(ctx: Context, before: object) -> bool:
+async def moved_on_masked(ctx: Context, before: object) -> Moved:
     """A masked field cannot be read back: focus probes, then ONE dump as proof."""
     deadline = _deadline(ctx)
     focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
     if focus and await _focus_left(ctx, focus, deadline):
-        return True
+        return Moved(True)
     dumped = await _dump(ctx)
-    return not dumped.get("error") and _moved_on(before, dumped.get("content"))
+    content = dumped.get("content")
+    if dumped.get("error") or not _moved_on(before, content):
+        return Moved(False)
+    return Moved(True, content)
 
 
-async def moved_on_by_deadline(ctx: Context, before: object) -> bool:
-    """Poll until the app is proved to have moved on; False when nothing proved it."""
+async def moved_on_by_deadline(ctx: Context, before: object) -> Moved:
+    """Poll until the app is proved to have moved on; ``Moved(False)`` when nothing did.
+
+    The read that proved it is returned: it is the screen after the action, so
+    the caller's settle need not dump it again.
+    """
     deadline = _deadline(ctx)
     focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
     while time.monotonic() < deadline:
         if focus and await _focus_moved(ctx.serial, focus, deadline):
-            return True
+            return Moved(True)
         kind, content = await _changed_poll(ctx, deadline)
         if kind == "cut":
-            return False
+            return Moved(False)
         if kind == "read" and _moved_on(before, content):
-            return True
-    return False
+            return Moved(True, content)
+    return Moved(False)
