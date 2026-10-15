@@ -132,7 +132,7 @@ def screen_key(screen: object, package: str = "", activity: str = "") -> ScreenK
     try:
         body = screen if isinstance(screen, dict) else {}
         package = str(package or body.get("package") or "")
-        activity = str(activity or body.get("activity") or "")
+        activity = str(body.get("activity") or activity or "")
         raw = body.get("elements")
         elements = (
             [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []

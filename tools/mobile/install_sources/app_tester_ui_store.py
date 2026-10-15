@@ -18,7 +18,14 @@ logger = logging.getLogger("tools.mobile.install_sources.app_tester_ui_store")
 
 FILE = "app_tester_memory.json"
 #: Seconds an entry stays trusted, per section (the latest build changes often).
-TTL_S = {"pages": 7 * 24 * 3600, "ids": 7 * 24 * 3600, "latest": 15 * 60}
+WEEK_S = 7 * 24 * 3600
+TTL_S = {
+    "pages": WEEK_S,
+    "spages": WEEK_S,
+    "rows": WEEK_S,
+    "ids": WEEK_S,
+    "latest": 15 * 60,
+}
 MAX_PER_SECTION = 200
 
 

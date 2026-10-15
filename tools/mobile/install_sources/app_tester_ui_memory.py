@@ -64,6 +64,34 @@ def known_page(serial: str, package: str) -> Optional[int]:
 
 def forget_page(serial: str, package: str) -> None:
     store.drop("pages", _key(serial, package))
+    store.drop("spages", _key(serial, package))
+
+
+def remember_start_page(serial: str, package: str, page: int) -> None:
+    """A page counted from the screen the scan started on (the top is unproven)."""
+    if package:
+        store.put("spages", _key(serial, package), page)
+
+
+def known_start_page(serial: str, package: str) -> Optional[int]:
+    page = store.get("spages", _key(serial, package)) if package else None
+    return page if isinstance(page, int) else None
+
+
+def _label_key(serial: str, label: str) -> str:
+    return _key(serial, " ".join((label or "").lower().split()))
+
+
+def remember_label(serial: str, label: str, bundle: str) -> None:
+    """The bundle id the label picked (the row's identity for the next call)."""
+    if (label or "").strip() and bundle:
+        store.put("rows", _label_key(serial, label), bundle)
+
+
+def known_bundle(serial: str, label: str) -> str:
+    if not (label or "").strip():
+        return ""
+    return str(store.get("rows", _label_key(serial, label)) or "")
 
 
 def remember_latest(serial: str, package: str, code: int) -> None:

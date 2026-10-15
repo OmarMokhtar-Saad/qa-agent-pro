@@ -14,9 +14,9 @@ from __future__ import annotations
 import time
 
 from tools.mobile import dump_latency, latency_scale
-from tools.mobile.replay.context import Context
-from tools.mobile.replay.context_consts import AUTO_SETTLE_MAX_S
-from tools.mobile.replay.dump import _focus_probe
+from tools.mobile.replay.context import Context, _sleep
+from tools.mobile.replay.context_consts import AUTO_SETTLE_MAX_S, WAIT_POLL_S
+from tools.mobile.replay.dump import _dump, _focus_probe
 from tools.mobile.replay.waits_changed import _changed_poll, _focus_moved
 from tools.mobile.screen_key import screen_key
 
@@ -54,6 +54,25 @@ def _deadline(ctx: Context) -> float:
     return time.monotonic() + latency_scale.scale_settle(
         AUTO_SETTLE_MAX_S, dump_latency.p90_ms(ctx.serial)
     )
+
+
+async def _focus_left(ctx: Context, focus: str, deadline: float) -> bool:
+    """Poll the cheap focus probe (no dump) until the window changes or the cut."""
+    while time.monotonic() < deadline:
+        if await _focus_moved(ctx.serial, focus, deadline):
+            return True
+        await _sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
+    return False
+
+
+async def moved_on_masked(ctx: Context, before: object) -> bool:
+    """A masked field cannot be read back: focus probes, then ONE dump as proof."""
+    deadline = _deadline(ctx)
+    focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
+    if focus and await _focus_left(ctx, focus, deadline):
+        return True
+    dumped = await _dump(ctx)
+    return not dumped.get("error") and _moved_on(before, dumped.get("content"))
 
 
 async def moved_on_by_deadline(ctx: Context, before: object) -> bool:

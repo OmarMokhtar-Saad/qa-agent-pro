@@ -11,7 +11,13 @@ from __future__ import annotations
 import logging
 from typing import Any, NamedTuple
 
-from tools.mobile import actions, flow_replay_match, media
+from tools.mobile import (
+    actions,
+    flow_nochange,
+    flow_replay_match,
+    flow_replay_stop,
+    media,
+)
 from tools.mobile.app_flows_consts import OK_OUTCOMES
 from tools.mobile.replay.replay import replay as replay_replay
 from tools.mobile.replay.waits_poll import _wait_for
@@ -45,11 +51,11 @@ class Plan(NamedTuple):
 
 async def _land(ctx: Any, screen: Any, want: str) -> tuple:
     """``(landed, screen)``: wait until the live key is *want* (no key recorded: landed)."""
-    if not want or flow_replay_match.live_key(screen, ctx) == want:
+    if not want or want in flow_replay_match.live_keys(screen, ctx):
         return True, screen
     probe = Probe(
         LANDING_WAIT_MS,
-        lambda _p, cur: flow_replay_match.live_key(cur, ctx) == want,
+        lambda _p, cur: want in flow_replay_match.live_keys(cur, ctx),
         "waiting for the recorded screen",
     )
     found, latest, _timed_out = await _wait_for(ctx, screen, probe)
@@ -85,7 +91,7 @@ def _problem(ctx: Any, plan: Plan, walk: Walk) -> str:
     """Why step ``walk.pos`` cannot run now (wrong screen, missing input), else ``""``."""
     meta = plan.template.get("meta") or {}
     want = (meta.get("before") or [""] * (walk.pos + 1))[walk.pos]
-    if want and want != flow_replay_match.live_key(walk.screen, ctx):
+    if want and want not in flow_replay_match.live_keys(walk.screen, ctx):
         return "the screen is not the one this step was saved from"
     name = flow_replay_match.needed(plan.template["steps"][walk.pos])
     if name and name not in plan.inputs:
@@ -93,8 +99,24 @@ def _problem(ctx: Any, plan: Plan, walk: Walk) -> str:
     return ""
 
 
+async def _after(ctx: Any, plan: Plan, walk: Walk) -> Walk:
+    """The walk after step ``walk.pos - 1`` ran: left the app, unrecorded, or landed."""
+    pos, screen, trace = walk.pos, walk.screen, walk.trace
+    step = plan.template["steps"][pos - 1]
+    cut = flow_replay_stop.cut_why(ctx, screen, step)
+    if cut:
+        return Walk(screen, pos, trace, cut)
+    meta = plan.template.get("meta") or {}
+    want = (meta.get("after") or [""] * pos)[pos - 1]
+    landed, screen = await _land(ctx, screen, want)
+    why = "" if landed else flow_replay_stop.UNRECORDED
+    return Walk(screen, pos, trace, why)
+
+
 async def _step(ctx: Any, plan: Plan, walk: Walk) -> Walk:
     """Run step ``walk.pos``; the next walk, with ``why`` set when the replay ends there."""
+    if flow_nochange.skip_at(plan.template, walk.pos):
+        return walk._replace(pos=walk.pos + 1)
     bad = _problem(ctx, plan, walk)
     if bad:
         return walk._replace(why=bad)
@@ -103,13 +125,9 @@ async def _step(ctx: Any, plan: Plan, walk: Walk) -> Walk:
     trace = walk.trace + list(content.get("trace") or [])
     screen = content.get("screen") or walk.screen
     if not _ok(content):
-        return Walk(screen, walk.pos, trace, "the step did not run as planned")
-    meta = plan.template.get("meta") or {}
-    want = (meta.get("after") or [""] * (walk.pos + 1))[walk.pos]
-    landed, screen = await _land(ctx, screen, want)
-    if not landed:
-        return Walk(screen, walk.pos + 1, trace, "the screen after it never matched")
-    return Walk(screen, walk.pos + 1, trace)
+        why = flow_replay_stop.failed_why(content)
+        return Walk(screen, walk.pos, trace, why)
+    return await _after(ctx, plan, Walk(screen, walk.pos + 1, trace))
 
 
 async def run(ctx: Any, plan: Plan, walk: Walk) -> Walk:

@@ -54,6 +54,7 @@ def _landed_no_with_fallback(content: dict, field: str) -> dict:
     if content.get("empty_after"):
         secret = bool(content.get("secret"))
         reply["if_screen_changed"] = _unconfirmed_type_reply(secret, typed, field)
+        reply["masked"] = secret
     return reply
 
 

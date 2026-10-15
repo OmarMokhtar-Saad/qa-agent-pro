@@ -20,6 +20,10 @@ SLOW_CALL_CEILING_S = 5.0
 #: slow on a cold emulator.
 DUMP_TIMEOUT_S = 60
 
+#: First attempt of a fallback dump (uiautomator waits for the screen to idle);
+#: a timeout is retried once with DUMP_TIMEOUT_S.
+FIRST_DUMP_TIMEOUT_S = 20
+
 #: The dump is attacker-influenced content. Cap it here, at the transport, as
 #: well as in the Phase-2 parser: a 400MB "screen" must never reach memory.
 MAX_DUMP_BYTES = 4 * 1024 * 1024

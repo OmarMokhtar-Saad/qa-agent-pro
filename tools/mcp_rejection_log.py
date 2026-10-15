@@ -7,8 +7,9 @@ of validation and writes ONE WARNING line per rejection.
 
 WHAT IS LOGGED: the tool name (sanitised), the exception class, and the
 pydantic error TYPES (``int_parsing``, ``missing``, ``unexpected_keyword_argument``).
-NEVER a value: types only, no ``input``, no ``ctx``, no ``loc`` (a location is a
-caller-chosen key name), and never ``exc_info`` -- a traceback prints the
+plus the offending argument NAMES (first ``loc`` element, sanitised and capped:
+a name is caller-chosen text, so it is cut, never trusted).
+NEVER a value: no ``input``, no ``ctx``, and never ``exc_info`` -- a traceback prints the
 ValidationError, and its text carries the rejected input.
 
 Version note: written against fastmcp 2.14.7, where the ValidationError
@@ -35,6 +36,8 @@ except ImportError as exc:  # no fastmcp, or one without middleware
     Middleware = cast("Any", None)
 
 logger = logging.getLogger("qa_agents.mcp")
+MAX_NAMES = 8
+MAX_NAME_CHARS = 40
 
 
 def _validation_error(exc: BaseException | None):
@@ -67,16 +70,32 @@ def _safe_name(name: object) -> str:
     return cleaned or "unknown"
 
 
+def error_args(exc: BaseException | None) -> list[str]:
+    """Sorted argument names the rejection points at (names only, never values)."""
+    found = _validation_error(exc)
+    if found is None:
+        return []
+    with never_raise():
+        rows = found.errors(
+            include_input=False, include_context=False, include_url=False
+        )
+        locs = [r.get("loc") or () for r in rows]
+        names = {str(loc[0]) for loc in locs if loc and isinstance(loc[0], str)}
+        return sorted(_safe_name(n)[:MAX_NAME_CHARS] for n in names)[:MAX_NAMES]
+    return []
+
+
 def log_rejection(tool: object, exc: BaseException) -> bool:
     """Write the rejection line; False (and silence) when ``exc`` is not one."""
     kinds = error_types(exc)
     if not kinds:
         return False
     logger.warning(
-        "tool %s: arguments rejected before the handler ran (%s): %s",
+        "tool %s: arguments rejected before the handler ran (%s): %s [args: %s]",
         _safe_name(tool),
         type(exc).__name__,
         ",".join(kinds),
+        ",".join(error_args(exc)) or "-",
     )
     return True
 

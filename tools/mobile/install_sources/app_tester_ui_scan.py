@@ -37,6 +37,9 @@ class _Scan:
         self.pos = 0
         self.top_pos: Optional[int] = 0 if top else None
         self.end = False
+        self.target = run.request.package or memory.known_bundle(
+            run.request.serial, run.request.app_label
+        )
         self.cur: list = rows
         self.deadline = time.monotonic() + LISTING_DEADLINE_S
         run.offsets.clear()
@@ -58,7 +61,7 @@ class _Scan:
         return len(fresh)
 
     def found(self) -> bool:
-        return any(row.bundle == self.run.request.package for row in self.rows)
+        return any(row.bundle == self.target for row in self.rows)
 
     def past_read(self) -> bool:
         """True when the scan is below every offset read so far (not a rescan)."""
@@ -122,22 +125,36 @@ class _Scan:
 
 
 def remember_row(run: _Run, bundle: str) -> None:
-    """Keep the page *bundle*'s row was read at (counted from the proven top)."""
+    """Keep what finds *bundle*'s row again: its label, and the page it was read
+    at (from the proven top, else from the screen the scan started on)."""
+    serial = run.request.serial
+    memory.remember_label(serial, run.request.app_label, bundle)
     at = run.offsets.get(bundle)
-    if at is not None and run.top_pos is not None:
-        memory.remember_page(run.request.serial, bundle, at - run.top_pos)
+    if at is None:
+        return
+    if run.top_pos is not None:
+        memory.remember_page(serial, bundle, at - run.top_pos)
+    else:
+        memory.remember_start_page(serial, bundle, at)
+
+
+def _cached_page(scan: _Scan) -> Optional[int]:
+    serial = scan.run.request.serial
+    page = memory.known_page(serial, scan.target)
+    if page is None and not scan.top:
+        page = memory.known_start_page(serial, scan.target)
+    return page
 
 
 async def _try_cached(scan: _Scan) -> None:
     """Go straight to the page the package was last found at and look once; a
     miss forgets the page and reads the list from its top instead."""
-    run = scan.run
-    page = memory.known_page(run.request.serial, run.request.package)
+    page = _cached_page(scan)
     if not page or scan.found():
         return
     await scan.jump(page)
     if not scan.found():
-        memory.forget_page(run.request.serial, run.request.package)
+        memory.forget_page(scan.run.request.serial, scan.target)
         await scan.up()
 
 
@@ -150,8 +167,7 @@ async def scan_listing(run: _Run, xml: str) -> tuple:
     row is flush with the list."""
     rows = await read_rows(run.ui, xml)
     scan = _Scan(run, rows, list_at_top(xml))
-    if scan.top:
-        await _try_cached(scan)
+    await _try_cached(scan)
     await scan.down()
     if not scan.found() and not scan.top:
         await scan.up()

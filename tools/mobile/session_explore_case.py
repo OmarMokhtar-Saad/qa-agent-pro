@@ -11,10 +11,10 @@ from tools.mobile import case_runner, run_store
 from tools.mobile.replay.guard import MAX_GUARD_NODE_CHARS
 from tools.mobile.session_explore_ids import (
     EXPLORE_MODULE,
-    EXPLORE_TITLE_PREFIX,
     explore_turn_number,
     explore_turn_tc_id,
 )
+from tools.mobile.session_explore_title import explore_turn_title
 
 logger = logging.getLogger("tools.mobile.session")
 
@@ -89,13 +89,12 @@ def _case_body(record: TurnRecord, now: float) -> dict:
     """The case-shaped dict one exploratory turn is checkpointed as."""
     body = record.state if isinstance(record.state, dict) else {}
     result = record.outcome if isinstance(record.outcome, dict) else {}
-    turn = explore_turn_number(body)
     goal = " ".join(str(body.get("goal") or "").split())[:200] or "no goal recorded"
     return {
-        "tc_id": explore_turn_tc_id(turn),
+        "tc_id": explore_turn_tc_id(explore_turn_number(body)),
         # The chat tally reads this to say "warnings", not "failed".
         "module": EXPLORE_MODULE,
-        "title": (EXPLORE_TITLE_PREFIX + str(turn) + " — " + goal)[:250],
+        "title": explore_turn_title(body, goal),
         **_explore_result_fields(result, record.verdict),
         "escapes": 0,
         "guard_stop": _explore_guard_stop(result),

@@ -133,7 +133,8 @@ class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
 
     async def _drive(self, run: _Run) -> InstallOutcome:
         deadline = time.monotonic() + APP_TESTER_FLOW_TIMEOUT_S
-        for _ in range(MAX_APP_TESTER_STEPS):
+        steps = 0
+        while steps < MAX_APP_TESTER_STEPS:
             if time.monotonic() >= deadline:
                 return await self._gave_up(run, "flow_timeout")
             landed = await self._landed(run)
@@ -142,6 +143,7 @@ class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
             stop = await self._step(run)
             if stop is not None:
                 return stop
+            steps += run.quiet == 0  # quiet polls are bounded by the deadline only
         return await self._gave_up(run, "step_limit")
 
     async def _gave_up(self, run: _Run, code: str) -> InstallOutcome:

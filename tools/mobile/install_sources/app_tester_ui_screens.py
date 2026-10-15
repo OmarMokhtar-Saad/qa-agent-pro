@@ -17,6 +17,7 @@ from tools.mobile.install_sources.app_tester_ui_consts import (
     AAB_SETUP_LABEL,
     APP_TESTER_PACKAGE,
     APP_TESTER_POLL_S,
+    QUIET_POLLS,
     Seen,
     _Flow,
     _Run,
@@ -29,10 +30,29 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
 from tools.mobile.install_sources.app_tester_ui_rows import AAB_SETUP_RID, has_rid
 
 
+async def _quiet(run: _Run) -> bool:
+    """True when the install runs on in the same app and no dump is due: the
+    foreground is read, the screen is not."""
+    if not run.tapped:
+        return False
+    front = await run.ui.foreground()
+    mine = (APP_TESTER_PACKAGE, run.request.package)
+    same = front == run.last_front and front in mine
+    run.last_front = front
+    run.quiet = run.quiet + 1 if same else 0
+    if not same or run.quiet >= QUIET_POLLS:
+        run.quiet = 0
+        return False
+    return True
+
+
 class _ScreenMixin:
     """The screen-level steps of the flow."""
 
     async def _step(self: _Flow, run: _Run) -> Optional[InstallOutcome]:
+        if await _quiet(run):
+            await self._sleep(APP_TESTER_POLL_S)
+            return None
         shot = await run.ui.screen()
         if shot is None:
             await self._sleep(APP_TESTER_POLL_S)

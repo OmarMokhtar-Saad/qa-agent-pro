@@ -29,6 +29,7 @@ class SettleOpts(NamedTuple):
     op: str = ""
     extra_expected: tuple = ()
     before_change_wait: bool = False
+    next_target: Any = None
 
 
 # Whether an action left the screen's CONTENT as it was.

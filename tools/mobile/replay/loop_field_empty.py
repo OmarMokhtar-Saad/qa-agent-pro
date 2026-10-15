@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tools.mobile.replay.loop_field_moved import moved_on_by_deadline
+from tools.mobile.replay.loop_field_moved import moved_on_by_deadline, moved_on_masked
 from tools.mobile.replay.loop_settle import Acted
 
 if TYPE_CHECKING:
@@ -31,6 +31,7 @@ async def reconcile_empty_field(run: _ReplayRun, acted: Acted) -> dict:
     unknown = outcome.get("if_screen_changed")
     if not (outcome.get("error") and isinstance(unknown, dict)):
         return outcome
-    if await moved_on_by_deadline(run.ctx, acted.screen):
+    moved = moved_on_masked if outcome.get("masked") else moved_on_by_deadline
+    if await moved(run.ctx, acted.screen):
         return {"error": None, "content": {"detail": ADVANCED_NOTE}}
     return unknown

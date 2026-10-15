@@ -8,9 +8,8 @@ from config.settings_guard import never_raise
 from tools.mobile import run_store
 from tools.mobile.session_explore_ids import (
     EXPLORE_MODULE,
-    EXPLORE_TITLE_PREFIX,
-    explore_turn_number,
 )
+from tools.mobile.session_explore_title import explore_turn_title
 
 logger = logging.getLogger("tools.mobile.session")
 
@@ -46,11 +45,10 @@ def _explore_planned_case(tc_id: str, state: object, finding: str = "") -> dict:
     """The turn as a MINIMAL valid ``TestCase`` dump, for ``manifest["cases"]``."""
     body = state if isinstance(state, dict) else {}
     goal = _clean_goal(body)
-    turn = explore_turn_number(body)
     return {
         "tc_id": tc_id,
         "module": EXPLORE_MODULE,
-        "title": (EXPLORE_TITLE_PREFIX + str(turn) + " — " + goal)[:250],
+        "title": explore_turn_title(body, goal),
         "priority": "Medium",
         "type": "Exploratory",
         "preconditions": "The app was open at the previous turn's screen.",

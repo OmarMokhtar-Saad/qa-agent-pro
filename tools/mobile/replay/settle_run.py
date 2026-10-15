@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from tools.mobile import actions as actions_mod
 from tools.mobile.replay.context import ReplayStop, _append, _result
 from tools.mobile.replay.context_consts import (
     NO_AUTO_SETTLE_OPS,
@@ -89,6 +90,14 @@ def _mark_of(entry: dict, which: str) -> ScreenMark:
     return ScreenMark(entry["after_screen_hash"], entry["after_screen_id"])
 
 
+def _target_in_hand(target: Any, screen: Any) -> bool:
+    """True when the next typed field is already on *screen* (nothing to wait for)."""
+    if target is None or not isinstance(screen, dict):
+        return False
+    hit = actions_mod.resolve_target(target, screen) or {}
+    return (hit.get("content") or {}).get("element") is not None
+
+
 # ``(screen, unchanged)``: did the action change nothing, after auto-settle.
 async def _settle_unchanged(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
     """``(screen, unchanged)``: did the action change nothing, after auto-settle."""
@@ -99,6 +108,7 @@ async def _settle_unchanged(job: SettleJob, screen: Any, opts: SettleOpts) -> tu
     # own poll (`mark_no_change=False`) is its own settle.
     # A script whose next op waits for the screen to change observes it anyway.
     skip = str(opts.op or "") in NO_AUTO_SETTLE_OPS or opts.before_change_wait
+    skip = skip or _target_in_hand(opts.next_target, screen)
     if unchanged and opts.redump and before.content_hash and not skip:
         read = await _auto_settle(job.ctx, screen, before.content_hash)
         _stamp_after(job.entry, read)

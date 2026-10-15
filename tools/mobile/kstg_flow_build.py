@@ -10,7 +10,7 @@ import hashlib
 import re
 from typing import Any
 
-from tools.mobile import kstg_foreign, run_store
+from tools.mobile import flow_nochange, kstg_foreign, run_store
 from tools.mobile.app_flows_consts import MAX_FLOW_NAME_CHARS, OK_OUTCOMES
 
 MIN_STEPS = 2
@@ -59,6 +59,14 @@ def ended_clean(steps: list) -> bool:
     return bool(steps) and str(steps[-1].get("outcome") or "") in _ENDED_OK
 
 
+def _saw_no_change(rec: dict) -> bool:
+    """True for a change-wait whose screen key did not move (nothing to replay)."""
+    op = _dict(rec.get("flow_action")).get("op")
+    return flow_nochange.no_change(
+        op, rec.get("screen_key"), rec.get("after_screen_key")
+    )
+
+
 def app_recs(steps: list, package: str) -> list:
     """The replayable step records of *package* that ran as planned and landed.
 
@@ -72,6 +80,7 @@ def app_recs(steps: list, package: str) -> list:
         and kstg_foreign.own(rec, package)
         and str(rec.get("outcome") or "") in OK_OUTCOMES
         and rec.get("landed") is not False
+        and not _saw_no_change(rec)
     ]
 
 

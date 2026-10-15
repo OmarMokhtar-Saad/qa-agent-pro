@@ -10,7 +10,7 @@ import logging
 from config.settings_guard import never_raise
 from tools import tool_status
 from tools.mobile import step_timing
-from tools.mobile.adb_consts import DUMP_REMOTE_PATH
+from tools.mobile.adb_consts import DUMP_REMOTE_PATH, FIRST_DUMP_TIMEOUT_S
 from tools.mobile.adb_host import host
 
 logger = logging.getLogger("tools.mobile.adb")
@@ -182,10 +182,19 @@ def _dump_reply(read: dict) -> dict:
 # known in that branch. `rc`
 # was ignored on both calls before and is ignored now; with `;` it would be
 # `cat`'s rc either way.
+async def _bounded_dump(serial: str) -> dict:
+    """A dump cut at FIRST_DUMP_TIMEOUT_S (animation), retried once at the full one."""
+    read = await host().shell(serial, [_DUMP_COMMAND], timeout=FIRST_DUMP_TIMEOUT_S)
+    if read.get("timed_out"):
+        read = await host().shell(
+            serial, [_DUMP_COMMAND], timeout=host().DUMP_TIMEOUT_S
+        )
+    return read
+
+
 async def uiautomator_dump(serial: str, *, use_provider: bool = True) -> dict:
     """The current screen's uiautomator XML, as a string."""
     fast = await _fast_dump(serial, use_provider)
     if fast is not None:
         return fast
-    read = await host().shell(serial, [_DUMP_COMMAND], timeout=host().DUMP_TIMEOUT_S)
-    return _dump_reply(read)
+    return _dump_reply(await _bounded_dump(serial))

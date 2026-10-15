@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, NamedTuple
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import step_timing
+from tools.mobile import ime, step_timing
 from tools.mobile.replay.context import STATUS_ERROR, _ReplayRun, _result, _Step
 from tools.mobile.replay.device_ops import PASSWORD_REFUSAL_STATUS
 from tools.mobile.replay.guard import _confirmed
@@ -69,14 +69,46 @@ def _before_change_wait(run: _ReplayRun, step: _Step) -> bool:
     return _wait_spec(nxt, run.items)[0] == "changed"
 
 
+def _next_op(run: _ReplayRun, step: _Step) -> str:
+    """The op after *step* in the script, else ``""``."""
+    at = int((getattr(step, "entry", None) or {}).get("index", -1)) + 1
+    if not 0 < at < len(run.items):
+        return ""
+    return str(getattr(run.items[at], "op", "") or "")
+
+
+def _next_typed_target(run: _ReplayRun, step: _Step) -> Any:
+    """The target of the ``type`` that follows *step*, else ``None``.
+
+    A tap before it only focuses the field when that field is already on the
+    screen; the settle then has nothing to wait for (see ``settle_run``).
+    """
+    if _next_op(run, step) != "type":
+        return None
+    return getattr(run.items[int(step.entry["index"]) + 1], "target", None)
+
+
+# A ``type`` the keyboard CONFIRMED (``landed == yes``) and that another ``type``
+# follows needs no re-dump: the keyboard itself proved the text landed,
+# and the next op resolves its target on the screen in hand and settles on its
+# own read.
+def _typed_in_place(run: _ReplayRun, step: _Step, acted: Acted) -> bool:
+    """Whether a confirmed ``type`` is followed by another ``type``."""
+    landed = (acted.outcome.get("content") or {}).get("landed")
+    return (
+        step.op == "type" and landed == ime.LANDED_YES and _next_op(run, step) == "type"
+    )
+
+
 def _device_opts(run: _ReplayRun, step: _Step, front: bool) -> SettleOpts:
-    """The settle options of a device action; a front landing skips the redump."""
+    """The settle options of a device action; *front* skips the redump."""
     return SettleOpts(
         redump=not front,
         mark_no_change=True,
         op=step.op,
         extra_expected=_extra_expected(step),
         before_change_wait=_before_change_wait(run, step),
+        next_target=_next_typed_target(run, step),
     )
 
 
@@ -88,6 +120,7 @@ async def _settle_device(
     ``reply`` is ``None`` when the replay goes on to the next action.
     """
     front, entry, screen = _front_landing(run, step, acted), acted.entry, acted.screen
+    front = front or _typed_in_place(run, step, acted)
     if front:
         step_timing.mark("dump_skipped")
     if step.op in actions_mod.MUTATING_OPS:

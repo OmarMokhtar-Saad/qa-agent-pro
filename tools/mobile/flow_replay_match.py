@@ -27,6 +27,31 @@ def live_key(screen: Any, ctx: Any) -> str:
         return ""
 
 
+def live_keys(screen: Any, ctx: Any) -> tuple:
+    """Every key *screen* may be stored under: its own, then the context's activity.
+
+    Flows saved before the key preferred the screen's own activity were stamped
+    with the context's (memoised, so possibly stale) one, or none; matching any of
+    them keeps those flows usable.
+    """
+    package = str(getattr(ctx, "package", "") or "")
+    stale = str(getattr(ctx, "activity", "") or "")
+    own = live_key(screen, ctx)
+    keys = [own] + [_key_with(screen, package, a) for a in (stale, "-")]
+    return tuple(dict.fromkeys(k for k in keys if k))
+
+
+def _key_with(screen: Any, package: str, activity: str) -> str:
+    """The key of *screen* hashed with *activity* (``"-"``: with none at all)."""
+    try:
+        body = dict(screen) if isinstance(screen, dict) else {}
+        body["activity"] = "" if activity == "-" else activity
+        return screen_key.screen_key(body, package, "").key
+    except Exception:
+        logger.exception("flow replay: legacy screen key failed")
+        return ""
+
+
 def _templates(package: str) -> list:
     rows = (app_flows.list_flows(package).get("content")) or []
     out = []
@@ -43,15 +68,22 @@ def template(package: str, name: str) -> dict:
     return {} if got.get("error") else got["content"]
 
 
+def _keys(key: Any) -> tuple:
+    """*key* (one key or several) as a tuple of non-empty keys."""
+    keys = (key,) if isinstance(key, str) else tuple(key or ())
+    return tuple(k for k in keys if k)
+
+
 def starts(template: dict, key: str, at: int) -> bool:
     before = (template.get("meta") or {}).get("before") or []
-    return at < len(before) and bool(key) and before[at] == key
+    return at < len(before) and bool(key) and before[at] in _keys(key)
 
 
 def _first_at(template: dict, key: str) -> int:
     """The earliest step whose recorded screen is *key*, or ``-1``."""
     before = (template.get("meta") or {}).get("before") or []
-    return before.index(key) if key and key in before else -1
+    hits = [before.index(k) for k in _keys(key) if k in before]
+    return min(hits) if hits else -1
 
 
 def _rank(item: tuple) -> tuple:

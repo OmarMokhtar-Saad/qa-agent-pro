@@ -74,6 +74,8 @@ def _record(body: dict, head: tuple, walk: flow_replay_run.Walk) -> None:
     body["auto_replay"] = {
         "name": name,
         "pos": walk.pos,
+        "start": head[2],
+        "total": head[1],
         "done": [] if retry else done[-MAX_CHAIN * 2 :],
         "why": walk.why,
         "retry": retry,
@@ -84,7 +86,7 @@ def _record(body: dict, head: tuple, walk: flow_replay_run.Walk) -> None:
 
 async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
     """``(Auto, stop)``: one flow replayed from the live screen; stop ends the chain."""
-    key = flow_replay_match.live_key(auto.screen, ctx)
+    key = flow_replay_match.live_keys(auto.screen, ctx)
     name, template, pos = _resume(
         auto.body, key, str(getattr(ctx, "package", "") or "")
     )
@@ -96,7 +98,7 @@ async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
     walk = await flow_replay_run.run(
         ctx, plan, flow_replay_run.Walk(auto.screen, pos, [])
     )
-    _record(auto.body, (name, len(template["steps"])), walk)
+    _record(auto.body, (name, len(template["steps"]), pos), walk)
     return Auto(walk.screen, auto.body, True), bool(walk.why)
 
 

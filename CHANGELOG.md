@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.116.0] - 2026-10-15
+## [1.117.0] - 2026-10-15
 
 ### Added
 
@@ -29,23 +29,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- A learned flow now replays from whatever step matches the current
-  screen, not only from its first step, so a flow saved on a first
-  launch (onboarding included) still replays on later runs. A chain of
-  replays stops after two minutes and hands back to the model.
-- App Tester asks for the app name before opening anything, remembers
-  each app's Firebase id and list position on disk across server
-  restarts, installs from the app page it already opened instead of
-  opening App Tester again, skips App Tester when the installed version
-  is already the latest it just read, and stops scrolling at the first
-  page with nothing new.
-- Faster steps: stopping and pulling the step's screen recording no
-  longer counts as a screen change, so the last screen read is reused
-  for the next step; a wait that saw the screen change keeps that read
-  instead of reading again; and a tap followed by a change wait skips
-  its extra settle read.
+- Learned flows no longer keep change waits that saw no change when
+  they were recorded, and replaying an older flow skips such waits.
+- A replay stops and hands back to the model when a step leaves the
+  app or lands on a screen the flow never recorded, and says which.
+- A screen key prefers the screen's own activity when the screen
+  carries one, and replay also matches keys stored by older flows.
+- Explore turns that replayed a learned flow name the flow and the
+  steps replayed in their title.
+- Faster steps: a typed value the keyboard confirmed is not read back
+  again before the next field, a tap is not settled again when the
+  next field to type into is already on screen, and a masked field
+  (password, OTP) is checked with one screen read after the focus
+  moves instead of repeated reads.
+- App Tester remembers an app's row and list position after any
+  successful find, and after the Update tap it watches the foreground
+  app instead of reading the full screen on every check.
 
 ### Fixed
 
-- A first App Tester call without an app name no longer scans the
-  whole list before asking for it.
+- A screen read that hangs on an animating screen times out after
+  20 s and is retried once.
+- Calls rejected for unexpected arguments log the argument names (never
+  the values).

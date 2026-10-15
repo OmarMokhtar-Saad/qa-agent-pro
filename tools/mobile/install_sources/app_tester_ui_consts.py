@@ -29,6 +29,11 @@ MAX_BACK_TO_LIST = 3
 #: Pause between screens while something loads or installs.
 APP_TESTER_POLL_S = 1.0
 
+#: While an install runs, the screen is dumped (a dump waits for the animating
+#: progress bar to idle: seconds) only when the foreground package changes or
+#: after this many cheap foreground polls; the version is checked every poll.
+QUIET_POLLS = 4
+
 ACTION_LABELS = ("Update", "Download", "Install")
 OPEN_LABEL = "Open"
 _PROGRESS_STARTS = ("downloading", "installing", "pending", "preparing")
@@ -58,6 +63,9 @@ class _Run:
     pos: int = 0
     #: scroll offset of the proven list top (None when not proven).
     top_pos: Optional[int] = None
+    #: install watch: the foreground package last seen, cheap polls since a dump.
+    last_front: str = ""
+    quiet: int = 0
     #: one (direction, rows seen, new rows, offset) entry per scroll made.
     scrolls: list = field(default_factory=list)
 
