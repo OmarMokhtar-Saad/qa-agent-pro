@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.117.0] - 2026-10-15
+## [1.118.0] - 2026-10-15
 
 ### Added
 
@@ -29,26 +29,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Learned flows no longer keep change waits that saw no change when
-  they were recorded, and replaying an older flow skips such waits.
-- A replay stops and hands back to the model when a step leaves the
-  app or lands on a screen the flow never recorded, and says which.
-- A screen key prefers the screen's own activity when the screen
-  carries one, and replay also matches keys stored by older flows.
-- Explore turns that replayed a learned flow name the flow and the
-  steps replayed in their title.
-- Faster steps: a typed value the keyboard confirmed is not read back
-  again before the next field, a tap is not settled again when the
-  next field to type into is already on screen, and a masked field
-  (password, OTP) is checked with one screen read after the focus
-  moves instead of repeated reads.
-- App Tester remembers an app's row and list position after any
-  successful find, and after the Update tap it watches the foreground
-  app instead of reading the full screen on every check.
+- A replayed step no longer pauses for its learned wait: it waits only
+  until its target is on screen, with the learned time as the limit,
+  and starts at once when the target is already there. A wait that
+  ran out is not learned back, so waits no longer grow run by run;
+  waits learned by older versions are relearned automatically.
+- The step timing line shows the time spent in learned waits.
+- A learned flow replays in one batch, checking each step's screen on
+  the screen read it already has and reading again only when it does
+  not match; an unmatched screen hands back to the model.
+- Faster typing: confirmed fill, clear and type steps in a row are not
+  read back between fields, the QA keyboard stays selected for the
+  whole run (your keyboard comes back when the run ends, is stopped,
+  fails or hands over to you), and switching keyboards no longer
+  forces a new screen read.
 
 ### Fixed
 
-- A screen read that hangs on an animating screen times out after
-  20 s and is retried once.
-- Calls rejected for unexpected arguments log the argument names (never
-  the values).
+- A script rejected for its format returns the reason at once instead
+  of reading the screen and replaying flows first.

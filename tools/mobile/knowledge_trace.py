@@ -31,6 +31,7 @@ class StepRec(TypedDict, total=False):
     screen_package: str
     outcome: str
     ms: int
+    waited_ms: int
     retries: int
     landed: bool | None
     locator_used: str
@@ -81,6 +82,7 @@ def _tail(entry: dict) -> StepRec:
     landed = entry.get("landed")
     return StepRec(
         ms=_int(entry.get("ms")),
+        waited_ms=_int(entry.get("waited_ms")),
         retries=_int(entry.get("retries")),
         landed=landed if isinstance(landed, bool) else None,
         locator_used=_text(entry.get("locator_used"), 200),

@@ -24,6 +24,8 @@ def failed_why(content: dict) -> str:
     detail = str(last.get("detail") or "")
     if outcome in ("left_app", "system_dialog"):
         return "%s (%s): %s" % (LEFT_APP, outcome, detail)
+    if outcome == "screen_mismatch" and detail:
+        return detail
     base = "the step did not run as planned"
     return "%s (%s)" % (base, outcome) if outcome else base
 

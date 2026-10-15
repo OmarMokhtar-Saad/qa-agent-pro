@@ -11,6 +11,7 @@ from tools.mobile.replay.guard import NON_ACTUATING_OPS
 from tools.mobile.replay.know_guard import NoteStep
 from tools.mobile.replay.knowledge import _apply_knowledge
 from tools.mobile.replay.loop_dispatch import _dispatch_op
+from tools.mobile.replay.loop_gate import gate_step
 from tools.mobile.replay.loop_open import _step_prelude
 from tools.mobile.replay.present_pick import resolve_optional_text
 from tools.mobile.replay.present_wait import present_read
@@ -62,7 +63,8 @@ async def _knowledge_before(
     if note_stop is not None:
         stop = _knowledge_stop(run, at._replace(screen=screen), note_stop)
         return screen, stop, False
-    reply, inserted = await _knowledge_pre(run, cursor, ahead._replace(screen=screen))
+    ahead = ahead._replace(screen=screen)
+    reply, inserted, screen = await _knowledge_pre(run, cursor, ahead)
     return screen, reply, inserted
 
 
@@ -165,6 +167,8 @@ async def _replay_one(run: _ReplayRun, turn: Turn, item: tuple) -> dict | None:
     index, action = item
     if index and time.monotonic() >= turn.state.deadline:
         return _budget_stop(run, index, turn.state.screen)
+    if (gated := await gate_step(run, turn.state, index)) is not None:
+        return gated
     entry, reply = _step_prelude(run, turn.state, item)
     if reply is not None:
         return reply

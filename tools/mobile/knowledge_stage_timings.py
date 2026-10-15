@@ -17,14 +17,20 @@ import logging
 import math
 from typing import NamedTuple
 
-from tools.mobile import actions, knowledge_db, knowledge_limits, run_store
+from tools.mobile import (
+    actions,
+    knowledge_db,
+    knowledge_limits,
+    ktim_samples,
+    run_store,
+)
 from tools.mobile.knowledge_learn import StageResult
 from tools.mobile.kstg_timing_write import Plan, insert_row, update_row
 
 logger = logging.getLogger(__name__)
 
 #: Ops whose duration is not the app's response time.
-_SKIP_OPS = frozenset({"wait", "done", "ask_tester", "assert"})
+_SKIP_OPS = ktim_samples.UNREADY_OPS
 _P90 = 0.9
 _OPEN = "screen_key = ? AND action = ? AND target = ? AND invalid_at IS NULL"
 
@@ -66,10 +72,16 @@ def _usable(rec: dict) -> bool:
         rec.get("outcome") == "ok"
         and not rec.get("retries")
         and not rec.get("fired")
-        and int(rec.get("ms") or 0) > 0
+        and int(rec.get("ms") or 0) - int(rec.get("waited_ms") or 0) > 0
         and rec.get("op") not in _SKIP_OPS
         and bool(rec.get("screen_key"))
     )
+
+
+def _net_ms(rec: dict, factor: float) -> int:
+    """The step's own ms: what we waited before it (``waited_ms``) is not the app's."""
+    own = int(rec["ms"]) - int(rec.get("waited_ms") or 0)
+    return max(1, int(round(own / factor)))
 
 
 def collect(steps: list, factor: float = 1.0) -> dict:
@@ -79,16 +91,13 @@ def collect(steps: list, factor: float = 1.0) -> dict:
         if not _usable(rec):
             continue
         key = (rec["screen_key"], rec.get("op", ""), rec.get("target_rid", ""))
-        out.setdefault(key, []).append(max(1, int(round(int(rec["ms"]) / factor))))
+        out.setdefault(key, []).append(_net_ms(rec, factor))
     return out
 
 
 def _samples(raw: object) -> list:
-    try:
-        got = json.loads(str(raw or "[]"))
-        return [int(v) for v in got if isinstance(v, (int, float))]
-    except (ValueError, TypeError, OverflowError):
-        return []
+    """The current samples of a stored row; a legacy row starts over."""
+    return ktim_samples.decode(raw) or []
 
 
 def _fresh(old: dict | None, run_id: str) -> bool:
@@ -106,7 +115,7 @@ def _values(key: tuple, samples: list, version: str) -> dict:
         "screen_key": key[0],
         "action": key[1],
         "target": key[2],
-        "samples_json": samples,
+        "samples_json": ktim_samples.encode(samples),
         "n": n,
         "p90_ms": p90(samples),
         "wait_ms": wait_for(p90(samples), n),

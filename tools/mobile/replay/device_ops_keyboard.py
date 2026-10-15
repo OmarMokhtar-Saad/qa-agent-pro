@@ -9,7 +9,6 @@ from tools.mobile import (
     step_timing,
 )
 from tools.mobile.replay.device_ops_consts import KEYBOARD_NOTE, KEYBOARD_OPS
-from tools.mobile.replay.dump import _drop_carried
 
 logger = logging.getLogger("tools.mobile.executor")
 
@@ -33,7 +32,6 @@ def needs_keyboard(script: object) -> bool:
 # Never raises.
 async def keyboard_up(serial: str) -> dict:
     """Remember the current keyboard; install, enable, select ours; QUERY once."""
-    _drop_carried(serial)  # the keyboard changes what is on screen
     try:
         remembered = await ime.remember_previous(serial)
         if remembered.get("error"):
@@ -108,7 +106,6 @@ async def _keyboard_arm_and_probe(serial: str, previous: str) -> dict | None:
 
 async def keyboard_down(serial: str, previous: str) -> dict:
     """Put the remembered keyboard back. ``content.note`` is what to tell."""
-    _drop_carried(serial)  # the keyboard changes what is on screen
     try:
         restored = await ime.restore_previous(serial, previous)
         if restored.get("error"):

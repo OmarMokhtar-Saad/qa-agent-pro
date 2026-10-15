@@ -17,6 +17,12 @@ from tools.mobile import render as mobile_render
 from tools.mobile import run_store, session_submit, step_timing
 from tools.untrusted import single_line as _safe
 
+#: Tail of a reply whose script the schema refused: nothing ran, so no dump.
+REFUSED_TAIL = (
+    "The script was refused before it ran; the screen is unchanged. "
+    "Fix it and call `qa_submit_mobile_step` again."
+)
+
 
 def _submit_call(turn: StepTurn):
     """The ``SubmitCall`` for this step's script, under the step budget."""
@@ -46,6 +52,8 @@ async def _step_tail(turn: StepTurn, body: dict) -> str:
     """The packet the replay already carries, else the next packet."""
     run_id, token, budget = turn.run_id, turn.token, turn.budget
     progress = turn.progress
+    if body.get("refused"):
+        return REFUSED_TAIL
     if body.get("packet"):
         tail = await _mobile_packet_text(
             PacketAsk(

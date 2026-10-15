@@ -33,6 +33,7 @@ def _explore_needs_model(reason: str, resolved: dict) -> dict:
             "next": {},
             "field": "",
             "resolved": resolved,
+            "refused": True,
         },
     }
 

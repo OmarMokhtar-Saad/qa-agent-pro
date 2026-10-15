@@ -6,7 +6,9 @@ import re
 from typing import Any
 
 from tools.mobile import ime
+from tools.mobile.replay import keyboard_hold
 from tools.mobile.replay.context import Context
+from tools.mobile.replay.context_consts import STATUS_ERROR, STATUS_NEEDS_TESTER
 from tools.mobile.replay.device_ops import keyboard_down, keyboard_up, needs_keyboard
 from tools.mobile.replay.loop_steps import _replay_steps
 
@@ -58,18 +60,64 @@ def _with_note(replied: Any, note: str) -> Any:
     return replied
 
 
-# A script with a ``type``/``clear`` step runs :func:`keyboard_up` before its
-# first step and :func:`keyboard_down` in a ``finally`` -- success, failure,
-# an exception and a cancelled task (an abort) all restore. A keyboard that
-# cannot come up stops the run by name before any step, restoring first if
-# the select had already happened. Otherwise the contract is
-# :func:`_replay_steps`'s.
+# A script with a ``type``/``clear`` step brings the QA keyboard up before its
+# first step. A run with a run id then HOLDS it across its scripts
+# (``keyboard_hold``); a script that stops for the tester, errors, raises or is
+# cancelled (an abort) gives it back at once, so the tester never inherits it.
+# Without a hold it goes down in a ``finally`` after every script. A keyboard
+# that cannot come up never stops the run (``_bring_up``).
 async def _replay_keyboard(script: Any, ctx: Context) -> dict:
     """Execute *script* with the QA keyboard up for its typing (why: above)."""
     if not needs_keyboard(script):
         return await _replay_steps(script, ctx)
     serial = str(getattr(ctx, "serial", "") or "")
+    run_id = str(getattr(ctx, "run_id", "") or "")
+    if keyboard_hold.is_held(serial, run_id):
+        return await _replay_held(script, ctx)
     previous, fallback_note = await _bring_up(ctx, serial)
+    if keyboard_hold.hold(serial, run_id, previous):
+        return await _replay_held(script, ctx)
+    return await _replay_and_restore(script, ctx, (previous, fallback_note))
+
+
+#: Script ends after which the run stops typing: the hold is given back.
+_ENDS_HOLD = frozenset({STATUS_NEEDS_TESTER, STATUS_ERROR})
+
+
+def _ends_hold(replied: Any) -> bool:
+    """True when the script errored or stopped for the tester."""
+    if not isinstance(replied, dict) or replied.get("error"):
+        return True
+    content = replied.get("content")
+    return isinstance(content, dict) and content.get("status") in _ENDS_HOLD
+
+
+async def _replay_held(script: Any, ctx: Context) -> dict:
+    """Run the steps on the run's held keyboard; a stop or a failure gives it back."""
+    try:
+        replied = await _replay_steps(script, ctx)
+    except BaseException:
+        await _give_back(ctx)
+        raise
+    if not _ends_hold(replied):
+        return replied
+    return _with_note(replied, _keyboard_note("", await _give_back(ctx)))
+
+
+async def _give_back(ctx: Context) -> dict:
+    """End the run's hold and put the remembered keyboard back."""
+    run_id = str(getattr(ctx, "run_id", "") or "")
+    previous = keyboard_hold.previous(run_id)
+    keyboard_hold.forget(run_id)
+    if previous is None:
+        return {"error": None, "content": None}
+    return await keyboard_down(str(getattr(ctx, "serial", "") or ""), previous)
+
+
+async def _replay_and_restore(script: Any, ctx: Context, up: tuple) -> dict:
+    """Run the steps, then give the tester's keyboard back (no hold)."""
+    previous, fallback_note = up
+    serial = str(getattr(ctx, "serial", "") or "")
     down: dict = {"error": None, "content": None}
     try:
         replied = await _replay_steps(script, ctx)

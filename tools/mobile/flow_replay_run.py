@@ -13,7 +13,7 @@ from typing import Any, NamedTuple
 
 from tools.mobile import (
     actions,
-    flow_nochange,
+    flow_replay_batch,
     flow_replay_match,
     flow_replay_stop,
     media,
@@ -30,6 +30,9 @@ LANDING_WAIT_MS = 6000
 
 #: Start of the stop reason when a step needs a tester input not yet given.
 MISSING_INPUT = "the tester has not supplied"
+
+#: The stop reason when the live screen is not the one a step was saved from.
+WRONG_SCREEN = "the screen is not the one this step was saved from"
 
 
 class Walk(NamedTuple):
@@ -62,12 +65,9 @@ async def _land(ctx: Any, screen: Any, want: str) -> tuple:
     return bool(found), latest
 
 
-async def _run_one(ctx: Any, ref: media.ClipRef, step: dict) -> dict:
-    """The replay content of the one *step*, recorded on the clip *ref* names.
-
-    ``{}`` when the step cannot be built or replayed (the clip is then abandoned).
-    """
-    parsed = actions.parse_script({"actions": [step]})
+async def _run_batch(ctx: Any, ref: media.ClipRef, steps: list) -> dict:
+    """The replay content of *steps* as one script on one clip; ``{}`` if it cannot run."""
+    parsed = actions.parse_script({"actions": steps}, max_actions=actions.MAX_ACTIONS)
     if parsed.get("error"):
         return {}
     clip = (await media.start_clip(ref, parsed["content"])).get("content")
@@ -87,52 +87,73 @@ def _ok(content: dict) -> bool:
     return str(last.get("outcome") or "") in OK_OUTCOMES
 
 
-def _problem(ctx: Any, plan: Plan, walk: Walk) -> str:
-    """Why step ``walk.pos`` cannot run now (wrong screen, missing input), else ``""``."""
-    meta = plan.template.get("meta") or {}
-    want = (meta.get("before") or [""] * (walk.pos + 1))[walk.pos]
-    if want and want not in flow_replay_match.live_keys(walk.screen, ctx):
-        return "the screen is not the one this step was saved from"
-    name = flow_replay_match.needed(plan.template["steps"][walk.pos])
-    if name and name not in plan.inputs:
-        return MISSING_INPUT + " `%s`" % name
-    return ""
+def _gate(ctx: Any, plan: Plan, batch: flow_replay_batch.Batch) -> Any:
+    """The per-step gate: the live screen must be the one the step was saved from.
+
+    The first step is judged on the screen in hand; later ones may wait (fresh dumps)
+    for it to land. An unresolved mismatch hands the replay back to the model.
+    """
+
+    async def gate(index: int, screen: Any) -> tuple:
+        want = flow_replay_batch.wanted(plan.template, batch.origin[index])
+        if index == 0:
+            ok = not want or want in flow_replay_match.live_keys(screen, ctx)
+            return screen, ("" if ok else WRONG_SCREEN)
+        landed, latest = await _land(ctx, screen, want)
+        return latest, ("" if landed else WRONG_SCREEN)
+
+    return gate
 
 
-async def _after(ctx: Any, plan: Plan, walk: Walk) -> Walk:
-    """The walk after step ``walk.pos - 1`` ran: left the app, unrecorded, or landed."""
-    pos, screen, trace = walk.pos, walk.screen, walk.trace
-    step = plan.template["steps"][pos - 1]
-    cut = flow_replay_stop.cut_why(ctx, screen, step)
+async def _finish(ctx: Any, plan: Plan, walk: Walk) -> Walk:
+    """The walk after the last step of a batch ran: left the app, unrecorded, or landed."""
+    step = plan.template["steps"][walk.pos - 1]
+    cut = flow_replay_stop.cut_why(ctx, walk.screen, step)
     if cut:
-        return Walk(screen, pos, trace, cut)
+        return walk._replace(why=cut)
     meta = plan.template.get("meta") or {}
-    want = (meta.get("after") or [""] * pos)[pos - 1]
-    landed, screen = await _land(ctx, screen, want)
+    want = (meta.get("after") or [""] * walk.pos)[walk.pos - 1]
+    landed, screen = await _land(ctx, walk.screen, want)
     why = "" if landed else flow_replay_stop.UNRECORDED
-    return Walk(screen, pos, trace, why)
+    return Walk(screen, walk.pos, walk.trace, why)
 
 
-async def _step(ctx: Any, plan: Plan, walk: Walk) -> Walk:
-    """Run step ``walk.pos``; the next walk, with ``why`` set when the replay ends there."""
-    if flow_nochange.skip_at(plan.template, walk.pos):
-        return walk._replace(pos=walk.pos + 1)
-    bad = _problem(ctx, plan, walk)
-    if bad:
-        return walk._replace(why=bad)
-    step = flow_replay_match.fill(plan.template["steps"][walk.pos], plan.inputs)
-    content = await _run_one(ctx, plan.ref, step)
+def _idle(plan: Plan, walk: Walk, batch: flow_replay_batch.Batch) -> Walk:
+    """The walk when nothing in the batch can run: the flow ended, or an input is missing."""
+    steps = plan.template["steps"]
+    if batch.end >= len(steps):
+        return walk._replace(pos=batch.end)
+    name = flow_replay_match.needed(steps[batch.end])
+    return walk._replace(pos=batch.end, why=MISSING_INPUT + " `%s`" % name)
+
+
+def _failed_at(content: dict, batch: flow_replay_batch.Batch) -> int:
+    """The flow position of the step the batch stopped on, by its script index:
+    entries the replay inserts (a dialog tap, a screen check) never shift it."""
+    trace = [e for e in content.get("trace") or [] if isinstance(e, dict)]
+    marks = [e["index"] for e in trace if isinstance(e.get("index"), int)]
+    at = marks[-1] if marks else len(trace) - 1
+    return batch.origin[min(max(at, 0), len(batch.origin) - 1)]
+
+
+async def _batch(ctx: Any, plan: Plan, walk: Walk) -> Walk:
+    """Run every step from ``walk.pos`` that can run, as one script."""
+    batch = flow_replay_batch.build(plan.template, plan.inputs, walk.pos)
+    if not batch.steps:
+        return _idle(plan, walk, batch)
+    with flow_replay_batch.armed(ctx, _gate(ctx, plan, batch), walk.screen):
+        content = await _run_batch(ctx, plan.ref, batch.steps)
     trace = walk.trace + list(content.get("trace") or [])
     screen = content.get("screen") or walk.screen
     if not _ok(content):
         why = flow_replay_stop.failed_why(content)
-        return Walk(screen, walk.pos, trace, why)
-    return await _after(ctx, plan, Walk(screen, walk.pos + 1, trace))
+        return Walk(screen, _failed_at(content, batch), trace, why)
+    return await _finish(ctx, plan, Walk(screen, batch.origin[-1] + 1, trace))
 
 
 async def run(ctx: Any, plan: Plan, walk: Walk) -> Walk:
     """Replay from ``walk.pos`` to the end of the flow or the first thing that stops it."""
     total = len(plan.template.get("steps") or [])
     while walk.pos < total and not walk.why:
-        walk = await _step(ctx, plan, walk)
+        walk = await _batch(ctx, plan, walk)
     return walk

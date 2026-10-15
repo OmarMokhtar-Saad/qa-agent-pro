@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any, NamedTuple, cast
 
-from tools.mobile import actions as actions_mod
 from tools.mobile import knowledge_hooks
 from tools.mobile.replay.context import (
     STATUS_NEEDS_MODEL,
@@ -15,6 +13,7 @@ from tools.mobile.replay.context import (
     _result,
     _StepCursor,
 )
+from tools.mobile.replay.steps_ready import _adaptive_wait
 from tools.mobile.replay.steps_stop import (
     StepAt,
     _close,
@@ -52,32 +51,23 @@ def _insert_steps(run: _ReplayRun, cursor: _StepCursor, found: tuple) -> bool:
     return inserted
 
 
-async def _adaptive_wait(run: _ReplayRun, action: Any, ahead: Ahead) -> None:
-    """The knowledge wait for *action*, capped by the max wait and the deadline."""
-    ms = knowledge_hooks.step_wait(run.ctx, action, ahead.screen)
-    left = int((ahead.deadline - time.monotonic()) * 1000)
-    ms = min(ms, int(actions_mod.MAX_WAIT_MS), left)
-    if ms > 0:
-        await asyncio.sleep(ms / 1000.0)
-
-
 # ``reply`` ends the replay (a refuse or stop directive); ``inserted`` means
 # steps were spliced in and the loop must re-enter at the same index.
 async def _knowledge_pre(
     run: _ReplayRun, cursor: _StepCursor, ahead: Ahead
-) -> tuple[dict | None, bool]:
-    """``pre_step`` then the adaptive wait, once each: ``(reply, inserted)``."""
+) -> tuple[dict | None, bool, Any]:
+    """``pre_step`` then the adaptive wait, once each: ``(reply, inserted, screen)``."""
     ctx, (index, action, entry) = run.ctx, ahead.step
     ctx.script_ahead = list(cursor.items[index:])
     pre = knowledge_hooks.Pre(entry, action, ahead.screen)
     directive = await knowledge_hooks.pre_step(ctx, pre)
     if directive.kind in ("refuse", "stop"):
         why = directive.reason or "stopped by app knowledge"
-        return _knowledge_stop(run, StepAt(index, entry, ahead.screen), why), False
+        stop = _knowledge_stop(run, StepAt(index, entry, ahead.screen), why)
+        return stop, False, ahead.screen
     if directive.kind == "insert_steps":
-        return None, _insert_steps(run, cursor, (index, directive))
-    await _adaptive_wait(run, action, ahead)
-    return None, False
+        return None, _insert_steps(run, cursor, (index, directive)), ahead.screen
+    return None, False, await _adaptive_wait(run, action, ahead)
 
 
 def _knowledge_post(run: _ReplayRun, post: knowledge_hooks.Post) -> None:

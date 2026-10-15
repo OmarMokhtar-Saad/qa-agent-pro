@@ -8,6 +8,7 @@ from tools.mobile import actions as actions_mod
 from tools.mobile import ime, step_timing
 from tools.mobile.replay.context import STATUS_ERROR, _ReplayRun, _result, _Step
 from tools.mobile.replay.device_ops import PASSWORD_REFUSAL_STATUS
+from tools.mobile.replay.device_ops_consts import KEYBOARD_OPS as TEXT_OPS
 from tools.mobile.replay.guard import _confirmed
 from tools.mobile.replay.settle import SettleJob, SettleOpts, _settle
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
@@ -88,16 +89,24 @@ def _next_typed_target(run: _ReplayRun, step: _Step) -> Any:
     return getattr(run.items[int(step.entry["index"]) + 1], "target", None)
 
 
-# A ``type`` the keyboard CONFIRMED (``landed == yes``) and that another ``type``
-# follows needs no re-dump: the keyboard itself proved the text landed,
-# and the next op resolves its target on the screen in hand and settles on its
-# own read.
+# A text step (``type``/``fill``/``clear``) the keyboard CONFIRMED and that
+# another text step follows needs no re-dump: the keyboard itself proved the
+# text landed (``landed == yes``) or the field cleared, and the next op resolves
+# its target on the screen in hand and settles on its own read. A text step
+# followed by a TAP keeps the re-dump on purpose: the tap's target (a Send
+# control that only appears once text is in) and the destructive guard must see
+# the actuated screen, not the one before the keyboard acted.
+def _text_confirmed(step: _Step, acted: Acted) -> bool:
+    """Whether the keyboard confirmed this text step."""
+    content = acted.outcome.get("content") or {}
+    if step.op == "clear":
+        return content.get("cleared") is True
+    return step.op in TEXT_OPS and content.get("landed") == ime.LANDED_YES
+
+
 def _typed_in_place(run: _ReplayRun, step: _Step, acted: Acted) -> bool:
-    """Whether a confirmed ``type`` is followed by another ``type``."""
-    landed = (acted.outcome.get("content") or {}).get("landed")
-    return (
-        step.op == "type" and landed == ime.LANDED_YES and _next_op(run, step) == "type"
-    )
+    """Whether a confirmed text step is followed by another text step."""
+    return _text_confirmed(step, acted) and _next_op(run, step) in TEXT_OPS
 
 
 def _device_opts(run: _ReplayRun, step: _Step, front: bool) -> SettleOpts:

@@ -118,3 +118,7 @@ class Context:
     # into the App Tester, an installer). A screen of one is NOT 'left the
     # app'. Empty (the default) is today's behaviour. Set by the caller.
     expect_apps: tuple = ()
+    # Per-step identity gate of a batched replay: ``async (index, screen) ->
+    # (screen, why)``. Run on the screen in hand before step *index*; a non-empty
+    # ``why`` ends the script there with nothing actuated. ``None`` = no gate.
+    step_gate: Any = None

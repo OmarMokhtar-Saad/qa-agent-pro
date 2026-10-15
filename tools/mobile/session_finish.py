@@ -24,6 +24,7 @@ from tools.mobile.device_lock import (
     release_device_lock,
     serial_of,
 )
+from tools.mobile.replay import keyboard_hold
 from tools.mobile.session_finish_ports import (  # noqa: F401
     _finalizer,
     awaits_tester,
@@ -62,7 +63,7 @@ def stop_ports() -> stop_run.StopPorts:
         active_runs=active_runs,
         stop_heartbeat=heartbeat.stop,
         finalize=_finalizer(run_finalize.STOP_TESTER),
-        release=release_if_held,
+        release=release_restoring,
     )
 
 
@@ -75,7 +76,7 @@ def idle_ports() -> lock_reaper.ReleasePorts:
     return SimpleNamespace(
         stop_heartbeat=heartbeat.stop,
         finalize=_finalizer(run_finalize.STOP_IDLE),
-        release_lock=release_if_held,
+        release_lock=release_restoring,
     )
 
 
@@ -94,6 +95,17 @@ def release_if_held(serial: str, run_id: str) -> dict:
     released = release_device_lock(run_id, DeviceRelease(force=True))
     run_lease_release.mark_released(run_id)
     return released
+
+
+async def release_restoring(serial: str, run_id: str) -> dict:
+    """:func:`release_if_held` that first gives back the keyboard the run holds."""
+    keyboard_hold.forget(run_id)
+    if locks.names_held_by(run_id):
+        with never_raise(
+            logger, "mobile.session.release: keyboard skipped", exc_info=True
+        ):
+            await ime_session.restore(run_id)
+    return release_if_held(serial, run_id)
 
 
 # **The one chokepoint for ending a run's hold on a device.** Every
@@ -141,9 +153,18 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
     return _finish_device_reply(released, restores, stale)
 
 
+def _forget_keyboard_hold(owner: str) -> None:
+    """The run's keyboard hold ends with the run, even when the device is gone."""
+    with never_raise(
+        logger, "mobile.session.finish_device: hold skipped", exc_info=True
+    ):
+        keyboard_hold.forget(owner)
+
+
 async def _restore_run_state(owner: str) -> tuple[dict, dict, dict]:
     """Disarm, then restore keyboard, animations and a11y: ``(ime, anim, a11y)``."""
 
+    _forget_keyboard_hold(owner)
     # DISARM first (G4): the nonce is forgotten even when the device is gone.
     with never_raise(
         logger, "mobile.session.finish_device: disarm skipped", exc_info=True
