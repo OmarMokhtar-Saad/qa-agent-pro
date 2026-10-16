@@ -105,13 +105,18 @@ def release_if_held(serial: str, run_id: str) -> dict:
 
 
 async def release_restoring(serial: str, run_id: str) -> dict:
-    """:func:`release_if_held` that first gives back the keyboard the run holds."""
+    """:func:`release_if_held` that first gives back keyboard, animations and a11y.
+
+    A stop or an idle release ends the run as surely as ``finish_device`` does,
+    so it restores the same state: a keyboard-only restore left the a11y service
+    on and the animation scales at 0 on the tester's device.
+    """
     keyboard_hold.forget(run_id)
     if locks.names_held_by(run_id):
         with never_raise(
-            logger, "mobile.session.release: keyboard skipped", exc_info=True
+            logger, "mobile.session.release: restore skipped", exc_info=True
         ):
-            await ime_session.restore(run_id)
+            await _restore_run_state(run_id)
     return release_if_held(serial, run_id)
 
 

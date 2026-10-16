@@ -126,9 +126,11 @@ def _explore_worker_instructions() -> str:
         "step of it cost four. "
         "Record anything a tester would want to know in `finding`, "
         "one sentence, even when the turn went fine. "
-        "Set `sub_goal` to the one step you are on now. When the "
-        "goal moves on to ANOTHER app and that app is on screen, "
-        "set `app` to its package name once."
+        "Set `sub_goal` to the one step you are on now: it goes INSIDE "
+        "the `script` JSON, "
+        '{"actions": [...], "sub_goal": "..."}, never as a tool '
+        "argument. When the goal moves on to ANOTHER app and that "
+        "app is on screen, set `app` the same way, once."
     )
 
 

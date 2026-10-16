@@ -120,8 +120,8 @@ GOAL_FIELDS: tuple[str, ...] = ("goal",)
 
 GOAL_OMITTED_NOTE = (
     "The run's full goal went out with the FIRST packet of this run in this "
-    "chat and has not changed. `sub_goal` is the step you are on now: plan "
-    "the next step from it and the screen. If the goal is no longer in front "
+    "chat and has not changed. `sub_goal` is the step you are on now (inside the "
+    "`script` JSON, not a tool argument): plan the next step from it and the screen. If the goal is no longer in front "
     "of you, send your best attempt anyway -- a script this server cannot "
     "parse is answered with the goal and the whole block again."
 )

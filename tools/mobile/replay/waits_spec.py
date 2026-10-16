@@ -70,3 +70,21 @@ def _condition_words(action: object, kind: str, wait_text: str) -> tuple[str, st
     gone = bool(getattr(action, "until_gone", False))
     label = "element " + repr(wait_text[:120]) + (" gone" if gone else " present")
     return "found " + label, "timed out waiting for " + label, label
+
+
+# The "did not change" sentence names the time the wait REALLY took. A wait cut
+# short (a dump that kept failing, the focus probe giving up) came back well
+# inside its limit, and "did not change in 15s" for a 1.1 s wait is the
+# true-shaped sentence that misleads the model about how long the screen was
+# watched. A wait that ran to its limit keeps the plain wording.
+def _unchanged_detail(wait_ms: int, elapsed_ms: int) -> str:
+    """What an unchanged ``wait_until_changed`` DID: the real time, and an early end."""
+    if elapsed_ms >= wait_ms * 0.9:
+        return "the screen did not change in " + _secs(wait_ms)
+    return (
+        "the screen did not change in "
+        + _secs(elapsed_ms)
+        + " (the wait ended early, before its "
+        + _secs(wait_ms)
+        + " limit: the screen could not be read or settled)"
+    )

@@ -30,6 +30,8 @@ _PENDING: dict = {}
 def begin(serial: str) -> None:
     """Start the "before" probe beside a dump about to run; never raises."""
     key = str(serial or "")
+    if cheaper_to_dump(key):  # note_read already popped the last one
+        return
     try:
         _PRE[key] = asyncio.get_running_loop().create_task(
             screen_probe.read(key, ANCHOR_BUDGET_S)
@@ -101,6 +103,8 @@ def schedule(serial: str, gen: int) -> None:
     """Take the anchor in the background; never raises, never blocks the dump."""
     serial = str(serial or "")
     _ANCHOR.pop(serial, None)
+    if cheaper_to_dump(serial):
+        return
     try:
         task = asyncio.get_running_loop().create_task(_anchor(serial, gen))
     except RuntimeError:
@@ -111,15 +115,20 @@ def schedule(serial: str, gen: int) -> None:
 
 
 def worth_waiting(serial: str) -> bool:
-    """True when this device's dumps cost clearly more than its anchor probe.
-
-    On a fast dump path (a few hundred ms) the wait would cost more than the
-    dump a skip saves, so the caller acts at once and takes the dump.
-    """
+    """True when this device's dumps cost clearly more than its anchor probe;
+    on a fast dump path the caller acts at once and takes the dump instead."""
     key = str(serial or "")
     dump_ms = dump_latency_state.p90_ms(key)
     cost = _COST.get(key, PROBE_GUESS_S)
     return dump_ms is not None and dump_ms / 1000.0 > WAIT_PAYBACK_RATIO * cost
+
+
+def cheaper_to_dump(serial: str) -> bool:
+    """True once dump AND probe are timed (an untimed probe runs once) and the dump
+    is too fast to pay for it: the action would bump the generation first."""
+    key = str(serial or "")
+    timed = key in _COST and dump_latency_state.p90_ms(key) is not None
+    return timed and not worth_waiting(key)
 
 
 def miss_reason(serial: str) -> str:
@@ -127,6 +136,8 @@ def miss_reason(serial: str) -> str:
     key = str(serial or "")
     if key in _ANCHOR:
         return "other_screen"
+    if cheaper_to_dump(key):
+        return "cheaper_to_dump"
     task = _PENDING.get(key)
     if task is not None and not task.done() and not worth_waiting(key):
         return "cheaper_to_dump"

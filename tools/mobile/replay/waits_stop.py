@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from tools.mobile import step_timing
 from tools.mobile.replay.context import ReplayStop, _append, _ReplayRun, _result
 from tools.mobile.replay.context_consts import STATUS_NEEDS_MODEL
@@ -13,6 +15,7 @@ from tools.mobile.replay.waits_changed import (
     _wait_until_changed,
     _watch_after_wait,
 )
+from tools.mobile.replay.waits_spec import _unchanged_detail
 from tools.mobile.replay.waits_types import AfterWait, ChangedStep, StopView
 
 
@@ -49,9 +52,13 @@ def _wait_timeout_stop(run: _ReplayRun, view: StopView) -> dict:
 async def _poll_changed(run: _ReplayRun, step: ChangedStep, screen: object) -> tuple:
     """Run the change wait and watch it: ``(screen, changed, reusable, interruption)``."""
     before_wait = screen
+    started = time.monotonic()
     screen, changed, reusable = await _wait_until_changed(run.ctx, screen, step.wait_ms)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     step.entry["outcome"] = "ok"
     step.entry["detail"] = _changed_detail(step.op, step.wait_ms, changed)
+    if step.op != "wait" and not changed:
+        step.entry["detail"] = _unchanged_detail(step.wait_ms, elapsed_ms)
     after = AfterWait(before_wait, changed, reusable)
     screen, reusable, interruption = await _watch_after_wait(run.ctx, screen, after)
     return screen, changed, reusable, interruption

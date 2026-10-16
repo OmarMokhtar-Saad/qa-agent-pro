@@ -40,6 +40,19 @@ def accepted_keys(tool: Any) -> tuple[list[str], list[str]]:
     return [], []
 
 
+#: Turn-payload fields: a model that passes one as a tool argument is told
+#: they ride inside the ``script`` JSON, not beside it.
+_PAYLOAD_KEYS = frozenset({"sub_goal", "goal_reached", "request_extension"})
+
+
+def _payload_hint(rows: list[tuple[str, str]], keys: list[str]) -> str:
+    """One line when a rejected key belongs inside the ``script`` JSON."""
+    bad = sorted(k for k, _ in rows if k in _PAYLOAD_KEYS)
+    if "script" not in keys or not bad:
+        return ""
+    return f"`{'`, `'.join(bad)}` go INSIDE the `script` JSON, not as tool arguments."
+
+
 def _example(name: str, required: list[str], keys: list[str]) -> str:
     """A call with the required keys, or the first accepted ones."""
     shown = required or keys[:2]
@@ -56,5 +69,8 @@ def fix_message(name: str, found: Any, tool: Any = None) -> str:
         if keys:
             lines.append("Accepted keys: " + ", ".join(keys) + ".")
             lines.append("Corrected example: " + _example(name, required, keys))
+        hint = _payload_hint(rows, keys)
+        if hint:
+            lines.append(hint)
         return "\n".join(lines)
     return f"{name} rejected: invalid arguments."

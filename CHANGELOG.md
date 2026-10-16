@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.123.1] - 2026-10-16
+## [1.124.0] - 2026-10-16
 
 ### Added
 
@@ -29,12 +29,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- When fast reading cannot see the app window (a system dialog is in
-  front, or the screen is switching), only that one read uses the slow
-  path. Fast reading turns off for the run only after 10 such misses
-  in a row, or 3 real failures in a row.
+- On a device where screen reads are fast, the extra screen-unchanged
+  probe no longer runs: it cost about a second per action and never
+  paid back. Slow devices keep it.
+- The explore instructions and the rejection message say `sub_goal`
+  goes inside the `script` JSON, not as a tool argument.
 
 ### Fixed
 
-- Fast reading no longer turns off for the whole run after a system
-  dialog (such as a permission prompt) or a screen transition.
+- Stopping a run, or a new run taking over an idle one, now turns the
+  QA accessibility service off and restores the window animation
+  scales, not just the keyboard.
+- A code field that submits itself after the last digit is no longer
+  read as a failed entry when the next screen cannot be read at once.
+- A wait that ended early says how long it really waited instead of
+  naming its full limit.
+- A permission decline ("Not Allow", "Deny") is never learned as
+  the way to dismiss a popup; the permission rule answers those.

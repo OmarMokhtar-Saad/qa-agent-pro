@@ -17,6 +17,7 @@ from typing import Any
 
 from tools.mobile import knowledge_db, knowledge_limits, kstg_popup_text
 from tools.mobile.knowledge_learn import StageResult
+from tools.mobile.kstg_popup_permission import is_permission_decline
 from tools.mobile.kstg_popup_write import Sighting, store
 from tools.mobile.replay.guard import is_destructive
 
@@ -97,11 +98,21 @@ def _upsert(conn, run_id: str, popup: tuple) -> int:
     return store(conn, Sighting(run_id, popup, sig), found)
 
 
+def _refusal(rid: Any) -> str:
+    """Why a dismiss is not learned, or ""."""
+    if looks_destructive(rid):
+        return "destructive-looking dismiss refused"
+    if is_permission_decline(rid):
+        return "permission decline left to the permission rule"
+    return ""
+
+
 def run(conn, lc) -> StageResult:
     wrote, notes = 0, []
     for popup in find(lc.steps):
-        if looks_destructive(popup[2]):
-            notes.append("destructive-looking dismiss refused")
+        refused = _refusal(popup[2])
+        if refused:
+            notes.append(refused)
             continue
         wrote += _upsert(conn, lc.run_id, popup)
     ready = knowledge_db.rows(

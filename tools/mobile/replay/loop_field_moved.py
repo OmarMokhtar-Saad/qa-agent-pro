@@ -78,12 +78,20 @@ async def _focus_left(ctx: Context, focus: str, deadline: float) -> bool:
 
 
 async def moved_on_masked(ctx: Context, before: object) -> Moved:
-    """A masked field cannot be read back: focus probes, then ONE dump as proof."""
+    """A masked field cannot be read back: focus probes, then a dump as proof.
+
+    ONE dump when it reads (the screen is the proof either way); only a dump
+    that FAILED (no window while the app transitions) is retried, bounded by
+    the same deadline, so a transition does not read as "did not move".
+    """
     deadline = _deadline(ctx)
     focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
     if focus and await _focus_left(ctx, focus, deadline):
         return Moved(True)
     dumped = await _dump(ctx)
+    while dumped.get("error") and time.monotonic() < deadline:
+        await _sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
+        dumped = await _dump(ctx)
     content = dumped.get("content")
     if dumped.get("error") or not _moved_on(before, content):
         return Moved(False)
