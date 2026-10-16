@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.127.0] - 2026-10-16
+## [1.128.0] - 2026-10-16
 
 ### Added
 
@@ -41,3 +41,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - A flow-parameter mismatch error now lists the expected keys. A typed
   field that reads empty but whose screen then advanced is noted as
   "confirmed by screen advance".
+- Saved flows replay again when you word an input differently from how
+  it was recorded (for example "otp" for "login_otp"); an
+  ambiguous name is never guessed.
+- A saved flow can start when its first screen key drifted, if its first
+  step has exactly one matching target on the live screen.
+- After a stale fast read, fast reading pauses until the screen changes,
+  is re-checked once, and stays off for the run after three strikes.
+- A chained flow is no longer started when only optional steps that
+  leave the screen unchanged remain; the reason is in the note.

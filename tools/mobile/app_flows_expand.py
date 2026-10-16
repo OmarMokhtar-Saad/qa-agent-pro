@@ -7,7 +7,7 @@ import json
 import logging
 from typing import Any
 
-from tools.mobile import actions
+from tools.mobile import actions, flow_replay_inputs
 from tools.mobile.app_flows_check import secret_fields
 from tools.mobile.app_flows_consts import PLACEHOLDER_RE, err
 
@@ -32,13 +32,37 @@ def _params_problem(template: dict, params: dict) -> str:
     return ""
 
 
+def _renamed(template: dict, params: Any) -> Any:
+    """*params* (``{}`` when empty) with each name the flow lacks renamed to the one it fits."""
+    if params is None or params == "":
+        return {}
+    if not isinstance(params, dict):
+        return params
+    declared = set(template.get("params") or [])
+    found = flow_replay_inputs.aliases(template, params)
+    used = {k for n, k in found.items() if n in declared}
+    kept = {k: v for k, v in params.items() if k not in used}
+    return {**kept, **{n: params[found[n]] for n in found if n in declared}}
+
+
+def _supplied_names(template: dict, supplied: Any) -> set:
+    """The secret fields *supplied* covers, counting a name that fits one exactly."""
+    names = {str(n): None for n in supplied or ()}
+    found = flow_replay_inputs.aliases(template, names)
+    return set(names) | {n for n in found if n in secret_fields(template)}
+
+
 def _expand_problem(template: dict, params: Any, supplied: Any) -> str:
     if not isinstance(params, dict):
         return "`flow_params` must be a JSON object"
     problem = _params_problem(template, params)
     if problem:
         return problem
-    absent = [f for f in secret_fields(template) if f not in set(supplied or ())]
+    absent = [
+        f
+        for f in secret_fields(template)
+        if f not in _supplied_names(template, supplied)
+    ]
     if absent:
         return "the tester has not supplied a value for secret field(s) %s" % absent
     return ""
@@ -60,8 +84,7 @@ def expand(template: dict, params: Any, supplied: Any) -> dict:
     step's field has no value supplied. *supplied* is a collection of field NAMES only.
     """
     try:
-        if params is None or params == "":
-            params = {}
+        params = _renamed(template, params)
         problem = _expand_problem(template, params, supplied)
         if problem:
             return err(problem)

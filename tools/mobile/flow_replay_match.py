@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from tools.mobile import app_flows, flow_stats, screen_key
+from tools.mobile import flow_replay_match_anchor as anchor
 from tools.mobile.app_flows_consts import PLACEHOLDER_RE
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ def live_keys(screen: Any, ctx: Any) -> tuple:
     keys = [live_key(screen, ctx)] + [
         _sk2_with(body, package, a) for a in (own, stale, "")
     ]
-    return tuple(dict.fromkeys(k for k in keys if k))
+    return anchor.Keys(dict.fromkeys(k for k in keys if k), screen)
 
 
 def _sk2_with(screen: dict, package: str, activity: str) -> str:
@@ -93,17 +94,23 @@ def landing_keys(template: dict, at: int) -> tuple:
     return tuple(dict.fromkeys(k for k in keys if k))
 
 
-def starts(template: dict, key: str, at: int) -> bool:
-    """Whether step *at* may start on *key* (one key or several)."""
+def starts_on_key(template: dict, key: str, at: int) -> bool:
+    """Whether step *at* may start on *key* (one key or several), by key alone."""
     if at >= len(template.get("steps") or []):
         return False
     return bool(set(_keys(key)) & set(landing_keys(template, at)))
 
 
-def _first_at(template: dict, key: str) -> int:
-    """The earliest step that may start on *key*, or ``-1``."""
+def starts(template: dict, key: str, at: int) -> bool:
+    """Whether step *at* may start on *key*, or on the live screen *key* carries."""
+    return starts_on_key(template, key, at) or anchor.fits(template, key, at)
+
+
+def _first_at(template: dict, key: str, by_key: bool = True) -> int:
+    """The earliest step that may start on *key* (``by_key`` False: by its screen)."""
+    test = starts_on_key if by_key else anchor.fits
     for at in range(len(template.get("steps") or [])):
-        if starts(template, key, at):
+        if test(template, key, at):
             return at
     return -1
 
@@ -134,15 +141,16 @@ def pick(package: str, key: str, skip: Any = ()) -> tuple:
     beats one that does not, then the higher replay score (Wilson lower bound of its
     success, decayed by age), then, as a tie-break, the longer remaining suffix and
     the earlier step.
+    A flow no key fits may still start where the live screen shows its own target
+    (``flow_replay_match_anchor``); a key match always beats that.
     Names in *skip* (already replayed this run) are never offered again.
     """
-    skipped = set(skip)
-    fits = [
-        (name, template, at)
-        for name, template in _templates(package)
-        if name not in skipped and (at := _first_at(template, key)) >= 0
-    ]
-    return max(fits, key=_rank) if fits else ("", {}, 0)
+    rows = [(n, t) for n, t in _templates(package) if n not in set(skip)]
+    for by_key in (True, False):
+        fits = [(n, t, at) for n, t in rows if (at := _first_at(t, key, by_key)) >= 0]
+        if fits:
+            return max(fits, key=_rank)
+    return ("", {}, 0)
 
 
 def needed(step: dict) -> str:

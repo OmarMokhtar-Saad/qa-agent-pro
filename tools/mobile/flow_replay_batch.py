@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, NamedTuple
 
-from tools.mobile import flow_nochange, flow_replay_match
+from tools.mobile import flow_nochange, flow_replay_inputs, flow_replay_match
 
 
 class Batch(NamedTuple):
@@ -27,6 +27,7 @@ def build(template: dict, inputs: dict, pos: int) -> Batch:
     steps: list = []
     origin: list = []
     flow = template["steps"]
+    inputs = flow_replay_inputs.resolve(template, inputs)
     at = pos
     while at < len(flow):
         if not flow_nochange.skip_at(template, at):

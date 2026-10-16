@@ -12,9 +12,11 @@ tree, with a device command that may have moved the screen in between (the
 the screen and :func:`tools.mobile.a11y_parity.compare` judges the two:
 
 * they agree -- the screen truly did not change; the a11y tree is served.
-* they disagree -- the a11y service is STALE. The provider is dropped for the
-  rest of the run (the next run re-enables and re-checks parity) and this
-  dump refuses, so ``adb.uiautomator_dump`` reads the real screen itself.
+* they disagree -- the a11y service is STALE. Fast reading is SUSPENDED until
+  the tree changes (another digest: a new screen, package or window), this dump
+  refuses so ``adb.uiautomator_dump`` reads the real screen itself, and the next
+  changed tree is served only after one more uiautomator comparison agrees.
+  :data:`MAX_STALE_STRIKES` stale verdicts in a run drop the provider for it.
 * uiautomator fails -- nothing proves the repeat, so the provider refuses this
   dump and uiautomator is asked once more; the provider stays registered.
 
@@ -45,13 +47,28 @@ CONFIRMED_NOTE = "a11y_repeat_confirmed"
 
 #: serial -> (generation after the last a11y dump, its node digest).
 _LAST: dict[str, tuple[int, str]] = {}
+#: serial -> digest of the tree uiautomator contradicted; fast reading waits for another.
+_SUSPENDED: dict[str, str] = {}
+#: serial -> stale verdicts this run.
+_STRIKES: dict[str, int] = {}
+
+#: Stale verdicts in one run before fast reading stays off for the rest of it.
+#: One is a transition lag (a tree read just before the screen moved); two can be
+#: two slow screens; a third means the service is persistently wrong and every
+#: further screen would cost a confirming dump for nothing.
+MAX_STALE_STRIKES = 3
+
+#: The refusal and ledger note while fast reading waits for the screen to change.
+SUSPENDED_NOTE = "a11y_suspended"
+SUSPENDED_REFUSAL = "the a11y tree is suspended until the screen changes"
 
 Provider = Callable[[str], Awaitable[dict]]
 
 
 def forget(serial: str) -> None:
-    """Drop the remembered tree (a fresh enable, a restore)."""
-    _LAST.pop(str(serial), None)
+    """Drop the remembered tree and the suspension (a fresh enable, a restore)."""
+    for table in (_LAST, _SUSPENDED, _STRIKES):
+        table.pop(str(serial), None)
 
 
 def _digest(xml: str) -> str:
@@ -65,6 +82,20 @@ def _repeats(serial: str, digest: str, started_under: int) -> bool:
     return last is not None and last[1] == digest and last[0] != started_under
 
 
+def _stale(serial: str, digest: str) -> dict:
+    """Suspend fast reading on *digest*; after :data:`MAX_STALE_STRIKES` drop it."""
+    step_timing.note(STALE_NOTE)
+    _STRIKES[serial] = _STRIKES.get(serial, 0) + 1
+    _LAST.pop(serial, None)
+    _SUSPENDED[serial] = digest
+    if _STRIKES[serial] >= MAX_STALE_STRIKES:
+        logger.warning("mobile.a11y: stale tree on %s; fast reading off", serial)
+        adb.clear_dump_provider(serial)
+    else:
+        logger.warning("mobile.a11y: stale tree on %s; suspended", serial)
+    return {"error": STALE_REFUSAL, "content": None}
+
+
 async def _judge(serial: str, xml: str) -> dict | None:
     """``None`` when uiautomator confirms *xml*, else the refusal to return."""
     slow = await adb.uiautomator_dump(serial, use_provider=False)
@@ -72,13 +103,20 @@ async def _judge(serial: str, xml: str) -> dict | None:
         step_timing.note(UNCHECKED_NOTE)
         return {"error": UNCHECKED_REFUSAL, "content": None}
     if compare(xml, str(slow.get("content") or "")).get("error"):
-        step_timing.note(STALE_NOTE)
-        logger.warning("mobile.a11y: stale tree on %s; fast reading off", serial)
-        adb.clear_dump_provider(serial)
-        forget(serial)
-        return {"error": STALE_REFUSAL, "content": None}
+        return _stale(serial, _digest(xml))
     step_timing.note(CONFIRMED_NOTE)
     return None
+
+
+async def _resume(serial: str, xml: str) -> dict | None:
+    """While suspended: refuse the stale tree; once it moves, one confirmation."""
+    if _digest(xml) == _SUSPENDED[serial]:
+        step_timing.note(SUSPENDED_NOTE)
+        return {"error": SUSPENDED_REFUSAL, "content": None}
+    refused = await _judge(serial, xml)
+    if refused is None:
+        _SUSPENDED.pop(serial, None)
+    return refused
 
 
 async def checked(serial: str, inner: Provider) -> dict:
@@ -90,10 +128,14 @@ async def checked(serial: str, inner: Provider) -> dict:
     if got.get("error") or not xml:
         return got
     digest = _digest(xml)
-    if _repeats(key, digest, started_under):
+    if key in _SUSPENDED:
+        refused = await _resume(key, xml)
+    elif _repeats(key, digest, started_under):
         refused = await _judge(key, xml)
-        if refused is not None:
-            return refused
+    else:
+        refused = None
+    if refused is not None:
+        return refused
     _LAST[key] = (dump_reuse.token(key), digest)
     return got
 

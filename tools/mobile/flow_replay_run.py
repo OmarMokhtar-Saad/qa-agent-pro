@@ -116,6 +116,14 @@ def _ok(content: dict) -> bool:
     return str(last.get("outcome") or "") in OK_OUTCOMES
 
 
+def _starts(plan: Plan, origin: int, keys: Any) -> bool:
+    """Whether step *origin* may start on *screen*: a landing key, or its own target."""
+    want = flow_replay_match.landing_keys(plan.template, origin)
+    if not want or set(want) & set(keys):
+        return True
+    return flow_replay_match.anchor.fits(plan.template, keys, origin)
+
+
 def _gate(ctx: Any, plan: Plan, batch: flow_replay_batch.Batch) -> Any:
     """The per-step gate: the live screen must be the one the step was saved from.
 
@@ -126,7 +134,8 @@ def _gate(ctx: Any, plan: Plan, batch: flow_replay_batch.Batch) -> Any:
     async def gate(index: int, screen: Any) -> tuple:
         want = flow_replay_match.landing_keys(plan.template, batch.origin[index])
         if index == 0:
-            ok = not want or _at(ctx, screen, want)
+            keys = flow_replay_match.live_keys(screen, ctx)
+            ok = _starts(plan, batch.origin[0], keys)
             return screen, ("" if ok else WRONG_SCREEN)
         landed, latest = await _land(ctx, screen, want)
         return latest, ("" if landed else WRONG_SCREEN)

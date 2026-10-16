@@ -18,6 +18,7 @@ from tools.mobile import (
     flow_replay_note,
     flow_replay_run,
     flow_replay_state,
+    flow_replay_stop,
     flow_replay_switch,
     flow_stats,
     held_inputs,
@@ -91,12 +92,20 @@ def _count(package: str, name: str, walk: flow_replay_run.Walk) -> None:
         flow_stats.record(package, name, not walk.why)
 
 
+def _next(auto: Auto, ctx: Any) -> tuple:
+    """``(name, template, pos)`` to run now; no template when the chain is over."""
+    key = flow_replay_match.live_keys(auto.screen, ctx)
+    got = _resume(auto.body, key, str(getattr(ctx, "package", "") or ""))
+    name, template, pos = got
+    if template and auto.ran and flow_replay_stop.inert_tail(template, pos):
+        flow_replay_stop.chain_done(auto.body, name, pos)
+        return name, {}, pos
+    return got
+
+
 async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
     """``(Auto, stop)``: one flow replayed from the live screen; stop ends the chain."""
-    key = flow_replay_match.live_keys(auto.screen, ctx)
-    name, template, pos = _resume(
-        auto.body, key, str(getattr(ctx, "package", "") or "")
-    )
+    name, template, pos = _next(auto, ctx)
     if not template:
         return auto, True
     case = session_explore_ids.explore_turn_case_id(auto.body)

@@ -37,3 +37,41 @@ def cut_why(ctx: Any, screen: Any, step: dict) -> str:
     if not cut.kind:
         return ""
     return "%s (%s): %s" % (LEFT_APP, cut.kind, _cut_detail(cut, ctx, {}))
+
+
+#: Ops whose step may do nothing: an optional tap, or a wait for the screen to settle.
+OPTIONAL_OPS = frozenset(
+    {"tap_text_if_present", "wait_until_gone", "wait_until_idle", "wait_until_changed"}
+)
+#: The note line when a chained flow is not started because it has nothing left to do.
+CHAIN_DONE = (
+    "chain stopped: the rest of flow `%s` (from step %d) only taps optional "
+    "prompts or waits on the screen already reached."
+)
+
+
+def _inert(template: dict, at: int) -> bool:
+    meta = template.get("meta") or {}
+    before, after = meta.get("before") or [], meta.get("after") or []
+    key = before[at] if at < len(before) else ""
+    last = after[at] if at < len(after) else ""
+    return not last or last == key
+
+
+def inert_tail(template: dict, pos: int) -> bool:
+    """True when every step from *pos* is optional and leaves the screen as it was."""
+    steps = (template.get("steps") or [])[pos:]
+    if not steps:
+        return False
+    return all(
+        s.get("op") in OPTIONAL_OPS and _inert(template, pos + i)
+        for i, s in enumerate(steps)
+    )
+
+
+def chain_done(body: dict, name: str, pos: int) -> None:
+    """Add the stop reason to the replay note the model reads."""
+    last = body.get("auto_replay")
+    if isinstance(last, dict):
+        why = CHAIN_DONE % (name, pos + 1)
+        last["note"] = "%s\n%s" % (last.get("note") or "", why)
