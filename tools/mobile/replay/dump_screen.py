@@ -87,11 +87,13 @@ async def _observed(ctx: Context, raw: dict) -> dict:
     # The display is a DEVICE fact, so it is read from the device rather than
     # inferred from the dump; `display_size` caches it per serial and never
     # refuses, so this costs one round trip per session and cannot fail a dump.
-    sized = await adb.display_size(ctx.serial)
-    # Cached per serial like the size above, so the accessibility floor is this
-    # device's 48dp rather than an assumed one, at no extra round trip.
-    dpi = await adb.display_density(ctx.serial)
-    activity = await resolve_activity(ctx)
+    # Cached per serial like the size, so the accessibility floor is this
+    # device's 48dp. The fresh focus probe runs beside them, not after them.
+    sized, dpi, activity = await asyncio.gather(
+        adb.display_size(ctx.serial),
+        adb.display_density(ctx.serial),
+        resolve_activity(ctx),
+    )
     observed = composite.observe(
         raw.get("content"),
         activity,
@@ -104,9 +106,9 @@ async def _observed(ctx: Context, raw: dict) -> dict:
 # THE activity a screen's identity is hashed with. One producer, no other.
 #
 # A caller that already knows the activity keeps priority: this only fills the
-# gap that made `screen_id` hash two dimensions instead of three. Memoised on
-# the context so a replay pays for one probe rather than one per action, and a
-# failed probe is remembered as "unknown" rather than retried on every dump.
+# gap that made `screen_id` hash two dimensions instead of three. Read fresh on
+# every dump (one grep'd focus line, short timeout, run beside the other device
+# reads); a failed probe is "unknown" and is simply asked again on the next dump.
 #
 # PUBLIC, and named without the underscore, because the prune sites OUTSIDE
 # this module must ask it rather than answer the question themselves.
@@ -129,23 +131,12 @@ async def resolve_activity(ctx: Any) -> str:
     known = str(getattr(ctx, "activity", "") or "")
     if known:
         return known
-    if getattr(ctx, "_activity_probed", False):
-        return ""
+    # Read fresh on every dump (fix/1210): a per-context memo froze the activity
+    # under a screen that later changed it. The key no longer hashes it, so the
+    # probe is metadata and an empty answer is normal.
     serial = _serial_for_activity(ctx)
     probed = await adb.current_activity(serial)
-    found = str(probed.get("content") or "")
-    return _cache_activity(ctx, found)
-
-
-def _cache_activity(ctx: Any, found: str) -> str:
-    try:
-        ctx._activity_probed = True
-        if found:
-            ctx.activity = found
-    except (AttributeError, TypeError):
-        # A frozen or slotted context must not fail a dump over a cache write.
-        return found
-    return found
+    return str(probed.get("content") or "")
 
 
 def _serial_for_activity(ctx: Any) -> str:

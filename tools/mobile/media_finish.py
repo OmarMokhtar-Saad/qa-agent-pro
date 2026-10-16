@@ -22,7 +22,8 @@ from tools.mobile.media_consts import (
     media_dir,
     record,
 )
-from tools.mobile.media_stop import _stop_recorder
+from tools.mobile.media_defer import defer
+from tools.mobile.media_stop import _stop_recorder, reap_recorder, signal_recorder
 from tools.mobile.media_store import remember
 
 logger = logging.getLogger("tools.mobile.media")
@@ -37,21 +38,36 @@ def _base(step: _Step) -> dict:
     }
 
 
-async def _clip_part(step: _Step) -> dict:
-    """Close out the clip: pull it when recorded, else drop the recorder."""
+async def _recorded_clip(step: _Step, clipped: dict) -> dict | None:
+    """Pull a recorded clip now, or defer it (then there is no record yet)."""
+    name = "clip-" + _safe(step.ref.tc_id) + "-" + str(clipped["seq"]) + ".mp4"
+    job = _PullJob(step.ref.serial, step.held, step.directory / name, clipped)
+    if not step.ref.defer:
+        await _finish_step_pull(job)
+        return clipped
+    await signal_recorder(step.ref.serial)
+    defer(step.ref, _pull_deferred(step.ref, job))
+    return None
+
+
+async def _clip_part(step: _Step) -> dict | None:
+    """Close out the clip; None when its pull was deferred (stored once done)."""
     serial, held = step.ref.serial, step.held
     state = str(held.get("state") or NOT_ATTEMPTED)
-    base = _base(step)
-    clipped = record(CLIP, state, **base)
+    clipped = record(CLIP, state, **_base(step))
     if state == OK:
-        name = "clip-" + _safe(step.ref.tc_id) + "-" + str(base["seq"]) + ".mp4"
-        target = step.directory / name
-        await _finish_step_pull(_PullJob(serial, held, target, clipped))
-    elif held.get("proc") is not None:
+        return await _recorded_clip(step, clipped)
+    if held.get("proc") is not None:
         await _stop_recorder(serial, held)
         remote = str(held.get("remote") or "")
         await adb.shell(serial, ["rm", "-f", remote], MAX_STOP_WAIT_S)
     return clipped
+
+
+async def _pull_deferred(ref: ClipRef, job: _PullJob) -> None:
+    """Background half of a clip: reap the recorder, pull, then store the record."""
+    await _pull_into(job, await reap_recorder(job.held))
+    remember(ref.run_id, ref.tc_id, [job.clipped])
 
 
 async def _frame_part(step: _Step) -> dict:
@@ -81,7 +97,8 @@ async def finish_step(ref: ClipRef, handle: object, screen_id: str = "") -> dict
         directory = media_dir(ref.run_id)
         directory.mkdir(parents=True, exist_ok=True)
         step = _Step(ref, held, directory, screen_id)
-        records.append(await _clip_part(step))
+        clip = await _clip_part(step)
+        records.extend([clip] if clip else [])
         records.append(await _frame_part(step))
     remember(ref.run_id, ref.tc_id, records)
     return {"error": None, "content": records}
@@ -103,9 +120,13 @@ def _pull_failed(pulled: dict, size: int) -> bool:
 
 async def _finish_step_pull(job: _PullJob) -> None:
     """Stop the recorder, pull the clip to the target and set the clip record's state."""
+    await _pull_into(job, await _stop_recorder(job.serial, job.held))
+
+
+async def _pull_into(job: _PullJob, closed: bool) -> None:
+    """Pull the (already stopped) clip to the target and set the clip record's state."""
     serial, held, target, clipped = job
     remote = str(held.get("remote") or "")
-    closed = await _stop_recorder(serial, held)
     pulled = await adb.pull(serial, remote, str(target))
     await adb.shell(serial, ["rm", "-f", remote], MAX_STOP_WAIT_S)
     size = target.stat().st_size if target.is_file() else 0

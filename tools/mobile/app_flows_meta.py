@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from tools.mobile import flow_stats
+
 MAX_KEY_CHARS = 64
+MAX_GOAL_CHARS = 120
 
 
 def _keys(raw: Any, count: int) -> list:
@@ -24,11 +27,19 @@ def clean(meta: Any, count: int) -> dict:
     before = _keys(meta.get("before"), count)
     if not any(before):
         return {}
-    return {
+    out = {
         "before": before,
         "after": _keys(meta.get("after"), count),
         "reached": meta.get("reached") is True,
     }
+    return {**out, **_extras(meta)}
+
+
+def _extras(meta: dict) -> dict:
+    """The optional record: the goal a flow reached and its replay counters."""
+    goal = " ".join(str(meta.get("goal") or "").split())[:MAX_GOAL_CHARS]
+    stats = flow_stats.clean(meta.get("stats"))
+    return {**({"goal": goal} if goal else {}), **({"stats": stats} if stats else {})}
 
 
 def reached(template: dict) -> bool:

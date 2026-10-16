@@ -42,7 +42,7 @@ def _note_fallback(ref: _Ref, before: str) -> None:
 # it for that reason.
 async def _replay_recorded(ref: _Ref, script: object) -> tuple[dict, object]:
     """Replay the script with the screen recorder running: ``(replayed, clip)``."""
-    clip_ref = media.ClipRef(ref.run_id, ref.tc_id, ref.ctx.serial)
+    clip_ref = media.ClipRef(ref.run_id, ref.tc_id, ref.ctx.serial, True)
     started = await media.start_clip(clip_ref, script)
     clip = started.get("content")
     before = str(getattr(ref.ctx, "typing_fallback", "") or "")
@@ -73,7 +73,7 @@ async def _close_step_evidence(step: _Step, clip: object, ctx: Context) -> dict:
     await step_timing.timed(
         "evidence",
         media.finish_step(
-            media.ClipRef(step.run_id, step.tc_id, ctx.serial), clip, screen_id
+            media.ClipRef(step.run_id, step.tc_id, ctx.serial, True), clip, screen_id
         ),
     )
     return await step_timing.timed(
@@ -113,7 +113,10 @@ async def _replay_and_checkpoint(ref: _Ref, view: dict, script: object) -> dict:
         return replayed
     step = _read_step(ref.run_id, ref.tc_id, replayed)
     crash = await _close_step_evidence(step, clip, ref.ctx)
-    return _outcome_checkpoint(step, view, crash)
+    outcome = _outcome_checkpoint(step, view, crash)
+    if not (outcome.get("content") or {}).get("packet"):
+        await media.flush(ref.run_id)
+    return outcome
 
 
 # ``{"error", "content": {"tc_id", "verdict", "status", "reason", "trace",
@@ -124,6 +127,7 @@ async def submit_case(sub: Submission) -> dict:
     """Validate a planner's script, replay it, decide a verdict, checkpoint."""
     run_id, case, ctx, raw_script, screen = sub
     try:
+        await media.flush(run_id)
         intake = _intake(run_id, case, raw_script)
         if intake.early is not None:
             return intake.early

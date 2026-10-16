@@ -1,6 +1,6 @@
 """Auto-replay: which saved flow fits the screen in front, and what each step needs.
 
-Pure reads of the app's saved flows. A flow matches when the screen key (sk2) of one
+Pure reads of the app's saved flows. A flow matches when the screen key (sk3; sk2 for older flows) of one
 of its steps equals the live screen's: any step on a fresh run (the flow resumes
 there), or the step a stopped replay was waiting at. Never raises.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from tools.mobile import app_flows, screen_key
+from tools.mobile import app_flows, flow_stats, screen_key
 from tools.mobile.app_flows_consts import PLACEHOLDER_RE
 
 logger = logging.getLogger(__name__)
@@ -28,27 +28,28 @@ def live_key(screen: Any, ctx: Any) -> str:
 
 
 def live_keys(screen: Any, ctx: Any) -> tuple:
-    """Every key *screen* may be stored under: its own, then the context's activity.
+    """Every key *screen* may be stored under: its sk3 key, then its sk2 forms.
 
-    Flows saved before the key preferred the screen's own activity were stamped
-    with the context's (memoised, so possibly stale) one, or none; matching any of
-    them keeps those flows usable.
+    Flows saved before sk3 hold sk2 keys, which hashed the screen's own activity,
+    the context's (memoised, so possibly stale) one, or none; matching any of them
+    keeps those flows usable.
     """
-    package = str(getattr(ctx, "package", "") or "")
+    body = screen if isinstance(screen, dict) else {}
+    package = str(getattr(ctx, "package", "") or body.get("package") or "")
     stale = str(getattr(ctx, "activity", "") or "")
-    own = live_key(screen, ctx)
-    keys = [own] + [_key_with(screen, package, a) for a in (stale, "-")]
+    own = str(body.get("activity") or "")
+    keys = [live_key(screen, ctx)] + [
+        _sk2_with(body, package, a) for a in (own, stale, "")
+    ]
     return tuple(dict.fromkeys(k for k in keys if k))
 
 
-def _key_with(screen: Any, package: str, activity: str) -> str:
-    """The key of *screen* hashed with *activity* (``"-"``: with none at all)."""
+def _sk2_with(screen: dict, package: str, activity: str) -> str:
+    """The sk2 key of *screen* hashed with *activity* (``""``: with none at all)."""
     try:
-        body = dict(screen) if isinstance(screen, dict) else {}
-        body["activity"] = "" if activity == "-" else activity
-        return screen_key.screen_key(body, package, "").key
+        return screen_key.sk2_key(screen, package, activity)
     except Exception:
-        logger.exception("flow replay: legacy screen key failed")
+        logger.exception("flow replay: sk2 screen key failed")
         return ""
 
 
@@ -121,7 +122,8 @@ def known_keys(package: str) -> frozenset:
 def _rank(item: tuple) -> tuple:
     name, template, at = item
     reached = bool((template.get("meta") or {}).get("reached"))
-    return (reached, len(template.get("steps") or []) - at, -at)
+    suffix = len(template.get("steps") or []) - at
+    return (reached, flow_stats.score(template), suffix, -at)
 
 
 def pick(package: str, key: str, skip: Any = ()) -> tuple:
@@ -129,7 +131,9 @@ def pick(package: str, key: str, skip: Any = ()) -> tuple:
 
     The flow may reach the live screen at any step, not only its first (a one-time
     first-launch screen is skipped on the next run). A flow that reaches the goal
-    beats one that does not, then the longer remaining suffix, then the earlier step.
+    beats one that does not, then the higher replay score (Wilson lower bound of its
+    success, decayed by age), then, as a tie-break, the longer remaining suffix and
+    the earlier step.
     Names in *skip* (already replayed this run) are never offered again.
     """
     skipped = set(skip)

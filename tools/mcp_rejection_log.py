@@ -27,6 +27,7 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from config.settings_guard import never_raise
+from tools import mcp_rejection_hint as rejection_hint
 
 try:
     from fastmcp.server.middleware import Middleware
@@ -34,6 +35,11 @@ except ImportError as exc:  # no fastmcp, or one without middleware
     if (exc.name or "").split(".")[0] != "fastmcp":
         raise
     Middleware = cast("Any", None)
+
+try:
+    from fastmcp.exceptions import ToolError
+except ImportError:  # no fastmcp
+    ToolError = cast("Any", None)  # type: ignore[misc]
 
 logger = logging.getLogger("qa_agents.mcp")
 MAX_NAMES = 8
@@ -109,6 +115,21 @@ def _note_rejection(context: object, exc: BaseException) -> None:
         log_rejection(name, exc)
 
 
+async def _fixable(context: object, exc: BaseException) -> BaseException | None:
+    """A ToolError the model can act on for a rejection, else None."""
+    found = _validation_error(exc)
+    if found is None or ToolError is None:
+        return None
+    with never_raise():
+        name = str(getattr(getattr(context, "message", None), "name", "") or "")
+        tool = None
+        fm = getattr(getattr(context, "fastmcp_context", None), "fastmcp", None)
+        if fm is not None:
+            tool = await fm.get_tool(name)
+        return ToolError(rejection_hint.fix_message(_safe_name(name), found, tool))
+    return None
+
+
 def build_middleware():
     """A FastMCP middleware that logs rejections, or None if unsupported."""
     if Middleware is None:
@@ -120,6 +141,6 @@ def build_middleware():
                 return await call_next(context)
             assert g.exc is not None
             _note_rejection(context, g.exc)
-            raise g.exc
+            raise await _fixable(context, g.exc) or g.exc
 
     return _RejectionLog()

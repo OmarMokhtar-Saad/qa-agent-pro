@@ -6,7 +6,21 @@ from handlers.mobile import content as mobile_content
 
 # Tool-body locals never forwarded to the handler. `rt` is a closure variable of
 # the tool bodies, so locals() holds it.
-_TEST_UNSENT = ("ctx", "device_id", "rt")
+_TEST_UNSENT = ("ctx", "device_id", "rt", "tester_inputs")
+
+_INPUTS_NOTE = (
+    "Note: tester_inputs is not used on this call (nothing is typed or stored "
+    "here). Pass it on qa_submit_mobile_step when a packet asks for a field.\n\n"
+)
+
+
+def _with_inputs_note(blocks: list, tester_inputs: str) -> list:
+    """Say once that ``tester_inputs`` was accepted but belongs to the step tool."""
+    first = blocks[0] if blocks else None
+    text = getattr(first, "text", None)
+    if tester_inputs and isinstance(text, str):
+        setattr(first, "text", _INPUTS_NOTE + text)
+    return blocks
 
 
 def _register_mobile_test_tool(mcp, kit, rt) -> None:
@@ -42,6 +56,7 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
         emulator: str = "",
         system_image: str = "",
         confirm_destructive: bool = False,
+        tester_inputs: str = "",
     ) -> list[ContentBlock]:
         """Drive an Android device: an exploration run toward goal=..., or cases.
 
@@ -53,7 +68,7 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
         # Every parameter except ctx/device_id goes to the handler by name.
         fields = {k: v for k, v in locals().items() if k not in _TEST_UNSENT}
         fields["serial"] = rt._device_ref(device_id, serial)
-        return await rt._mobile_reply(
+        blocks = await rt._mobile_reply(
             rt.MobileReplySpec(
                 "qa_mobile_test", mobile_content.handle_mobile_test_content
             ),
@@ -61,3 +76,4 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
             fields,
             **rt._make_elicitors(ctx),
         )
+        return _with_inputs_note(blocks, tester_inputs)

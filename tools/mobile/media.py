@@ -83,6 +83,7 @@ from tools.mobile.media_consts import (  # noqa: F401
     media_dir,
     record,
 )
+from tools.mobile.media_defer import flush, open_clips  # noqa: F401
 from tools.mobile.media_finish import (  # noqa: F401
     _finish_step_frame,
     _finish_step_pull,

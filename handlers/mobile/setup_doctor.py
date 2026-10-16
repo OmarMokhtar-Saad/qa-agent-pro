@@ -91,12 +91,7 @@ async def _mobile_lock_ime_lines(lines: list) -> None:
     attached = await setup_mobile_devices._mobile_attached_devices()
     lines += setup_mobile_devices._mobile_lock_rows(attached)
     pinned = (ime.manifest_status() or {}).get("content") or {}
-    lines.append(
-        "- ✅ QA input method " + str(pinned.get("detail") or "pinned")
-        if pinned.get("ok")
-        else "- ⬜ QA input method not pinned yet, so typing into the app "
-        "is unavailable; taps and assertions work"
-    )
+    lines.append(setup_mobile_ime.pinned_row(pinned))
     if pinned.get("ok"):
         lines += await setup_mobile_ime._mobile_ime_rows(
             [str(s) for s in ((attached or {}).get("content") or [])]

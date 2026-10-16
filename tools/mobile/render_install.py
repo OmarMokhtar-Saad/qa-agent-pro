@@ -117,5 +117,6 @@ def apply_refusal(step: str, detail: str = "") -> str:
         + " would run"
         + ((": " + str(detail)[:300]) if detail else "")
         + ".\n\nRe-call the same way with `apply=true` once the tester has said "
-        "go, on their turn."
+        "go, on their turn. If the tester already asked for this install, pass "
+        "`apply=true` on the first call; no preview round is needed."
     )

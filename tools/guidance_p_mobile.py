@@ -7,7 +7,8 @@ Run test cases, or explore freely, on an Android emulator.
 
 Nothing runs until the tester has agreed to it: every step that installs an
 app, downloads an SDK or launches anything needs `apply=true`, and you send
-that only after the tester has said go, on a later turn.
+that only after the tester has said go, on a later turn. If they already
+asked for the install, pass `apply=true` on the first call.
 
 1. Call `qa_mobile_test` with no arguments. It answers with whatever the
    machine needs next -- a setup guide, an install menu, a preflight

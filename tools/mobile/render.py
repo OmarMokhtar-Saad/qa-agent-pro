@@ -60,6 +60,7 @@ from tools.mobile.render_packet import (  # noqa: F401
     STATIC_OMITTED_NOTE,
     busy_block,
     packet_block,
+    static_hash,
     without_goal,
     without_static,
 )

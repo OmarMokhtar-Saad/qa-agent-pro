@@ -6,10 +6,10 @@ import logging
 from typing import Any
 
 from handlers.mobile.step_support import _mobile_learn_after
+from tools.mobile import media, session_finish, session_records, session_runs
 from tools.mobile import open_report as mobile_open
 from tools.mobile import render as mobile_render
 from tools.mobile import report as mobile_report
-from tools.mobile import session_finish, session_records, session_runs
 
 logger = logging.getLogger("tools.mcp_handlers")
 
@@ -51,6 +51,7 @@ RUN_OVER_NOTE = (
 async def _finish_run(run_id: str, session_token: str, body: dict) -> tuple:
     """``(resolved, rows, coverage)`` once the device is given back."""
 
+    await media.flush(run_id)  # deferred clips need the device: store them first
     await session_finish.finish_device(run_id, lease=str(session_token or ""))
     _mobile_learn_after(run_id)
     listed = session_runs.summary(run_id)

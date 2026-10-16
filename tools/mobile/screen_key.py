@@ -1,12 +1,19 @@
 """A stable identity for a screen, built from structure and never from text.
 
+Version ``sk3``: the activity is NO LONGER part of the key. It was read once per
+context and changed under a screen, so one screen got several keys (fix/1210).
+The activity stays on :class:`ScreenKey` as metadata only (the degraded
+``sk1d`` key drops it too). ``sk2`` keys (which hashed the activity) stay stored
+and link to their ``sk3`` twin through ``screens.remap_of``; ``sk2_key`` rebuilds
+one for saved flows.
+
 Version ``sk2``: the key also folds in the input structure (``_structure``),
 because screens whose only anchors are shared containers (a login form and a
 code-entry screen, neither with resource ids) collided under ``sk1``. Stored
 ``sk1:`` keys are never matched again (relearned under the new key); degraded
 keys keep the ``sk1d:`` prefix the rest of the code tests for.
 
-Pure, no I/O, never raises.``screen_key`` hashes the package, the activity and
+Pure, no I/O, never raises.``screen_key`` hashes the package and
 the resource ids that occur exactly once on the screen (the *anchors*), so three
 chat screens that differ only in message text share one key. A screen with fewer
 than two anchors gets a *degraded* key (class counts); learning treats such keys
@@ -121,10 +128,26 @@ def _title(elements: list) -> str:
     return ""
 
 
-def _degraded(package: str, activity: str, elements: list) -> str:
+def _degraded(package: str, elements: list, activity: str = "") -> str:
     classes = Counter(str(e.get("cls") or "") for e in elements)
     body = ",".join("%s:%d" % (k, classes[k]) for k in sorted(classes))
     return "sk1d:" + _sha("|".join((package, activity, body)))
+
+
+def _elements(body: dict) -> list:
+    raw = body.get("elements")
+    return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+
+def _build(elements: list, package: str, activity: str) -> ScreenKey:
+    anchors = _anchors(elements, package)
+    title = _title(elements)
+    if len(anchors) < 2:
+        key = _degraded(package, elements)
+        return ScreenKey(key, activity, anchors, title, True)
+    parts = (package, "|".join(anchors), _structure(elements))
+    key = "sk3:" + _sha("|".join(parts))
+    return ScreenKey(key, activity, anchors, title, False)
 
 
 def screen_key(screen: object, package: str = "", activity: str = "") -> ScreenKey:
@@ -133,20 +156,19 @@ def screen_key(screen: object, package: str = "", activity: str = "") -> ScreenK
         body = screen if isinstance(screen, dict) else {}
         package = str(package or body.get("package") or "")
         activity = str(body.get("activity") or activity or "")
-        raw = body.get("elements")
-        elements = (
-            [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
-        )
-        anchors = _anchors(elements, package)
-        title = _title(elements)
-        if len(anchors) < 2:
-            key = _degraded(package, activity, elements)
-            return ScreenKey(key, activity, anchors, title, True)
-        parts = (package, activity, "|".join(anchors), _structure(elements))
-        key = "sk2:" + _sha("|".join(parts))
-        return ScreenKey(key, activity, anchors, title, False)
+        return _build(_elements(body), package, activity)
     except (ValueError, TypeError, KeyError, AttributeError):
         return ScreenKey("sk1d:" + _sha("error"), "", (), "", True)
+
+
+def sk2_key(screen: object, package: str, activity: str) -> str:
+    """The pre-sk3 key of *screen* read under *activity* (saved flows hold these)."""
+    elements = _elements(screen if isinstance(screen, dict) else {})
+    anchors = _anchors(elements, package)
+    if len(anchors) < 2:
+        return _degraded(package, elements, activity)
+    parts = (package, activity, "|".join(anchors), _structure(elements))
+    return "sk2:" + _sha("|".join(parts))
 
 
 def legacy_from(package: str, activity: str, anchors: Any) -> str:

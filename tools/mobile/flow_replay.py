@@ -15,9 +15,11 @@ from typing import Any, NamedTuple
 
 from tools.mobile import (
     flow_replay_match,
+    flow_replay_note,
     flow_replay_run,
     flow_replay_state,
     flow_replay_switch,
+    flow_stats,
     held_inputs,
     media,
     session_explore_ids,
@@ -64,28 +66,29 @@ def _resume(body: dict, key: str, package: str) -> tuple:
     return flow_replay_match.pick(package, key, last.get("done") or ())
 
 
-def _note(head: tuple, walk: flow_replay_run.Walk) -> str:
-    base = "auto-replayed flow `%s`: %d of %d steps" % (head[0], walk.pos, head[1])
-    if not walk.why:
-        return base + ", all landed."
-    return "%s; stopped: %s. Continue from this screen yourself." % (base, walk.why)
-
-
-def _record(body: dict, head: tuple, walk: flow_replay_run.Walk) -> None:
-    name = head[0]
+def _record(
+    body: dict, head: flow_replay_note.Head, walk: flow_replay_run.Walk
+) -> None:
+    name = head.name
     done = list((body.get("auto_replay") or {}).get("done") or []) + [name]
     retry = walk.why.startswith(flow_replay_run.MISSING_INPUT)
     body["auto_replay"] = {
         "name": name,
         "pos": walk.pos,
-        "start": head[2],
-        "total": head[1],
+        "start": head.start,
+        "total": len(head.template.get("steps") or []),
         "done": [] if retry else done[-MAX_CHAIN * 2 :],
         "why": walk.why,
         "retry": retry,
-        "note": _note(head, walk),
+        "note": flow_replay_note.text(head, walk.pos, walk.why),
     }
     body["auto_trace"] = (list(body.get("auto_trace") or []) + walk.trace)[-MAX_TRACE:]
+
+
+def _count(package: str, name: str, walk: flow_replay_run.Walk) -> None:
+    """Count the replay in the flow's stats (a missing tester input is not a failure)."""
+    if not walk.why.startswith(flow_replay_run.MISSING_INPUT):
+        flow_stats.record(package, name, not walk.why)
 
 
 async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
@@ -102,7 +105,9 @@ async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
     walk = await flow_replay_run.run(
         ctx, plan, flow_replay_run.Walk(auto.screen, pos, [])
     )
-    _record(auto.body, (name, len(template["steps"]), pos), walk)
+    live = flow_replay_match.live_key(auto.screen, ctx)
+    _record(auto.body, flow_replay_note.Head(name, template, pos, live), walk)
+    _count(str(getattr(ctx, "package", "") or ""), name, walk)
     detour = flow_replay_switch.detour(auto.body, (name, walk.pos), walk.why)
     return Auto(walk.screen, auto.body, True), bool(walk.why) and not detour
 

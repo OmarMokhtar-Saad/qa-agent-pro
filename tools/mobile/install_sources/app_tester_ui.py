@@ -35,7 +35,6 @@ from typing import Any, Optional
 
 from tools.mobile import adb
 from tools.mobile.adb_device_ui import AdbDeviceUi
-from tools.mobile.app_info import read_version
 from tools.mobile.dialog_handlers import visible_texts
 from tools.mobile.install_source import InstallOutcome, InstallRequest, clip_releases
 from tools.mobile.install_sources.app_tester_ui_cards import _CardMixin
@@ -60,6 +59,7 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (  # noqa: F401
 from tools.mobile.install_sources.app_tester_ui_pick import _PickMixin
 from tools.mobile.install_sources.app_tester_ui_screens import _ScreenMixin
 from tools.mobile.resolve import AskCb, PickOpts, decide, resolve_or_ask  # noqa: F401
+from tools.mobile.version_fast import read_version_fast
 
 #: Whole flow, seconds. A slow device dumps a screen in ~11 s and an install
 #: downloads over the network, so this is minutes, not seconds.
@@ -82,7 +82,7 @@ class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
         sleep: Optional[SleepFn] = None,
     ) -> None:
         self._ui_factory = ui_factory or AdbDeviceUi
-        self._versions = versions or read_version
+        self._versions = versions or read_version_fast
         self._sleep = sleep or asyncio.sleep
         self._staged: Any = None  # the run find_listed_app left on the app page
 

@@ -18,6 +18,7 @@ from tools.mobile.media_consts import (
     WITHHELD,
     _safe,
 )
+from tools.mobile.media_defer import open_clips
 from tools.mobile.media_store import records_of
 from tools.mobile.media_withhold import withholds
 
@@ -26,7 +27,8 @@ logger = logging.getLogger("tools.mobile.media")
 
 def _clip_count(ref: ClipRef) -> int:
     """How many clips this case has stored so far."""
-    return len([r for r in records_of(ref.run_id, ref.tc_id) if r.get("kind") == CLIP])
+    stored = [r for r in records_of(ref.run_id, ref.tc_id) if r.get("kind") == CLIP]
+    return len(stored) + open_clips(ref.run_id, ref.tc_id)
 
 
 def _refusal(script: object, seq: int) -> str | None:

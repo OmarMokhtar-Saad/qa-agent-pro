@@ -82,8 +82,8 @@ async def _plan_first_screen(run_id: str, ctx: Context, opened: _Opened) -> dict
 
 # THE SETTLE PRUNE passes NO activity on purpose: it answers ONE question --
 # "is the app in front yet?" -- inside a loop that exists BECAUSE the answer
-# is often no. `replay.dump.resolve_activity` MEMOISES what it probes, so
-# probing from in here would freeze whatever held focus mid-launch (the
+# is often no. `replay.dump.resolve_activity` probes the focus fresh, so
+# probing from in here would report whatever held focus mid-launch (the
 # launcher, an IME, a permission dialog) onto the context. The identity is
 # resolved once, after the loop. The density is a DEVICE fact like the size,
 # so the accessibility audit measures 48dp against THIS device.
@@ -140,7 +140,7 @@ async def _wait_for_foreground(ctx: Context) -> _Settle:
 # The dump is re-pruned rather than re-fetched. Not resolving is the SAFE
 # answer: the other exit is a dump that named no package, where the focused
 # window may still be what the launch was moving away from, and
-# `resolve_activity` memoises. A failure to resolve or re-prune leaves the
+# `resolve_activity` probes fresh per dump. A failure to resolve or re-prune leaves the
 # settle screen standing -- never no screen at all.
 async def _settled_screen(ctx: Context, settle: _Settle) -> dict:
     """The screen the planner is shown, identity resolved when the app is up."""

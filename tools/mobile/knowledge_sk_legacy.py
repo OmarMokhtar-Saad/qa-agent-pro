@@ -21,7 +21,7 @@ from tools.mobile import knowledge_sk_targets as sk_targets
 SK1_RETIRE_DAYS = 30
 _ROWS = 2000
 _MARK = "sk1_eligible"
-_KEY_COLS = {
+KEY_COLS = {
     "screens": ("screen_key",),
     "elements": ("screen_key",),
     "mistakes": ("screen_key",),
@@ -50,7 +50,7 @@ def _taken(conn, table: str, values: dict) -> bool:
 def _move_row(conn, row: dict, rep: tuple) -> int:
     table, old_key, new_key, run_id = rep
     values = {
-        k: (new_key if v == old_key and k in _KEY_COLS[table] else v)
+        k: (new_key if v == old_key and k in KEY_COLS[table] else v)
         for k, v in row.items()
     }
     if _taken(conn, table, values):
@@ -60,9 +60,9 @@ def _move_row(conn, row: dict, rep: tuple) -> int:
     return int(knowledge_db.supersede(conn, table, rep_row) is not None)
 
 
-def _move_table(conn, rep: tuple) -> int:
+def move_table(conn, rep: tuple) -> int:
     table, done = rep[0], 0
-    for col in _KEY_COLS[table]:
+    for col in KEY_COLS[table]:
         where = knowledge_db.Where(col + " = ? AND " + _LIVE, (rep[1],), _ROWS)
         for row in knowledge_db.rows(conn, table, where):
             done += _move_row(conn, row, rep)
@@ -91,14 +91,14 @@ def migrate(conn, package: str, run_id: str) -> int:
     for old_key, news in found.items():
         if len(news) != 1:
             continue
-        for table in _KEY_COLS:
-            done += _move_table(conn, (table, old_key, next(iter(news)), run_id))
+        for table in KEY_COLS:
+            done += move_table(conn, (table, old_key, next(iter(news)), run_id))
     return done
 
 
 def _retire_key(conn, key: str, run_id: str) -> int:
     done = 0
-    for table, cols in _KEY_COLS.items():
+    for table, cols in KEY_COLS.items():
         for col in cols:
             where = knowledge_db.Where(col + " = ? AND " + _LIVE, (key,), _ROWS)
             for row in knowledge_db.rows(conn, table, where):

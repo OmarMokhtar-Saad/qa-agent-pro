@@ -1,0 +1,76 @@
+"""The note an auto-replay leaves for the model (see ``flow_replay``).
+
+It says what the replay DID, step by step as ``op target -> landed screen``; what it did
+NOT do (the steps left); and, when it stopped, where it diverged: the step, the screen
+the flow expected and the live one. Screen keys are shortened. A secret or typed value is
+never repeated. Pure; never raises.
+"""
+
+from __future__ import annotations
+
+from typing import NamedTuple
+
+KEY_CHARS = 12
+MAX_LISTED = 8
+
+
+class Head(NamedTuple):
+    """The flow a replay ran: name, template, the step it began at, the live key."""
+
+    name: str
+    template: dict
+    start: int
+    live: str
+
+
+def short(key: object) -> str:
+    return str(key or "")[:KEY_CHARS] or "?"
+
+
+def _target(step: dict) -> str:
+    got = step.get("target")
+    target: dict = got if isinstance(got, dict) else {}
+    named = next((str(v) for v in target.values() if v), "")
+    return named or ("" if step.get("secret") else str(step.get("text") or ""))[:30]
+
+
+def _line(template: dict, at: int) -> str:
+    steps = template.get("steps") or []
+    after = (template.get("meta") or {}).get("after") or []
+    land = after[at] if at < len(after) else ""
+    return "%d. %s %s -> %s" % (
+        at + 1,
+        steps[at].get("op"),
+        _target(steps[at]),
+        short(land),
+    )
+
+
+def done_lines(head: Head, pos: int) -> list:
+    """The replayed steps, newest last, capped to :data:`MAX_LISTED`."""
+    return [_line(head.template, i) for i in range(head.start, pos)][-MAX_LISTED:]
+
+
+def _diverged(head: Head, pos: int, why: str) -> str:
+    before = (head.template.get("meta") or {}).get("before") or []
+    want = before[pos] if pos < len(before) else ""
+    return "diverged at step %d: %s (expected screen %s, live screen %s)" % (
+        pos + 1,
+        why,
+        short(want),
+        short(head.live),
+    )
+
+
+def text(head: Head, pos: int, why: str) -> str:
+    """The whole note for a replay that ran steps ``head.start`` .. *pos* - 1."""
+    total = len(head.template.get("steps") or [])
+    base = "auto-replayed flow `%s`: %d of %d steps" % (head.name, pos, total)
+    ran = done_lines(head, pos)
+    steps = "\nreplayed: " + "; ".join(ran) if ran else ""
+    if not why:
+        return "%s, all landed.%s" % (base, steps)
+    left = total - pos
+    skipped = "\nnot replayed: %d step(s) left (from step %d)." % (left, pos + 1)
+    stop = "\n%s. Continue from this screen yourself." % _diverged(head, pos, why)
+    return base + "." + steps + skipped + stop

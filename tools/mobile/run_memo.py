@@ -62,18 +62,26 @@ def briefed_session(run_id: str) -> dict:
         body = run_io._read_json(_briefing_path(run_id))
         if not isinstance(body, dict):
             return {"error": None, "content": ""}
-        return {"error": None, "content": str(body.get("session_id") or "")}
+        return {
+            "error": None,
+            "content": str(body.get("session_id") or ""),
+            "static_hash": str(body.get("static_hash") or ""),
+        }
     except Exception as exc:
         logger.exception("mobile.run_store.briefed_session failed")
         return {"error": str(exc), "content": ""}
 
 
-def mark_briefed(run_id: str, session_id: str) -> dict:
-    """Record that *session_id* has been handed this run's static block."""
+def mark_briefed(run_id: str, session_id: str, static_hash: str = "") -> dict:
+    """Record that *session_id* has been handed this run's static block.
+
+    *static_hash* is the short id of that block, so a changed block is re-sent.
+    """
     try:
         if not run_io.valid_run_id(run_id) or not str(session_id or "").strip():
             return {"error": "Invalid run id or session.", "content": None}
-        run_io._write_json(_briefing_path(run_id), {"session_id": str(session_id)})
+        body = {"session_id": str(session_id), "static_hash": str(static_hash or "")}
+        run_io._write_json(_briefing_path(run_id), body)
         return {"error": None, "content": {"session_id": str(session_id)}}
     except Exception as exc:
         logger.exception("mobile.run_store.mark_briefed failed")

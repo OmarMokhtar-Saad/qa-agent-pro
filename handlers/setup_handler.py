@@ -9,6 +9,7 @@ from handlers import (
     _common,
     _lane,
     mobile_gate,
+    setup_cache,
     setup_collect,
     setup_gates,
     setup_mobile_off,
@@ -106,14 +107,25 @@ async def handle_setup_check(
 ) -> str:
     """Machine-readiness report for tester onboarding; never raises."""
     await _common.audit("mcp_setup_check")
+    key = setup_cache.roots_key(workspace_roots)
+    cached = setup_cache.lookup(fix, key)
+    if cached is not None:
+        return cached
     try:
         run = await setup_collect._setup_collect(progress, workspace_roots, fix)
         if isinstance(run, str):
             return run
-        return await _report_text(run)
+        return await _cached_report(run, fix, key)
     except Exception as exc:
         logger.exception("handle_setup_check failed")
         return f"⚠️ Setup check failed: {exc}"
+
+
+async def _cached_report(run, fix: bool, key: str) -> str:
+    """Render the report and keep it for the next call (fix runs are never kept)."""
+    report = await _report_text(run)
+    setup_cache.store(fix, report, key)
+    return report
 
 
 async def _setup_mobile_lines(mobile_state: str, tool_paths: dict) -> list[str]:

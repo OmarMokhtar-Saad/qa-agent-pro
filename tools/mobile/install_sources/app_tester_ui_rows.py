@@ -73,6 +73,21 @@ def _words(text: str) -> set:
     return {word for word in _SPLIT_RE.split(text.casefold()) if word}
 
 
+_BUILD_WORDS = frozenset({"debug", "release", "staging", "dev", "beta", "alpha"})
+MIN_DERIVED_WORDS = 2
+
+
+def derive_label(package: str) -> str:
+    """Words a row for *package* must hold, read from the package id itself.
+
+    The top-level domain and build-type words drop out. Fewer than
+    ``MIN_DERIVED_WORDS`` words is too loose to pick a row by: "" (ask).
+    """
+    parts = [seg for seg in str(package or "").split(".")[1:] if seg]
+    words = [w for w in _words(" ".join(parts)) if w not in _BUILD_WORDS]
+    return " ".join(sorted(words)) if len(words) >= MIN_DERIVED_WORDS else ""
+
+
 def matching_rows(label: str, rows) -> list:
     """Rows whose name and bundle words hold every word of *label*."""
     want = _words(label)

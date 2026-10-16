@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.120.0] - 2026-10-15
+## [1.121.0] - 2026-10-16
 
 ### Added
 
@@ -29,12 +29,28 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- A step whose screen never moved after a tap keeps the screen it
-  already read instead of reading it again; the step timing line
-  counts these as probe_skip.
-- An optional tap whose text is not on an unchanged screen is skipped
-  at once with no new read (counted as gate_skip), and a wait whose
-  condition already holds returns at once.
-- Waiting for the screen to go idle watches screenshot fingerprints
-  and reads the full screen at most once. Secure screens that block
-  screenshots fall back to full reads.
+- A screen keeps one identity when the app changes its activity, and
+  screens learned before this release are matched to their new keys
+  when knowledge loads.
+- The screen-unchanged check ignores the status bar and tiny pixel
+  changes (clock, cursor), so unchanged steps skip their extra read.
+- A step before a wait, an optional tap, or a field already on screen
+  skips its settle read.
+- Learned flows remember how often they replay successfully; the best
+  flow per goal is offered, failing and duplicate flows are pruned, and
+  the model gets a short note on each replay.
+- Screen recordings are pulled at the end of the run instead of after
+  each step, and the installed app version is read faster.
+- When the tester has already asked for an install, the assistant is
+  now told to confirm it on the first call, skipping the preview.
+- The start reply carries the timing line, the static instructions
+  are sent once per run, and a repeat doctor call in the same run and
+  workspace reuses its report (fix=true always rechecks).
+- The run record keeps step marks, a per-read ledger and the replay
+  trace.
+
+### Fixed
+
+- tester_inputs is accepted on the start call, and a wrong argument
+  returns a hint naming the accepted keys with an example.
+- The doctor flags a QA keyboard on the old protocol in yellow.

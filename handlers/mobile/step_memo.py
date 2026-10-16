@@ -28,10 +28,19 @@ class MemoCtx:
     unusable: str
 
 
-def _without_briefed(shown: dict) -> dict:
+def _without_briefed(shown: dict, block_hash: str = "") -> dict:
     """``shown`` without the static block and the goal (the chat has seen both)."""
 
-    return mobile_render.without_goal(mobile_render.without_static(shown))
+    return mobile_render.without_goal(mobile_render.without_static(shown, block_hash))
+
+
+def _same_hash(seen: dict, block_hash: str) -> bool:
+    """Whether the block now going out is the one the chat was briefed with.
+
+    A packet with no static block (no hash) never changes the answer; a block
+    whose id differs from the recorded one is re-sent.
+    """
+    return not block_hash or str(seen.get("static_hash") or "") == block_hash
 
 
 # NEVER-RAISE, and the fail-open direction is REPEAT. This function's promise
@@ -50,14 +59,13 @@ def _mobile_briefing_memo(shown: dict, run_id: str, token: str) -> tuple[dict, b
 
     brief_needed = True
     try:
-        briefed = str(
-            (mobile_run_store.briefed_session(run_id) or {}).get("content") or ""
-        )
-        if briefed == token:
-            shown = _without_briefed(shown)
+        seen = mobile_run_store.briefed_session(run_id) or {}
+        block_hash = mobile_render.static_hash(shown)
+        if str(seen.get("content") or "") == token and _same_hash(seen, block_hash):
+            shown = _without_briefed(shown, block_hash)
             brief_needed = False
         else:
-            mobile_run_store.mark_briefed(run_id, token)
+            mobile_run_store.mark_briefed(run_id, token, block_hash)
     except Exception:
         logger.exception("mcp mobile static-block memo failed")
     return shown, brief_needed

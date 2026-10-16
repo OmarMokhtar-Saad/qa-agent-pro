@@ -35,7 +35,8 @@ def _sk2_pages(conn):
     last = 1 << 62
     while True:
         where = knowledge_db.Where(
-            "screen_key LIKE 'sk2:%' AND invalid_at IS NULL AND id < ?",
+            "(screen_key LIKE 'sk2:%' OR screen_key LIKE 'sk3:%')"
+            " AND invalid_at IS NULL AND id < ?",
             (last,),
             _PAGE,
         )

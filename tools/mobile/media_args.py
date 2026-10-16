@@ -12,6 +12,7 @@ class ClipRef(NamedTuple):
     run_id: str
     tc_id: str
     serial: str
+    defer: bool = False
 
 
 class _PullJob(NamedTuple):

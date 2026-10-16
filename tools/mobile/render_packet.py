@@ -32,6 +32,7 @@ already asked about.
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 from config.settings_guard import never_raise
@@ -82,13 +83,28 @@ STATIC_OMITTED_NOTE = (
 )
 
 
-def without_static(packet: object) -> dict:
-    """*packet* with :data:`STATIC_FIELDS` replaced by one note. Never raises."""
+def static_hash(packet: object) -> str:
+    """A 10-hex id of the :data:`STATIC_FIELDS` a packet carries, ``""`` if none."""
+    body = packet if isinstance(packet, dict) else {}
+    kept = {k: body[k] for k in STATIC_FIELDS if k in body}
+    if not kept:
+        return ""
+    text = json.dumps(kept, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+
+
+def without_static(packet: object, block_hash: str = "") -> dict:
+    """*packet* with :data:`STATIC_FIELDS` replaced by one note. Never raises.
+
+    The note names the block's short id (*block_hash*) so the model can tell
+    which block it holds.
+    """
     body = packet if isinstance(packet, dict) else {}
     if not any(k in body for k in STATIC_FIELDS):
         return dict(body)
     out = {k: v for k, v in body.items() if k not in STATIC_FIELDS}
-    out["static_block"] = STATIC_OMITTED_NOTE
+    tag = f" Static block id: {block_hash}." if block_hash else ""
+    out["static_block"] = STATIC_OMITTED_NOTE + tag
     return out
 
 

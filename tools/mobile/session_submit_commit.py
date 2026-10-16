@@ -34,7 +34,7 @@ async def _checkpoint_turn(call: ExploreCall, turn: dict, outcome: dict) -> dict
 
 async def _finish_clip(call: ExploreCall, replay: _ReplayedTurn) -> None:
     """File the turn's clip onto the case record the checkpoint created."""
-    ref = media.ClipRef(call.run_id, replay.clip_tc_id, call.ctx.serial)
+    ref = media.ClipRef(call.run_id, replay.clip_tc_id, call.ctx.serial, True)
     screen_id = str((replay.outcome.get("screen") or {}).get("screen_id") or "")
     await media.finish_step(ref, replay.clip, screen_id)
 
@@ -77,6 +77,7 @@ async def _commit_explore_turn(
     if isinstance(turn.get("state"), dict):
         turn["state"]["queued_actions"] = outcome.get("queued_actions") or []
     _fold_auto_trace(turn, outcome)
+    await media.flush(call.run_id)
     checkpoint = await _checkpoint_turn(call, turn, outcome)
     await _finish_clip(call, replay)
     return await _settle_explore_turn(

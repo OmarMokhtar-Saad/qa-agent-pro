@@ -42,13 +42,15 @@ def normalise(goal: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", goal.lower()))
 
 
-def flow_name(goal: str, reserve: int = 0) -> str:
-    """A valid flow name keyed by the normalised goal: a short slug plus its hash.
+def flow_name(goal: str, reserve: int = 0, sig: str = "") -> str:
+    """A valid flow name keyed by the normalised goal (and route signature *sig*).
 
-    *reserve* characters stay free for a ``-pN`` packet suffix.
+    A short slug plus a hash of goal and route: the same goal reached by the same
+    route is the same flow, a different route a different one. *reserve* characters
+    stay free for a ``-pN`` packet suffix.
     """
     norm = normalise(goal)
-    digest = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:_HASH_CHARS]
+    digest = hashlib.sha1((norm + sig).encode("utf-8")).hexdigest()[:_HASH_CHARS]
     room = MAX_FLOW_NAME_CHARS - _HASH_CHARS - 1 - reserve
     slug = norm.replace(" ", "-")[:room].strip("-") or "goal"
     return "%s-%s" % (slug, digest)

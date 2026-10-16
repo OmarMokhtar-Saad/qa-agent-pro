@@ -11,7 +11,7 @@ from handlers import _common
 from handlers.mobile import step as mobile_step
 from handlers.mobile.run_device_prefs import _mobile_a11y_stage
 from handlers.mobile.run_hooks import mobile_run
-from tools.mobile import knowledge_run
+from tools.mobile import knowledge_run, step_timing
 from tools.mobile import render as mobile_render
 
 logger = logging.getLogger("tools.mcp_handlers")
@@ -59,7 +59,15 @@ async def _mobile_hand_off(
     for note in notes:
         if note:
             rendered = note + "\n\n" + rendered
-    return rendered, True
+    return rendered + _start_timing_line(run_id), True
+
+
+def _start_timing_line(run_id: str) -> str:
+    """The ``⏱`` line of the start (launch, wait, first settle); ``""`` if unarmed."""
+    timing = step_timing.line()
+    if timing:
+        logger.info("mobile start %s: %s", run_id, timing)
+    return "\n\n" + timing if timing else ""
 
 
 # Notes for ``_mobile_claim_fresh_run`` (moved out of the body to keep it short):

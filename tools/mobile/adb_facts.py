@@ -70,14 +70,16 @@ focused_component = _focused_component
 # differs across Android versions.
 
 
-async def current_activity(serial: str, timeout: int = 20) -> dict:
+async def current_activity(serial: str, timeout: int = 5) -> dict:
     """The focused activity as ``package/Activity``, or "" when unknowable.
 
     An empty answer is a NORMAL result, not an error: a dialog or a system
     window can leave no resolvable component, and a screen identity that is
     weaker than it could be is far better than a refused dump.
     """
-    result = await host().shell(serial, ["dumpsys", "window"], timeout=timeout)
+    result = await host().shell(
+        serial, ["dumpsys window | grep mCurrentFocus"], timeout=timeout
+    )
     if result.get("error"):
         return {"error": None, "content": ""}
     text = str((result["content"] or {}).get("out") or "")

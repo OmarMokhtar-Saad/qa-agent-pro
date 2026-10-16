@@ -48,7 +48,7 @@ def _rekeyed(old: dict, item: Item) -> bool:
     """True when the row sits under an old ``sk1`` key and this run saw it under ``sk2``."""
     return str(old.get("screen_key") or "").startswith("sk1:") and str(
         item.key[0]
-    ).startswith("sk2:")
+    ).startswith(("sk2:", "sk3:"))
 
 
 def _reorder(conn, plan: Plan) -> bool:

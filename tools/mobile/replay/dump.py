@@ -23,7 +23,6 @@ from tools.mobile.replay.dump_raw import (  # noqa: F401
     logger,
 )
 from tools.mobile.replay.dump_screen import (  # noqa: F401
-    _cache_activity,
     _cut,
     _dump,
     _fetched,

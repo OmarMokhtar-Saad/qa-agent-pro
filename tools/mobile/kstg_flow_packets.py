@@ -47,9 +47,9 @@ def kept(packets: list) -> int:
     return sum(len(p) for p in packets)
 
 
-def names(goal: str, count: int) -> list:
-    """The flow name of each of *count* packets."""
+def names(goal: str, count: int, sig: str = "") -> list:
+    """The flow name of each of *count* packets (*sig*: the route signature)."""
     if count <= 1:
-        return [kstg_flow_build.flow_name(goal)]
-    base = kstg_flow_build.flow_name(goal, _SUFFIX_ROOM)
+        return [kstg_flow_build.flow_name(goal, 0, sig)]
+    base = kstg_flow_build.flow_name(goal, _SUFFIX_ROOM, sig)
     return ["%s-p%d" % (base, n) for n in range(1, count + 1)]

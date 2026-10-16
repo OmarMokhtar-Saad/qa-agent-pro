@@ -7,7 +7,7 @@ import logging
 
 from config.settings_guard import never_raise
 from handlers import _reply, mobile_gate
-from tools.mobile import ime, ime_session
+from tools.mobile import ime, ime_nonce, ime_session
 
 logger = logging.getLogger("tools.mcp_handlers")
 
@@ -110,7 +110,6 @@ def _mobile_ime_static_rows(ime, where: str, found: dict) -> list:
 # assumed good because it is selected.
 async def _mobile_ime_probe_rows(ime, where: str) -> list:
     """The one line for a selected keyboard, from a live test message."""
-    out: list = []
     with never_raise() as g:
         answered = await asyncio.wait_for(
             ime.probe(where), timeout=_reply.MOBILE_PROBE_S
@@ -118,13 +117,49 @@ async def _mobile_ime_probe_rows(ime, where: str) -> list:
     if g.failed:
         answered = {"error": str(g.exc)[:80], "content": None}
     if answered.get("error") or not (answered.get("content") or {}).get("ok"):
-        out.append(
+        return [
             "- \u26a0\ufe0f The QA keyboard is active on "
             + where
             + " but did not answer a test message, so typing may silently "
             "do nothing: "
             + str(answered.get("error") or "no reply from the input method")[:160]
+        ]
+    return [_answering_row(where)]
+
+
+def _answering_row(where: str) -> str:
+    """The line for a keyboard that answered: green, or yellow on protocol 1."""
+    if ime_nonce.protocol(where) == ime_nonce.PROTOCOL_LEGACY:
+        return (
+            "- \u26a0\ufe0f The QA keyboard on "
+            + where
+            + " answers but speaks legacy protocol 1: slow dumps, "
+            "update the QA keyboard"
         )
-        return out
-    out.append("- \u2705 The QA keyboard is active on " + where + " and answering")
-    return out
+    return "- \u2705 The QA keyboard is active on " + where + " and answering"
+
+
+def _legacy_version(detail: str) -> bool:
+    """True for a pinned build older than 1.1.0 (protocol 1, slow dumps)."""
+    tail = detail.rpartition("@")[2].strip().split(".")
+    try:
+        return (int(tail[0]), int(tail[1])) < (1, 1)
+    except (ValueError, IndexError):
+        return False
+
+
+def pinned_row(pinned: dict) -> str:
+    """The pinned-keyboard line: green, or yellow for a legacy build."""
+    detail = str(pinned.get("detail") or "pinned")
+    if not pinned.get("ok"):
+        return (
+            "- \u2b1c QA input method not pinned yet, so typing into the app "
+            "is unavailable; taps and assertions work"
+        )
+    if _legacy_version(detail):
+        return (
+            "- \u26a0\ufe0f QA input method "
+            + detail
+            + " is the legacy protocol 1: dumps are slow, update the QA keyboard"
+        )
+    return "- \u2705 QA input method " + detail

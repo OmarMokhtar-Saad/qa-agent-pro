@@ -42,10 +42,17 @@ async def signal_recorder(serial: str) -> None:
 # reaching another run.
 async def _stop_recorder(serial: str, handle: dict) -> bool:
     """Interrupt the recorder so it CLOSES its container, then reap it."""
+    if handle.get("proc") is None:
+        return False
+    await signal_recorder(serial)
+    return await reap_recorder(handle)
+
+
+async def reap_recorder(handle: dict) -> bool:
+    """Wait (bounded) for an already-interrupted recorder to exit; kill it past that."""
     proc = handle.get("proc")
     if proc is None:
         return False
-    await signal_recorder(serial)
     with never_raise():
         await wait_for(proc.communicate(), timeout=MAX_STOP_WAIT_S)
         return True

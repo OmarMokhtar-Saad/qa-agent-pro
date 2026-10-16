@@ -11,6 +11,7 @@ from tools.mobile.replay.device_ops import PASSWORD_REFUSAL_STATUS
 from tools.mobile.replay.device_ops_consts import KEYBOARD_OPS as TEXT_OPS
 from tools.mobile.replay.guard import _confirmed
 from tools.mobile.replay.settle import SettleJob, SettleOpts, _settle
+from tools.mobile.replay.settle_run import _target_in_hand
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
 from tools.mobile.replay.verdicts import Landing, _brought_to_front
 
@@ -136,6 +137,28 @@ def _device_opts(run: _ReplayRun, step: _Step, front: bool) -> SettleOpts:
     )
 
 
+# The next op reads the screen itself: a condition wait polls, ``tap_text_if_present``
+# looks first, and a ``type`` whose field is already on the screen in hand only
+# needs the tap to focus it. A re-dump here would be a second read of the same
+# moment (the server re-dumps before the wait anyway). Like a typed-in-place
+# step, the screen in hand was not re-read, so it is never marked ``no_change``.
+def _next_polls(run: _ReplayRun, step: _Step) -> bool:
+    """Whether the next op polls the screen for a condition (or looks first).
+
+    A plain timed ``wait`` is NOT one: it reads nothing, so the settle dump
+    after the action is the only read that sees a dialog or the new text.
+    """
+    nxt = _next_op(run, step)
+    return nxt in actions_mod.WAIT_UNTIL_OPS or nxt == "tap_text_if_present"
+
+
+def _next_observes(run: _ReplayRun, step: _Step, screen: Any) -> bool:
+    """Whether the next op reads the screen (or its target is in hand) itself."""
+    return _next_polls(run, step) or _target_in_hand(
+        _next_typed_target(run, step), screen
+    )
+
+
 async def _settle_device(
     run: _ReplayRun, step: _Step, acted: Acted
 ) -> tuple[Any, dict | None]:
@@ -143,7 +166,7 @@ async def _settle_device(
     entry, screen = acted.entry, acted.screen
     front = _front_landing(run, step, acted) or acted.fresh
     front = front or _nothing_actuated(step, acted)
-    typed = _typed_in_place(run, step, acted)
+    typed = _typed_in_place(run, step, acted) or _next_observes(run, step, screen)
     if front or typed:
         step_timing.mark("dump_skipped")
     if step.op in actions_mod.MUTATING_OPS:

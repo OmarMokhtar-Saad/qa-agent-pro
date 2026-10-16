@@ -107,13 +107,11 @@ async def _changed_poll(ctx: Context, deadline: float) -> tuple:
 #
 # FOCUS FIRST. Each iteration asks ``adb.current_activity`` -- bounded by the
 # time left -- before paying for a dump. A focused window different from the one
-# PROBED when the wait started (never ``ctx.activity``, which is memoised per
-# replay) is a change, returned at once and never reusable. An empty answer on
+# PROBED when the wait started (never ``ctx.activity``, which may be stale) is a change, returned at once and never reusable. An empty answer on
 # either side is unknown, never a change.
 #
-# The baseline is PROBED at the start, never read from `ctx.activity`: that is
-# memoised once per replay (`resolve_activity`) and is stale after the first
-# navigation, when every later probe would differ from it and end every wait at
+# The baseline is PROBED at the start, never read from `ctx.activity`: that can
+# be stale after the first navigation, when every later probe would differ from it and end every wait at
 # its first poll. An empty or failed probe is UNKNOWN: this wait skips the focus
 # check and the dump path alone decides.
 async def _wait_until_changed(ctx: Context, screen: object, ms: int) -> tuple:

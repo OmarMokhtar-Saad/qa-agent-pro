@@ -19,7 +19,7 @@ import json
 import logging
 from typing import Any
 
-from tools.mobile import app_flows_meta, app_store
+from tools.mobile import app_flows_meta, app_store, flow_stats
 from tools.mobile.app_flows_check import secret_fields, template_from_script
 from tools.mobile.app_flows_consts import (
     ALLOWED_OPS,
@@ -129,24 +129,27 @@ def _with_meta(got: dict, entry: dict) -> dict:
     return got
 
 
+def _row(name: str, template: dict) -> dict:
+    meta = template.get("meta") or {}
+    return {
+        "name": name,
+        "steps": len(template["steps"]),
+        "params": template["params"],
+        "fields": secret_fields(template),
+        "reached": app_flows_meta.reached(template),
+        "covers": app_flows_meta.covers(template),
+        "goal": meta.get("goal") or "",
+        "score": flow_stats.score(template),
+    }
+
+
 def list_flows(package: Any) -> dict:
     flows = app_store.read_json(package, FLOWS_FILE).get("flows")
     rows: list = []
     for name in sorted(flows if isinstance(flows, dict) else ()):
         got = get_flow(package, name)
-        if got.get("error"):
-            continue
-        template = got["content"]
-        rows.append(
-            {
-                "name": name,
-                "steps": len(template["steps"]),
-                "params": template["params"],
-                "fields": secret_fields(template),
-                "reached": app_flows_meta.reached(template),
-                "covers": app_flows_meta.covers(template),
-            }
-        )
+        if not got.get("error"):
+            rows.append(_row(name, got["content"]))
     return {"error": None, "content": rows}
 
 

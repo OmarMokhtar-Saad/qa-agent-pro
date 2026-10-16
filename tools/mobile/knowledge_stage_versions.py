@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tools.mobile import knowledge_sk3_alias as sk3_alias
 from tools.mobile import knowledge_sk_legacy as sk_legacy
 from tools.mobile import knowledge_versions as kv
 from tools.mobile.knowledge_learn import StageResult
@@ -27,6 +28,7 @@ def run(conn, lc) -> StageResult:
     else:
         result.notes.append("no app version")
     result.wrote += sk_legacy.migrate(conn, lc.package, lc.run_id)
+    result.wrote += sk3_alias.migrate(conn, lc.run_id)
     result.wrote += sk_legacy.retire_stale(conn, lc.package, lc.run_id)
     result.wrote += kv.stale_shortcuts(conn, lc.run_id)
     return result

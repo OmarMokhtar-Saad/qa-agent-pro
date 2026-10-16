@@ -21,8 +21,9 @@ import asyncio
 import dataclasses
 import re
 
-from tools.mobile import adb, adb_facts
+from tools.mobile import adb, adb_facts, screen_frame
 
+FOCUS_CMD = "dumpsys window | grep mCurrentFocus"
 READ_CMD = "dumpsys window | grep mCurrentFocus; echo @@; screencap | md5sum"
 BLANK_CMD = "screencap | tr -d '\\000\\377' | wc -c"
 #: A frame with at most this many "colour" bytes is black or one flat colour.
@@ -39,11 +40,16 @@ class Reading:
 
     focus: str
     digest: str
+    #: Sampled pixels of the frame (:mod:`screen_frame`); empty on the md5 fallback.
+    frame: bytes = dataclasses.field(default=b"", compare=False, repr=False)
+    flat: bool = dataclasses.field(default=False, compare=False, repr=False)
 
 
 def same(before: Reading, now: Reading) -> bool:
     """True when the frame is identical and the focus is not a known different one."""
-    if not before.digest or before.digest != now.digest:
+    if not before.digest:
+        return False
+    if before.digest != now.digest and not screen_frame.static(before.frame, now.frame):
         return False
     return not (before.focus and now.focus and before.focus != now.focus)
 
@@ -72,8 +78,21 @@ async def _shell(serial: str, command: str, budget: float) -> str | None:
     return str((result.get("content") or {}).get("out") or "")
 
 
+async def _read_frame(serial: str, budget: float) -> Reading | None:
+    """Focus plus a sampled raw frame; ``None`` when the raw frame is unavailable."""
+    frame = await screen_frame.fetch(serial, budget)
+    if frame is None:
+        return None
+    out = await _shell(serial, FOCUS_CMD, budget)
+    focus = adb_facts.focused_component(out or "")
+    return Reading(focus, frame.digest, frame.words, frame.flat)
+
+
 async def read(serial: str, budget: float) -> Reading | None:
     """One probe, or ``None`` when unknown (adb error, unsupported, over budget)."""
+    framed = await _read_frame(serial, budget)
+    if framed is not None:
+        return framed
     out = await _shell(serial, READ_CMD, budget)
     return None if out is None else parse(out)
 
@@ -94,6 +113,8 @@ async def blank(serial: str, digest: str, budget: float) -> bool:
 async def baseline(serial: str, budget: float) -> Reading | None:
     """A reading fit to compare later ones against; ``None`` when not trustworthy."""
     reading = await read(serial, budget)
-    if reading is None or await blank(serial, reading.digest, budget):
+    if reading is None:
         return None
-    return reading
+    if reading.frame:
+        return None if reading.flat else reading
+    return None if await blank(serial, reading.digest, budget) else reading

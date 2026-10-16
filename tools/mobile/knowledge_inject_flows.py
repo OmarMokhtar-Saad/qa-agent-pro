@@ -57,12 +57,32 @@ def _item(base: str, rows: list) -> dict:
     }
 
 
+def _rank(got: list) -> tuple:
+    """Best-first order of one packet group: reached, replay score, longest route."""
+    first = got[0]
+    return (
+        bool(first.get("reached")),
+        float(first.get("score") or 0),
+        sum(int(r.get("steps") or 0) for r in got),
+    )
+
+
+def _best_per_goal(groups: dict) -> dict:
+    """Keep one group per goal (a legacy flow without one is its own goal)."""
+    best: dict = {}
+    for base, got in groups.items():
+        goal = str(got[0].get("goal") or "") or "base:" + base
+        if goal not in best or _rank(got) > _rank(best[goal][1]):
+            best[goal] = (base, got)
+    return dict(best.values())
+
+
 def flows(snap: dict, key) -> list:
-    """One item per saved flow (its packets grouped), in the stable block only."""
+    """One item per goal (its best flow, packets grouped), in the stable block only."""
     if key is not None:
         return []
     rows = [r for r in snap.get("flows") or [] if isinstance(r, dict) and r.get("name")]
-    return [_item(base, got) for base, got in _groups(rows).items()]
+    return [_item(base, got) for base, got in _best_per_goal(_groups(rows)).items()]
 
 
 knowledge_inject.register_source("flows", flows)

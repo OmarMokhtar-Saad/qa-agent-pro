@@ -19,9 +19,12 @@ from typing import NamedTuple
 from tools.mobile import (
     app_flows,
     kstg_flow_build,
+    kstg_flow_gate,
+    kstg_flow_merge,
     kstg_flow_meta,
     kstg_flow_packets,
     kstg_flow_prune,
+    kstg_flow_sig,
 )
 from tools.mobile.knowledge_learn import StageResult
 
@@ -39,9 +42,8 @@ def _save(package: str, packet: _Packet) -> str:
     got = app_flows.template_from_script({"actions": packet.acts})
     if got.get("error"):
         return str(got["error"])[:120]
-    saved = app_flows.save_flow(
-        package, packet.name, dict(got["content"], meta=packet.meta)
-    )
+    meta = kstg_flow_merge.merged_meta(package, packet.name, packet.meta)
+    saved = app_flows.save_flow(package, packet.name, dict(got["content"], meta=meta))
     return str(saved.get("error") or "")[:120]
 
 
@@ -62,7 +64,9 @@ def _packets(acts: list) -> tuple:
 def _plan(goal: str, recs: list, packets: list) -> list:
     done = kstg_flow_meta.all_kept(recs, packets)
     metas = kstg_flow_meta.packet_metas(recs, packets, done)
-    names = kstg_flow_packets.names(goal, len(packets))
+    sig = kstg_flow_sig.of_records(recs)
+    names = kstg_flow_packets.names(goal, len(packets), sig)
+    metas = [dict(m, goal=kstg_flow_build.normalise(goal)) for m in metas]
     return [_Packet(n, p, m) for n, p, m in zip(names, packets, metas)]
 
 
@@ -78,6 +82,10 @@ def _write(package: str, plan: list, result: StageResult) -> bool:
 
 def _save_all(lc, goal_recs: tuple, result: StageResult) -> None:
     goal, recs = goal_recs
+    refused = kstg_flow_gate.reject(recs)
+    if refused:
+        result.notes.append("%s: not saved, %s" % (lc.package, refused))
+        return
     packets, why = _packets([r["flow_action"] for r in recs])
     if why:
         result.notes.append("%s: %s" % (lc.package, why))

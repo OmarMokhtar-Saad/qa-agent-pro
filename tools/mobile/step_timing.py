@@ -29,6 +29,8 @@ import time
 from contextvars import ContextVar
 from typing import Any, Awaitable, Optional
 
+from tools.mobile import step_ledger
+
 #: Distinct phase names one call may record. The instrumented sites name six;
 #: a name past this is dropped rather than grown into an unbounded dict that
 #: ends up in a reply. Bounded from above in
@@ -58,6 +60,7 @@ def _record(name: str, seconds: float) -> None:
     phases = state["phases"]
     if name not in phases and len(phases) >= MAX_TIMED_PHASES:
         return
+    step_ledger.on_phase(state, name, int(seconds * 1000))
     total, count = phases.get(name, (0.0, 0))
     phases[name] = (total + seconds, count + 1)
 
@@ -86,6 +89,7 @@ def mark(name: str) -> None:
     if name not in marks and len(marks) >= MAX_TIMED_PHASES:
         return
     marks[name] = marks.get(name, 0) + 1
+    step_ledger.on_mark(state, name)
 
 
 def summary() -> dict:
@@ -112,6 +116,9 @@ class StepTiming:
     dump_ms: int = 0
     wait_ms: int = 0
     source: str = ""
+    marks: dict = dataclasses.field(default_factory=dict)
+    ledger: list = dataclasses.field(default_factory=list)
+    trace: list = dataclasses.field(default_factory=list)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -129,6 +136,9 @@ class StepTiming:
                 dump_ms=max(0, int(data.get("dump_ms", 0))),
                 wait_ms=max(0, int(data.get("wait_ms", 0))),
                 source=str(data.get("source") or "")[:MAX_SOURCE_CHARS],
+                marks=step_ledger.clean_marks(data.get("marks")),
+                ledger=step_ledger.clean_ledger(data.get("ledger")),
+                trace=step_ledger.clean_trace(data.get("trace")),
             )
         except (TypeError, ValueError, OverflowError):
             return None
@@ -156,6 +166,9 @@ def current_row(index: int) -> Optional[StepTiming]:
         dump_ms=int(dump.get("ms", 0)),
         wait_ms=int(wait.get("ms", 0)),
         source=str((_PHASES.get() or {}).get("source") or ""),
+        marks=dict((_PHASES.get() or {}).get("marks") or {}),
+        ledger=list((_PHASES.get() or {}).get("ledger") or []),
+        trace=list((_PHASES.get() or {}).get("trace") or []),
     )
 
 
