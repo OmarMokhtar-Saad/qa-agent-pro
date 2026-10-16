@@ -103,6 +103,7 @@ def schedule(serial: str, gen: int) -> None:
     """Take the anchor in the background; never raises, never blocks the dump."""
     serial = str(serial or "")
     _ANCHOR.pop(serial, None)
+    dump_latency_state.note_p90(serial)
     if cheaper_to_dump(serial):
         return
     try:
@@ -118,7 +119,7 @@ def worth_waiting(serial: str) -> bool:
     """True when this device's dumps cost clearly more than its anchor probe;
     on a fast dump path the caller acts at once and takes the dump instead."""
     key = str(serial or "")
-    dump_ms = dump_latency_state.p90_ms(key)
+    dump_ms = dump_latency_state.next_dump_p90(key)
     cost = _COST.get(key, PROBE_GUESS_S)
     return dump_ms is not None and dump_ms / 1000.0 > WAIT_PAYBACK_RATIO * cost
 
@@ -127,7 +128,7 @@ def cheaper_to_dump(serial: str) -> bool:
     """True once dump AND probe are timed (an untimed probe runs once) and the dump
     is too fast to pay for it: the action would bump the generation first."""
     key = str(serial or "")
-    timed = key in _COST and dump_latency_state.p90_ms(key) is not None
+    timed = key in _COST and dump_latency_state.next_dump_p90(key) is not None
     return timed and not worth_waiting(key)
 
 
@@ -191,10 +192,8 @@ def note_read(serial: str, observed: object) -> None:
 def screen_is_current(serial: str, shown: str) -> bool:
     """True when *shown* is the last dump's screen and nothing actuated since."""
     key = str(serial or "")
-    held = _READ.get(key)
-    return (
-        bool(shown) and held is not None and held[:2] == (shown, dump_reuse.token(key))
-    )
+    held = _READ.get(key) or ()
+    return bool(shown) and held[:2] == (shown, dump_reuse.token(key))
 
 
 dump_latency_state.BEFORE_DUMP.append(begin)

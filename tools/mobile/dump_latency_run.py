@@ -7,20 +7,30 @@ import functools
 import time
 from typing import Any, Awaitable
 
+from tools.mobile import step_timing
 from tools.mobile.dump_latency_state import _INFLIGHT, _record, before_dump
+
+
+def _source() -> str:
+    """The tree source the armed step noted for this dump, or ``""``."""
+    row = step_timing.current_row(0)
+    return row.source if row else ""
 
 
 async def _timed(serial: str, awaitable: Awaitable[Any]) -> Any:
     before_dump(serial)  # e.g. screen_anchor's "before" probe
+    step_timing.note_source("")  # so the source read below is THIS dump's
     started = time.monotonic()
     try:
         result = await awaitable
     except asyncio.CancelledError:
         raise
     except Exception:
-        _record(serial, time.monotonic() - started)
+        _record(serial, time.monotonic() - started, _source())
         raise
-    _record(serial, time.monotonic() - started)
+    # The source (a11y, uiautomator fallback) keeps a 0.1 s dump out of the
+    # same p90 as a 2.5 s one.
+    _record(serial, time.monotonic() - started, _source())
     return result
 
 

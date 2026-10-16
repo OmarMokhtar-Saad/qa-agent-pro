@@ -19,6 +19,7 @@ from typing import NamedTuple
 from tools.mobile import (
     app_flows,
     kstg_flow_build,
+    kstg_flow_dedupe,
     kstg_flow_gate,
     kstg_flow_merge,
     kstg_flow_meta,
@@ -37,14 +38,28 @@ class _Packet(NamedTuple):
     meta: dict
 
 
-def _save(package: str, packet: _Packet) -> str:
-    """``""`` once the flow is saved, else why it was not."""
+class _Outcome(NamedTuple):
+    error: str  # why the flow was not saved, else ""
+    note: str  # the staging note for the packet
+    holder: str  # the flow now holding the packet: itself, or the one covering it
+
+
+def _save(package: str, packet: _Packet) -> _Outcome:
     got = app_flows.template_from_script({"actions": packet.acts})
     if got.get("error"):
-        return str(got["error"])[:120]
+        return _Outcome(str(got["error"])[:120], "", "")
     meta = kstg_flow_merge.merged_meta(package, packet.name, packet.meta)
-    saved = app_flows.save_flow(package, packet.name, dict(got["content"], meta=meta))
-    return str(saved.get("error") or "")[:120]
+    template = dict(got["content"], meta=meta)
+    verdict = kstg_flow_dedupe.judge(package, packet.name, template)
+    if verdict.covered_by:
+        note = "skipped %s, already covered by %s" % (packet.name, verdict.covered_by)
+        return _Outcome("", note, verdict.covered_by)
+    error = str(app_flows.save_flow(package, packet.name, template).get("error") or "")
+    if error:  # the replaced flows stay when the new one could not be saved
+        return _Outcome(error[:120], "", "")
+    gone = kstg_flow_dedupe.drop(package, verdict.replaces)
+    note = "saved " + packet.name + (" (replaced %s)" % ", ".join(gone) if gone else "")
+    return _Outcome("", note, packet.name)
 
 
 def _packets(acts: list) -> tuple:
@@ -70,14 +85,17 @@ def _plan(goal: str, recs: list, packets: list) -> list:
     return [_Packet(n, p, m) for n, p, m in zip(names, packets, metas)]
 
 
-def _write(package: str, plan: list, result: StageResult) -> bool:
-    ok = True
+def _write(package: str, plan: list, result: StageResult) -> list:
+    """The flows holding the plan's packets (saved or covering); [] on any failure."""
+    held: list = []
     for packet in plan:
-        why = _save(package, packet) if ok else ""
-        ok = ok and not why
-        result.wrote += 1 if ok else 0
-        result.notes.append("%s: %s" % (package, why or "saved " + packet.name))
-    return ok
+        out = _save(package, packet)
+        result.notes.append("%s: %s" % (package, out.error or out.note))
+        if out.error:
+            return []
+        result.wrote += 1 if out.holder == packet.name else 0
+        held.append(out.holder)
+    return held
 
 
 def _save_all(lc, goal_recs: tuple, result: StageResult) -> None:
@@ -95,8 +113,9 @@ def _save_all(lc, goal_recs: tuple, result: StageResult) -> None:
         note = "%s: kept first %d of %d steps" % (lc.package, kept, len(recs))
         result.notes.append(note)
     plan = _plan(goal, recs, packets)
-    if _write(lc.package, plan, result) and kept == len(recs):
-        kstg_flow_prune.prune(lc.package, [p.name for p in plan], kept)
+    held = _write(lc.package, plan, result)
+    if held and kept == len(recs):  # a covering flow holds a skipped packet: keep it
+        kstg_flow_prune.prune(lc.package, held, kept)
 
 
 def run(conn, lc) -> StageResult:

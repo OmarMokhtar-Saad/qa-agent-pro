@@ -19,7 +19,7 @@ from tools.mobile import dump_latency, screen_anchor, screen_probe
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.dump import _dump
 from tools.mobile.replay.probe_gate import PROBE_BUDGET_S, wait_moved
-from tools.mobile.replay.screen import _screen_hash
+from tools.mobile.replay.screen import _screen_hash, system_dialog_package
 from tools.mobile.replay.waits_prior import _spinning
 
 
@@ -101,6 +101,8 @@ async def probed_changed(ctx: Context, screen: object, plan: Plan) -> tuple:
         current, fresh = got, True
         if _screen_hash(current) != before:
             return current, True, await _reusable(ctx, current, base)
+        if system_dialog_package(current):  # unchanged AND covered: stop polling
+            return current, False, False
         base, fresh = await _rebaseline(ctx, current)
         if base is None:
             break

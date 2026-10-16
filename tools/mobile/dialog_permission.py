@@ -35,3 +35,8 @@ HANDLER = ChoiceHandler(
         for text in PERMISSION_BUTTONS
     ),
 )
+
+
+def is_permission_button(text: object) -> bool:
+    """Whether *text* is the label of a runtime-permission dialog button."""
+    return str(text or "").strip().lower() in {b.lower() for b in PERMISSION_BUTTONS}

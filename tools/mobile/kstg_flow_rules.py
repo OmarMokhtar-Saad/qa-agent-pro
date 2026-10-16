@@ -34,7 +34,8 @@ def _steps(template: dict) -> list:
     return [json.dumps(s, sort_keys=True) for s in template.get("steps") or []]
 
 
-def _inside(small: list, big: list) -> bool:
+def inside(small: list, big: list) -> bool:
+    """Whether *small* is a shorter contiguous run of *big*."""
     n = len(small)
     return 0 < n < len(big) and any(big[i : i + n] == small for i in range(len(big)))
 
@@ -57,7 +58,7 @@ def _dominated(item: tuple, others: list) -> bool:
             continue
         if kstg_flow_sig.of_template(other[1]) == sig and _better(other, item):
             return True
-        if not _goal(template) and _goal(other[1]) and _inside(steps, _steps(other[1])):
+        if not _goal(template) and _goal(other[1]) and inside(steps, _steps(other[1])):
             return True
     return False
 

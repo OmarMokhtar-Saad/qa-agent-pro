@@ -4,14 +4,16 @@ One saved flow replays as one script, so it holds at most ``MAX_MODEL_ACTIONS``
 steps and must fit the wait budget on its own. A longer run is saved as
 ``<base>-p1`` .. ``<base>-pN`` instead of being cut short; the model replays them
 in order. The wait caps count each condition wait's ``max_s`` ceiling, not the time
-it really takes, so a packet closes when its ceilings add up to the cap.
+it really takes, so a packet closes when its ceilings add up to the cap. It also
+closes where the steps switch between the app and a runtime-permission dialog
+(``kstg_flow_perm``), so the login and the permission part replay on their own.
 """
 
 from __future__ import annotations
 
 import re
 
-from tools.mobile import actions, kstg_flow_build
+from tools.mobile import actions, kstg_flow_build, kstg_flow_perm
 
 #: Most packets one goal may become (4 x MAX_MODEL_ACTIONS = MAX_ACTIONS steps).
 MAX_FLOW_PACKETS = 4
@@ -32,8 +34,10 @@ def chunk(acts: list) -> list:
     """
     packets: list = []
     cur: list = []
+    seen = ""
     for act in acts:
-        if cur and not _fits(cur + [act]):
+        cut, seen = kstg_flow_perm.boundary(seen, act)
+        if cur and (cut or not _fits(cur + [act])):
             packets.append(cur)
             cur = []
         if not _fits(cur + [act]):

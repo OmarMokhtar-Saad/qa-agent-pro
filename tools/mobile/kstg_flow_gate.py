@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import re
 
+from tools.mobile.kstg_popup_permission import is_permission_decline
+
 _FAMILY_RE = re.compile(r"^(sk[0-9]+[a-z]*):")
 _TAPS = ("tap", "tap_text", "tap_text_if_present")
 _SELECTORS = ("rid", "text", "label", "role")
@@ -58,6 +60,23 @@ def _noop_loop(recs: list) -> bool:
     return False
 
 
+def _declines_permission(recs: list) -> bool:
+    """True when a tap in the route answers a runtime-permission dialog with a decline."""
+    for rec in recs:
+        act = rec.get("flow_action") or {}
+        got = act.get("target")
+        target: dict = got if isinstance(got, dict) else {}
+        labels = (
+            act.get("text"),
+            act.get("label"),
+            target.get("text"),
+            target.get("label"),
+        )
+        if act.get("op") in _TAPS and any(map(is_permission_decline, labels)):
+            return True
+    return False
+
+
 def reject(recs: list) -> str:
     """Why *recs* must not be saved as a flow, or ``""`` when they pass."""
     if _empty_tap_end(recs):
@@ -66,4 +85,6 @@ def reject(recs: list) -> str:
         return "mixes screen-key families"
     if _noop_loop(recs):
         return "repeats a tap that changed nothing"
+    if _declines_permission(recs):
+        return "taps a runtime-permission decline"
     return ""

@@ -23,8 +23,9 @@ A11Y_MAX_REPLY_CHARS = 1000000
 A11Y_MAX_CONSECUTIVE_FAILURES = 3
 
 #: Consecutive ``no_window`` refusals before the provider is dropped for the run.
-#: A system dialog or a screen transition hides the app window from the service;
-#: each refusal falls back to uiautomator for that dump only.
+#: qa-ime 1.2.0 reads every app and dialog window, so
+#: ``no_window`` means no readable window at all (a screen transition); each refusal
+#: falls back to uiautomator for that dump only.
 A11Y_MAX_CONSECUTIVE_NO_WINDOW = 10
 
 _NO_WINDOW_REFUSAL = "refused: no_window"
