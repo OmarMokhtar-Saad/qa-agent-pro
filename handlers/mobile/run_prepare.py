@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import tools.mobile.session_finish as session_finish
+from handlers.mobile.run_grant import mobile_grant_stage
 from handlers.mobile.run_hooks import mobile_run
 from handlers.mobile.run_request import _MobileTestRequest
 from tools.mobile import adb as mobile_adb
@@ -53,5 +54,8 @@ async def _prepare_tail(
     )
     if reset_stage:
         return reset_stage, None
+    grant_stage = await mobile_grant_stage(req, serial, target)
+    if grant_stage:
+        return grant_stage, None
     failed = await _mobile_preflight_reply(serial, target)
     return failed, (target, locale_taken, capture_result, reset_result)

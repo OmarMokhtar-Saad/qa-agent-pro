@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.125.1] - 2026-10-16
+## [1.126.0] - 2026-10-16
 
 ### Added
 
@@ -29,14 +29,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- The QA keyboard is now 1.2.0. Its screen reads include a permission
-  or ANR dialog shown over the app, so the fast read path no longer
-  falls back to the slow one there. 1.2.0 is signed with a new key, so
-  on a device holding 1.1.0 the run removes the old QA keyboard and
-  installs 1.2.0 in its place; your own keyboard is restored as usual.
-
-### Fixed
-
-- Tests now pin that prune keeps a flow covering a skipped packet,
-  that a failed flow save keeps the flows it would replace, and that
-  a read naming no source keeps the last real one.
+- qa_mobile_test takes a new opt-in `grant_permissions` option (needs
+  `apply: true`). Before the first step it grants the run's own app
+  every runtime permission it asked for but does not hold yet, so
+  permission dialogs no longer interrupt the run. It never overrides
+  a permission you or a device policy fixed ("don't ask again"),
+  never grants Health Connect (health data) access, and a grant the
+  device refuses never stops the run; the permission-dialog handler
+  still covers anything left. It is off by default.

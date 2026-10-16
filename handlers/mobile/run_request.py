@@ -30,6 +30,7 @@ class _MobileTestRequest:
     charter: str
     choose: _common.ChooseCb
     progress: _common.ProgressCb
+    grant_permissions: bool = False
 
     @classmethod
     def from_call(cls, params: dict) -> "_MobileTestRequest":

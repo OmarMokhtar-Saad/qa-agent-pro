@@ -86,6 +86,7 @@ async def handle_mobile_test(  # noqa: PLR0913 - MCP tool schema
     capture_ack: bool = False,
     reset_app: bool = False,
     charter: str = "",
+    grant_permissions: bool = False,
     *,
     choose: _common.ChooseCb = None,
     ask_text: _elicit.AskCb = None,
