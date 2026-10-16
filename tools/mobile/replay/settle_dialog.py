@@ -11,6 +11,7 @@ from tools.mobile import adb, dialog_handlers
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.context_consts import DIALOG_SETTLE_S, MAX_DIALOG_TAPS
 from tools.mobile.replay.dump import _drop_carried, _dump, _focus_probe, dump_raw
+from tools.mobile.replay.dump_held import take_held
 from tools.mobile.replay.elements import (
     _center,
     actuated_element,
@@ -88,7 +89,9 @@ def _dialog_tap_refusal(ctx: Context, action: Any, target: DialogTarget) -> str:
 
 async def _handler_action(ctx: Context, view: CutView, foreign: str) -> Any:
     """The handler's action for the interruption in front, or None when nothing fits."""
-    raw = await dump_raw(ctx.serial)
+    # Settle's own dump was just read and nothing was actuated since (the
+    # generation check inside take_held): do not read the same screen twice.
+    raw = await take_held(ctx.serial) or await dump_raw(ctx.serial)
     xml = raw.get("content") if isinstance(raw, dict) else None
     if not isinstance(xml, str) or not xml:
         return None

@@ -21,8 +21,8 @@ preflight and ``scripts/build_dist.py``'s mobile-file exclusion all consult the
 same absence and start passing together.
 """
 
-#: Release this pin describes. Matches the tag `qa-ime-v1.0.0`.
-IME_VERSION = "1.0.0"
+#: Release this pin describes. Matches the tag `qa-ime-v1.1.0`.
+IME_VERSION = "1.1.0"
 
 #: applicationId / namespace from mobile/qa-ime/build.gradle.kts.
 IME_PACKAGE = "io.qaagents.ime"
@@ -33,12 +33,12 @@ IME_SERVICE = "io.qaagents.ime.QaImeService"
 #: The published release asset. HTTPS, and the only URL the downloader accepts.
 IME_ASSET_URL = (
     "https://github.com/OmarMokhtar-Saad/qa-agent-pro/releases/download/"
-    "qa-ime-v1.0.0/qa-ime-1.0.0.apk"
+    "qa-ime-v1.1.0/qa-ime-1.1.0.apk"
 )
 
-#: SHA-256 of the 646906 bytes served at IME_ASSET_URL, verified 2026-09-04
+#: SHA-256 of the 653758 bytes served at IME_ASSET_URL, verified 2026-10-16
 #: against the asset itself and against its published .sha256 sidecar.
-IME_SHA256 = "0d8abda1677bb56311212c86e5de1d1990572134abab37807cc273410125db51"
+IME_SHA256 = "f3bdb2f5249c96dc646b673d596240d29721e760231628414eea150db18e5669"
 
 #: The text-field broadcasts QaImeService registers in onCreate (QaImeService.kt:72-113; it also
 #: registers ARM/DISARM/DUMP, which this module does not state).

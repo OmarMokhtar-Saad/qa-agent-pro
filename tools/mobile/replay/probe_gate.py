@@ -19,6 +19,8 @@ from tools.mobile.replay.screen import _screen_hash
 PROBE_BUDGET_S = 3.0
 #: ``Probe.gate`` modes.
 TEXT = "text"  # skip dumps until the frame moves; one confirming dump at the end
+#: Verdicts after whose dump the gate is re-anchored and keeps gating.
+KEEPS_GATE = ("dump", "unsure")
 CALM = "calm"  # a screen provably current and quiet for one poll is calm
 
 
@@ -52,14 +54,22 @@ class Gate:
         #: True until the first verdict: the baseline was bracketed by the dump
         #: in hand a moment ago, so a calm gate answers from that dump at once.
         self.primed = False
+        #: True while ``base`` equals the "before" reading of the dump in hand;
+        #: only then may a quiet poll vouch for that dump (calm mode).
+        self.bracketed = True
 
     async def rebase(self, shown: object) -> bool:
         """Re-anchor on the screen just dumped; False when the probe is unusable.
 
-        Calm mode skips dumps on the strength of one quiet poll, so it only
-        re-anchors on a baseline equal to the reading taken beside that dump.
+        Calm mode skips dumps on the strength of one quiet poll, so only a
+        baseline equal to the reading taken beside that dump may vouch for it.
+        When the screen moved while that dump ran, a plain baseline still gates
+        the next polls (``bracketed`` False: they may dump, never go calm), so
+        one busy dump never drops the gate for the rest of the wait.
         """
         base = await _baseline(self.ctx, shown, self.mode)
+        self.bracketed = base is not None
+        base = base or await screen_probe.baseline(self.ctx.serial, PROBE_BUDGET_S)
         self.base = base or self.base
         return base is not None
 
@@ -74,20 +84,29 @@ class Gate:
 
     async def verdict(self, current: object, deadline: float) -> str:
         """``"calm"``: treat *current* as read twice. ``"dump"``: the frame moved,
-        dump then re-anchor. ``"drop"``: dump now and stop gating (the window
-        spent, or an untrusted quiet), so that dump is the confirming read."""
+        dump then re-anchor. ``"unsure"``: a quiet poll that cannot vouch for the
+        screen in hand; dump, then re-anchor. ``"drop"``: the window is spent;
+        dump now and stop gating, so that dump is the confirming read."""
         until = deadline - dump_latency.p90_ms(self.ctx.serial) / 1000.0
         if time.monotonic() >= until:
             return "drop"
-        trusted = self.mode == CALM and _quiet_trusted(self.ctx, current)
+        trusted = self._trusts(current)
         primed, self.primed = self.primed and trusted, False
         held = "quiet" if primed else await self.hold(until)
         if held == "moved":
             return "dump"
-        calm = held == "quiet" and trusted and _quiet_trusted(self.ctx, current)
-        if calm:
-            step_timing.mark("gate_skip")
-        return "calm" if calm else "drop"
+        if held == "idle":
+            return "drop"
+        if not (trusted and self._trusts(current)):
+            return "unsure"
+        step_timing.mark("gate_skip")
+        return "calm"
+
+    def _trusts(self, current: object) -> bool:
+        """True when a quiet poll may vouch for *current* (calm mode only)."""
+        return (
+            self.mode == CALM and self.bracketed and _quiet_trusted(self.ctx, current)
+        )
 
 
 async def _baseline(ctx: Context, screen: object, mode: str) -> object:

@@ -11,7 +11,7 @@ from tools.mobile.replay.context_consts import (
     WAIT_POLL_S,
 )
 from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
-from tools.mobile.replay.probe_gate import TEXT, open_gate, rebased
+from tools.mobile.replay.probe_gate import KEEPS_GATE, TEXT, open_gate, rebased
 from tools.mobile.replay.screen import _screen_has_element
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_types import Pace, Poll, Probe
@@ -117,7 +117,7 @@ async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
         if final:
             return final
         previous, current = current, content
-        gate = await rebased(gate, content) if verdict == "dump" else None
+        gate = await rebased(gate, content) if verdict in KEEPS_GATE else None
         await ticker.tick()
 
 

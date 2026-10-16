@@ -1,12 +1,15 @@
 """The per-step ledger the run manifest keeps beside the timing numbers.
 
 Three bounded pieces, all written by ``step_timing`` while a step is armed:
-``marks`` (event counts), ``ledger`` (one row per dump: reason, ms, skipped?)
-and ``trace`` (the ordered phase and event names, the replay trace). Pure
-helpers over the armed state dict; nothing here awaits or raises.
+``marks`` (event counts), ``ledger`` (one row per dump: reason, ms, skipped?,
+and the optional ``caller`` site that asked) and ``trace`` (the ordered phase
+and event names, the replay trace). Pure helpers over the armed state dict;
+nothing here awaits or raises.
 """
 
 from __future__ import annotations
+
+from tools.mobile import step_site
 
 #: Distinct mark names kept per step.
 MAX_MARKS = 20
@@ -38,11 +41,17 @@ def _push(items: list, value: object, cap: int) -> None:
     del items[:-cap]
 
 
+def _with_caller(row: dict) -> dict:
+    """*row* plus the optional ``caller`` key naming the asking code site."""
+    site = step_site.caller()
+    return {**row, "caller": site} if site else row
+
+
 def on_phase(state: dict, name: str, ms: int) -> None:
     """A timed phase ended: trace it, and ledger it when it was a dump."""
     _push(state.setdefault("trace", []), name, MAX_TRACE_NAMES)
     if name == "ui_dump":
-        row = {"reason": "dump", "ms": int(ms), "skipped": False}
+        row = _with_caller({"reason": "dump", "ms": int(ms), "skipped": False})
         _push(state.setdefault("ledger", []), row, MAX_LEDGER_ROWS)
 
 
@@ -50,22 +59,28 @@ def on_mark(state: dict, name: str) -> None:
     """An event was counted: trace it, and ledger it when it concerns a dump."""
     _push(state.setdefault("trace", []), name, MAX_TRACE_NAMES)
     if name in _DUMP_EVENTS:
-        row = {"reason": name, "ms": 0, "skipped": name in SKIPS}
+        row = _with_caller({"reason": name, "ms": 0, "skipped": name in SKIPS})
         _push(state.setdefault("ledger", []), row, MAX_LEDGER_ROWS)
+
+
+def _clean_row(item: dict) -> dict:
+    row = {
+        "reason": str(item.get("reason") or "")[:40],
+        "ms": max(0, int(item.get("ms") or 0)),
+        "skipped": bool(item.get("skipped")),
+    }
+    if item.get("caller"):
+        row["caller"] = str(item["caller"])[:40]
+    return row
 
 
 def clean_ledger(value: object) -> list:
     """The stored ledger, kept only where every row is well formed."""
-    rows = []
-    for item in value if isinstance(value, list) else []:
-        if isinstance(item, dict):
-            rows.append(
-                {
-                    "reason": str(item.get("reason") or "")[:40],
-                    "ms": max(0, int(item.get("ms") or 0)),
-                    "skipped": bool(item.get("skipped")),
-                }
-            )
+    rows = (
+        [_clean_row(i) for i in value if isinstance(i, dict)]
+        if isinstance(value, list)
+        else []
+    )
     return rows[-MAX_LEDGER_ROWS:]
 
 

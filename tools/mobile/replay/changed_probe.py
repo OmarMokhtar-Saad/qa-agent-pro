@@ -42,8 +42,18 @@ async def _reusable(ctx: Context, screen: object, base: screen_probe.Reading) ->
     return now is not None and now.focus == base.focus
 
 
+async def _still_shown(ctx: Context, screen: object) -> bool:
+    """True when *screen* is the last dump's, nothing actuated since, and the frame
+    still equals the probe that bracketed that dump: it cannot have changed."""
+    shown = _screen_hash(screen)
+    base = await screen_anchor.trusted_baseline(ctx.serial, shown, PROBE_BUDGET_S)
+    return base is not None
+
+
 async def _confirm(ctx: Context, screen: object, plan: Plan) -> tuple:
     """The confirming read of an unmoved wait: ``(screen, changed, reusable)``."""
+    if await _still_shown(ctx, screen):
+        return screen, False, True
     dumped = await _dump(ctx, deadline=plan.deadline)
     if dumped.get("error"):
         return screen, False, False
@@ -51,6 +61,21 @@ async def _confirm(ctx: Context, screen: object, plan: Plan) -> tuple:
     if _screen_hash(content) == _screen_hash(screen):
         return content, False, True
     return content, True, await _reusable(ctx, content, plan.base)
+
+
+async def _rebaseline(ctx: Context, shown: object) -> tuple:
+    """``(baseline, bracketed)``: the baseline after a dump that showed the old screen: the bracketed one,
+    else a plain probe (the frame moved during the dump), so the wait keeps
+    gating on the probe instead of ending in a confirming dump; a change that
+    landed in that window is caught by the confirm at the deadline. ``None``
+    only when the probe is unavailable. *bracketed* False means the dump in hand
+    cannot stand for the post-wait screen."""
+    trusted = await screen_anchor.trusted_baseline(
+        ctx.serial, _screen_hash(shown), PROBE_BUDGET_S
+    )
+    if trusted:
+        return trusted, True
+    return await screen_probe.baseline(ctx.serial, PROBE_BUDGET_S), False
 
 
 async def _on_move(ctx: Context, plan: Plan, now: object) -> tuple:
@@ -76,9 +101,7 @@ async def probed_changed(ctx: Context, screen: object, plan: Plan) -> tuple:
         current, fresh = got, True
         if _screen_hash(current) != before:
             return current, True, await _reusable(ctx, current, base)
-        base = await screen_anchor.trusted_baseline(
-            ctx.serial, _screen_hash(current), PROBE_BUDGET_S
-        )
+        base, fresh = await _rebaseline(ctx, current)
         if base is None:
             break
     if fresh and base:

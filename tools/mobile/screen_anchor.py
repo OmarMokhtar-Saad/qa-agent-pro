@@ -10,14 +10,21 @@ way (:func:`schedule`), which lets it outlive the 15 s age cap.
 from __future__ import annotations
 
 import asyncio
+import time
 
 from tools.mobile import dump_latency_state, dump_reuse, screen_probe
 
 ANCHOR_BUDGET_S = 3.0
+#: Seconds one anchor probe is assumed to cost until one has been timed.
+PROBE_GUESS_S = 1.0
+#: The dump must cost this many times the anchor probe before waiting pays back.
+WAIT_PAYBACK_RATIO = 2.0
+_COST: dict = {}
 _ANCHOR: dict = {}
 _TASKS: set = set()
 _READ: dict = {}
 _PRE: dict = {}
+_PENDING: dict = {}
 
 
 def begin(serial: str) -> None:
@@ -80,7 +87,9 @@ async def _anchor(serial: str, gen: int) -> None:
     """Probe now; keep the reading only when it equals the "before" one and
     nothing actuated while it ran."""
     before = await _before(serial)
+    started = time.monotonic()
     reading = await screen_probe.baseline(serial, ANCHOR_BUDGET_S)
+    _COST[serial] = time.monotonic() - started
     if before is None or reading is None or not screen_probe.same(before, reading):
         return
     if gen == dump_reuse.token(serial):
@@ -96,7 +105,36 @@ def schedule(serial: str, gen: int) -> None:
     except RuntimeError:
         return
     _TASKS.add(task)
+    _PENDING[serial] = task
     task.add_done_callback(_TASKS.discard)
+
+
+def worth_waiting(serial: str) -> bool:
+    """True when this device's dumps cost clearly more than its anchor probe.
+
+    On a fast dump path (a few hundred ms) the wait would cost more than the
+    dump a skip saves, so the caller acts at once and takes the dump.
+    """
+    key = str(serial or "")
+    dump_ms = dump_latency_state.p90_ms(key)
+    cost = _COST.get(key, PROBE_GUESS_S)
+    return dump_ms is not None and dump_ms / 1000.0 > WAIT_PAYBACK_RATIO * cost
+
+
+async def ready(serial: str) -> None:
+    """Let the anchor probe still running for *serial* finish; never raises.
+
+    The probe takes about a second, and any actuating command bumps the
+    generation, which discards a reading that lands after it. Awaiting it before
+    an action runs is what lets :func:`before_action` hold a baseline at all.
+    """
+    task = _PENDING.get(str(serial or ""))
+    if task is None or task.done() or not worth_waiting(serial):
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(task), 2 * ANCHOR_BUDGET_S)
+    except (TimeoutError, OSError, ValueError, RuntimeError):
+        return
 
 
 def anchored(serial: str, gen: int) -> bool:
@@ -121,7 +159,7 @@ def note_read(serial: str, observed: object) -> None:
     shown = str((content or {}).get("hash") or "") if isinstance(content, dict) else ""
     key = str(serial or "")
     pre = _PRE.pop(key, None)
-    if shown and not observed.get("error"):
+    if shown and isinstance(observed, dict) and not observed.get("error"):
         _READ[key] = (shown, dump_reuse.token(key), pre)
     else:
         _READ.pop(key, None)

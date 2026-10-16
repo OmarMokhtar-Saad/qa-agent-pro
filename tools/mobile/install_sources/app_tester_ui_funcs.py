@@ -80,7 +80,7 @@ def _label_required() -> InstallOutcome:
         "label_required",
         "App Tester does not show this package on screen and lists apps by display "
         "name. Ask the tester what the app is called in App Tester (for example "
-        "Acme QA).",
+        "Acme QA), then re-call with app=<name>.",
     )
 
 

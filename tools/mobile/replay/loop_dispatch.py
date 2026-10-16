@@ -5,13 +5,19 @@ from __future__ import annotations
 from typing import Any
 
 from tools.mobile import actions as actions_mod
+from tools.mobile import screen_anchor
 from tools.mobile.replay.context import _ReplayRun, _Step
 from tools.mobile.replay.device_ops import _perform
 from tools.mobile.replay.elements import _clamp_source
 from tools.mobile.replay.elements_swipe import TouchSpec
 from tools.mobile.replay.guard import _confirmed
 from tools.mobile.replay.loop_field_empty import reconcile_empty_field
-from tools.mobile.replay.loop_settle import Acted, _device_error_stop, _settle_device
+from tools.mobile.replay.loop_settle import (
+    Acted,
+    _device_error_stop,
+    _next_observes,
+    _settle_device,
+)
 from tools.mobile.replay.screen import _screen_hash
 from tools.mobile.replay.steps_assert import Seen, _assert_step
 from tools.mobile.replay.verdicts import SCROLL_TARGET_MISSED
@@ -60,6 +66,8 @@ async def _device_step(
     entry = step.entry
     touch = TouchSpec(step.op, step.action, step.element, _clamp_source(screen))
     note_action(run.ctx, _screen_hash(screen))
+    if not _next_observes(run, step, screen):
+        await screen_anchor.ready(run.ctx.serial)
     outcome = await _perform(touch, run.ctx)
     outcome = await reconcile_empty_field(run, Acted(outcome, entry, screen))
     read = outcome.get("read_screen")

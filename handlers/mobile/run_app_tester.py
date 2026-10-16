@@ -6,6 +6,7 @@ from handlers import _common
 from handlers.mobile.run_request import _AppCall, _mobile_ask
 from tools.mobile import adb as mobile_adb
 from tools.mobile import app_alias, app_stage_pick, resolve_cache, run_store
+from tools.mobile.app_label_from_goal import goal_app_label
 from tools.mobile.install_source import InstallOutcome, InstallRequest
 from tools.mobile.install_sources.app_tester_ui import AppTesterUiSource
 from tools.mobile.install_sources.app_tester_ui_funcs import _label_required
@@ -92,6 +93,7 @@ async def app_tester_stage(call: _AppCall, target: str) -> tuple:
     if not tester:
         return await _open_tester_store(call.serial), target
     label = "" if parse_app_id(call.value) else call.value or target
+    label = label or goal_app_label(call.goal) or ""
     known = await known_package(call.serial, label)
     if not label and not known:  # nothing names the app: ask before any launch
         return _failed(_label_required()), ""

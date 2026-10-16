@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.121.0] - 2026-10-16
+## [1.122.0] - 2026-10-16
 
 ### Added
 
@@ -29,28 +29,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- A screen keeps one identity when the app changes its activity, and
-  screens learned before this release are matched to their new keys
-  when knowledge loads.
-- The screen-unchanged check ignores the status bar and tiny pixel
-  changes (clock, cursor), so unchanged steps skip their extra read.
-- A step before a wait, an optional tap, or a field already on screen
-  skips its settle read.
-- Learned flows remember how often they replay successfully; the best
-  flow per goal is offered, failing and duplicate flows are pruned, and
-  the model gets a short note on each replay.
-- Screen recordings are pulled at the end of the run instead of after
-  each step, and the installed app version is read faster.
-- When the tester has already asked for an install, the assistant is
-  now told to confirm it on the first call, skipping the preview.
-- The start reply carries the timing line, the static instructions
-  are sent once per run, and a repeat doctor call in the same run and
-  workspace reuses its report (fix=true always rechecks).
-- The run record keeps step marks, a per-read ledger and the replay
-  trace.
+- The QA keyboard is now 1.1.0. Devices on 1.0.0 are upgraded in place
+  and fast screen reading turns on.
+- When a full screen read is slow, a step lets the screen-unchanged
+  check finish before the next tap, so an unchanged screen is not read
+  again (probe_skip). On fast reads the step does not wait.
+- Answering a system dialog during settle reuses the screen read settle
+  just took when nothing was tapped since.
+- A wait for the screen to change keeps using the cheap frame check
+  for its whole wait, so it reads the full screen only when the frame
+  moved, instead of on every poll after the first unclear one.
+- Each read in the run record names the code that asked for it.
 
 ### Fixed
 
-- tester_inputs is accepted on the start call, and a wrong argument
-  returns a hint naming the accepted keys with an example.
-- The doctor flags a QA keyboard on the old protocol in yellow.
+- An App Tester start with no app name takes the app name the goal
+  quotes in the same sentence as App Tester or install wording; if
+  there is no single such name, the reply asks to re-call with
+  app=<name>.
