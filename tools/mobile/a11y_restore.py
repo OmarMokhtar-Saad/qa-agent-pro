@@ -13,7 +13,7 @@ from tools.mobile.a11y_device import (
     component,
     read_state,
 )
-from tools.mobile.a11y_dump import _FAILS
+from tools.mobile.a11y_dump import reset_streaks
 from tools.mobile.a11y_record import clear_record, read_record, write_record
 
 logger = logging.getLogger("tools.mobile.a11y")
@@ -54,7 +54,7 @@ def _restore_target(run_id: str) -> tuple:
     serial = str(record.get("serial") or remembered)
     if serial:
         adb.clear_dump_provider(serial)
-        _FAILS.pop(serial, None)
+        reset_streaks(serial)
     return record, serial
 
 

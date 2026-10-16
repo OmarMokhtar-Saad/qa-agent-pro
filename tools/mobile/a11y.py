@@ -25,8 +25,10 @@ from tools.mobile.a11y_device import (  # noqa: F401
 )
 from tools.mobile.a11y_dump import (  # noqa: F401
     _FAILS,
+    _NO_WINDOW,
     A11Y_DUMP_TIMEOUT_S,
     A11Y_MAX_CONSECUTIVE_FAILURES,
+    A11Y_MAX_CONSECUTIVE_NO_WINDOW,
     A11Y_MAX_REPLY_CHARS,
     decode,
     fetch_dump,

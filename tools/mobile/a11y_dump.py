@@ -22,7 +22,15 @@ A11Y_MAX_REPLY_CHARS = 1000000
 #: Consecutive failed fast dumps before the provider is dropped for the run.
 A11Y_MAX_CONSECUTIVE_FAILURES = 3
 
+#: Consecutive ``no_window`` refusals before the provider is dropped for the run.
+#: A system dialog or a screen transition hides the app window from the service;
+#: each refusal falls back to uiautomator for that dump only.
+A11Y_MAX_CONSECUTIVE_NO_WINDOW = 10
+
+_NO_WINDOW_REFUSAL = "refused: no_window"
+
 _FAILS: dict = {}
+_NO_WINDOW: dict = {}
 
 
 def _inflate(b64: str) -> dict:
@@ -105,13 +113,30 @@ async def fetch_dump(serial: str) -> dict:
     return _failed(g.exc)
 
 
+def reset_streaks(serial: str) -> None:
+    """Forget both failure streaks of ``serial`` (a success, an enable or a restore)."""
+    _FAILS.pop(serial, None)
+    _NO_WINDOW.pop(serial, None)
+
+
+def _strike(serial: str, error: str) -> None:
+    streaks, cap = _FAILS, A11Y_MAX_CONSECUTIVE_FAILURES
+    if _NO_WINDOW_REFUSAL in error:
+        streaks, cap = _NO_WINDOW, A11Y_MAX_CONSECUTIVE_NO_WINDOW
+    streaks[serial] = streaks.get(serial, 0) + 1
+    if streaks[serial] >= cap:
+        adb.clear_dump_provider(serial)
+
+
 async def provider(serial: str) -> dict:
-    """The dump provider ``adb.uiautomator_dump`` consults; drops itself after repeated failures."""
+    """The dump provider ``adb.uiautomator_dump`` consults; drops itself after repeated failures.
+
+    A ``no_window`` refusal counts on its own, longer streak: the service is alive,
+    only the window is hidden, so that dump alone falls back to uiautomator.
+    """
     got = await fetch_dump(serial)
     if got.get("error"):
-        _FAILS[serial] = _FAILS.get(serial, 0) + 1
-        if _FAILS[serial] >= A11Y_MAX_CONSECUTIVE_FAILURES:
-            adb.clear_dump_provider(serial)
+        _strike(serial, str(got["error"]))
         return got
-    _FAILS[serial] = 0
+    reset_streaks(serial)
     return got

@@ -19,7 +19,7 @@ from tools.mobile.a11y_device import (
     component,
     read_state,
 )
-from tools.mobile.a11y_dump import _FAILS, fetch_dump, provider
+from tools.mobile.a11y_dump import fetch_dump, provider, reset_streaks
 from tools.mobile.a11y_parity import compare
 from tools.mobile.a11y_record import write_record
 from tools.mobile.a11y_restore import _RUNS, restore
@@ -155,7 +155,7 @@ async def _verified(serial: str, run_id: str) -> dict | None:
     checked = await _verify_parity(serial, run_id)
     if checked.get("error"):
         return checked
-    _FAILS[str(serial)] = 0
+    reset_streaks(str(serial))
     adb.set_dump_provider(serial, provider)
     return None
 

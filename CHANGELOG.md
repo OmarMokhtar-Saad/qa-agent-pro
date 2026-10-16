@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.123.0] - 2026-10-16
+## [1.123.1] - 2026-10-16
 
 ### Added
 
@@ -29,17 +29,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- The run record shows what each screen-unchanged probe cost, and
-  wherever a skip of the extra read was possible but did not happen,
-  the reason (no baseline, other screen, cheaper to read, screen
-  changed, probe error). No extra device calls.
+- When fast reading cannot see the app window (a system dialog is in
+  front, or the screen is switching), only that one read uses the slow
+  path. Fast reading turns off for the run only after 10 such misses
+  in a row, or 3 real failures in a row.
 
 ### Fixed
 
-- A QA keyboard on the device signed with a different key is replaced
-  once (our own package only), instead of failing the upgrade at every
-  step. Any other failed keyboard setup is decided once per run, and the
-  step reply names the reason and the one-line adb fix.
-- A run the tester stops after its last case passed, with no failed
-  case and no guard stop, is recorded as pass (stopped after goal)
-  instead of unverified.
+- Fast reading no longer turns off for the whole run after a system
+  dialog (such as a permission prompt) or a screen transition.
