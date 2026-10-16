@@ -6,6 +6,7 @@ import logging
 
 from tools.mobile import (
     ime,
+    ime_fresh,
     step_timing,
 )
 from tools.mobile.replay.device_ops_consts import KEYBOARD_NOTE, KEYBOARD_OPS
@@ -65,7 +66,7 @@ async def _keyboard_install(serial: str) -> dict | None:
         )
     missing = not (present.get("content") or {}).get("installed")
     if missing or await ime.is_foreign_build(serial):
-        put = await ime.install(serial)
+        put = await ime_fresh.install_pinned(serial)
         if put.get("error"):
             return _keyboard_failure("installing it failed: " + str(put["error"]))
     enabled = await ime.enable(serial)

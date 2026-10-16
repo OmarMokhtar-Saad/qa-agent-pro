@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.122.0] - 2026-10-16
+## [1.123.0] - 2026-10-16
 
 ### Added
 
@@ -29,21 +29,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- The QA keyboard is now 1.1.0. Devices on 1.0.0 are upgraded in place
-  and fast screen reading turns on.
-- When a full screen read is slow, a step lets the screen-unchanged
-  check finish before the next tap, so an unchanged screen is not read
-  again (probe_skip). On fast reads the step does not wait.
-- Answering a system dialog during settle reuses the screen read settle
-  just took when nothing was tapped since.
-- A wait for the screen to change keeps using the cheap frame check
-  for its whole wait, so it reads the full screen only when the frame
-  moved, instead of on every poll after the first unclear one.
-- Each read in the run record names the code that asked for it.
+- The run record shows what each screen-unchanged probe cost, and
+  wherever a skip of the extra read was possible but did not happen,
+  the reason (no baseline, other screen, cheaper to read, screen
+  changed, probe error). No extra device calls.
 
 ### Fixed
 
-- An App Tester start with no app name takes the app name the goal
-  quotes in the same sentence as App Tester or install wording; if
-  there is no single such name, the reply asks to re-call with
-  app=<name>.
+- A QA keyboard on the device signed with a different key is replaced
+  once (our own package only), instead of failing the upgrade at every
+  step. Any other failed keyboard setup is decided once per run, and the
+  step reply names the reason and the one-line adb fix.
+- A run the tester stops after its last case passed, with no failed
+  case and no guard stop, is recorded as pass (stopped after goal)
+  instead of unverified.

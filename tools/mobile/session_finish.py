@@ -17,6 +17,7 @@ from tools.mobile import (
     preflight,
     run_finalize,
     run_lease_release,
+    stop_goal,
     stop_run,
 )
 from tools.mobile.device_lock import (
@@ -47,6 +48,12 @@ async def preflight_for(resolved: object) -> dict:
     )
 
 
+def _active_run(run_id: str) -> stop_run.ActiveRun:
+    """One live run for the stop tool, with the goal verdict its record proves."""
+    goal = stop_goal.goal_verdict(run_id)
+    return stop_run.ActiveRun(run_id, serial_of(run_id), trace_verdict=goal)
+
+
 def stop_ports() -> stop_run.StopPorts:
     """The ports ``stop_run.stop`` needs, from this module's own helpers.
 
@@ -56,7 +63,7 @@ def stop_ports() -> stop_run.StopPorts:
     """
 
     def active_runs(serial=None):
-        runs = [stop_run.ActiveRun(r, serial_of(r)) for r in heartbeat.active()]
+        runs = [_active_run(r) for r in heartbeat.active()]
         return [r for r in runs if not serial or r.serial == serial]
 
     return SimpleNamespace(

@@ -10,6 +10,7 @@ from tools.mobile import adb
 from tools.mobile.ime_consts import _INPUT_UNSAFE_RE, LANDED_UNKNOWN, TypeOpts
 from tools.mobile.ime_host import host
 from tools.mobile.ime_type import _length_refusal
+from tools.mobile.install_errors import UPDATE_INCOMPATIBLE
 from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger("tools.mobile.ime")
@@ -60,6 +61,21 @@ def _fallback_fix(apk: str, target: str) -> str:
     )
 
 
+def _mismatch_fix(reason: str, target: str) -> str:
+    """The one-line fix when the installed keyboard has another signing key, else ``""``."""
+    if UPDATE_INCOMPATIBLE not in str(reason):
+        return ""
+    package = str((host().manifest().get("content") or {}).get("package") or "")
+    return (
+        " Fix: the installed QA keyboard was signed with a different key and"
+        " could not be replaced automatically; run `adb -s "
+        + target
+        + " uninstall "
+        + package
+        + "` and start the run again."
+    )
+
+
 # What a tester is told when the QA keyboard could not be set up (R1d).
 #
 # States THAT typing fell back to ``adb shell input text``, WHY, what that costs,
@@ -68,7 +84,8 @@ def fallback_notice(reason: str, serial: str = "") -> str:
     """What a tester is told when the QA keyboard could not be set up (R1d)."""
     target = str(serial or "").strip() or "<serial>"
     tail = " Taps, swipes and screen checks are unaffected."
-    return _fallback_head(reason) + _fallback_fix(_cached_apk(), target) + tail
+    fix = _mismatch_fix(reason, target) or _fallback_fix(_cached_apk(), target)
+    return _fallback_head(reason) + fix + tail
 
 
 def _unsafe_input_refusal(value: str) -> dict | None:

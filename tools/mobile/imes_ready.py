@@ -7,6 +7,7 @@ import logging
 
 from tools.mobile import (
     ime,
+    ime_fresh,
     imes_record,
     imes_remember,
     imes_select,
@@ -116,9 +117,9 @@ async def _maybe_upgrade(serial: str, run_id: str, body: dict) -> str:
     old = await imes_upgrade.older_version(serial, bool(body.get("installed")))
     if not old or await imes_remember._remember_keyboard(serial, run_id):
         return ""
-    done = await ime.install(serial)
+    done = await ime_fresh.install_pinned(serial)
     if done.get("error"):
-        # Never uninstall: the run goes on the slow path with the note.
+        # A key mismatch was already retried fresh: the run goes on the slow path with the note.
         body["pinned"] = None
         return imes_upgrade.refused_note(old, done, serial)
     body["installed"], body["pinned"] = True, True
@@ -140,7 +141,7 @@ async def _prepare(serial: str, run_id: str, body: dict) -> dict | None:
     if refused:
         return refused
     if _needs_install(body):
-        installed = await ime.install(serial)
+        installed = await ime_fresh.install_pinned(serial)
         if installed.get("error"):
             return installed
     return None

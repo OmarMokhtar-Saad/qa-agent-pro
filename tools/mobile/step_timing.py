@@ -1,9 +1,6 @@
 """Where one ``qa_submit_mobile_step`` call spent its time, phase by phase.
 
-The Air run that motivated this (mrun-20260928-160257-cbcdc3) took 104 s for a
-five-action script and nothing said where: the audit row carries one
-``duration_ms`` for the whole call. This module is the breakdown.
-
+The audit row has one ``duration_ms`` per call; this module is the breakdown.
 A CONTEXTVAR, for the reason ``_MOBILE_IMAGE_SPECS`` in ``mcp_handlers`` is
 one: the handler has many return points and the timed work happens several
 calls down (``executor._dump``, ``executor._sleep``, ``media.finish_step``), so
@@ -18,8 +15,7 @@ PHASES NEST. ``replay`` is the whole ``session.submit`` call, and ``ui_dump``,
 not add up to the total and are not meant to: ``replay`` answers "how long did
 the script take", the inner ones answer "on what".
 
-A phase whose awaitable raises is not recorded; the exception propagates
-unchanged. Timing is a report, never a behaviour.
+A phase whose awaitable raises is not recorded. Timing is a report only.
 """
 
 from __future__ import annotations
@@ -92,6 +88,13 @@ def mark(name: str) -> None:
     step_ledger.on_mark(state, name)
 
 
+def note(reason: str, ms: int = 0) -> None:
+    """Ledger one fact (``probe`` cost, ``skip_miss:<why>``): a row, not a mark."""
+    state = _PHASES.get()
+    if state is not None:
+        step_ledger.on_note(state, reason, ms)
+
+
 def summary() -> dict:
     """``{"total_ms": int, "phases": {name: {"ms": int, "n": int}}}`` or ``{}``."""
     state = _PHASES.get()
@@ -153,7 +156,7 @@ def note_source(name: str) -> None:
 
 def current_row(index: int) -> Optional[StepTiming]:
     """The armed breakdown as one :class:`StepTiming`, or None when not armed."""
-    data = summary()
+    data, st = summary(), _PHASES.get() or {}
     if not data:
         return None
     phases = data["phases"]
@@ -165,10 +168,10 @@ def current_row(index: int) -> Optional[StepTiming]:
         dumps=int(dump.get("n", 0)),
         dump_ms=int(dump.get("ms", 0)),
         wait_ms=int(wait.get("ms", 0)),
-        source=str((_PHASES.get() or {}).get("source") or ""),
-        marks=dict((_PHASES.get() or {}).get("marks") or {}),
-        ledger=list((_PHASES.get() or {}).get("ledger") or []),
-        trace=list((_PHASES.get() or {}).get("trace") or []),
+        source=str(st.get("source") or ""),
+        marks=dict(st.get("marks") or {}),
+        ledger=list(st.get("ledger") or []),
+        trace=list(st.get("trace") or []),
     )
 
 

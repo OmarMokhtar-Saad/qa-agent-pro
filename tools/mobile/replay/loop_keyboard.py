@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from tools.mobile import ime
+from tools.mobile import ime, imes_record
 from tools.mobile.replay import keyboard_hold
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.context_consts import STATUS_ERROR, STATUS_NEEDS_TESTER
@@ -18,7 +18,10 @@ from tools.mobile.replay.loop_steps import _replay_steps
 # with typing over stdin, and the result says so, why, and the exact fix.
 async def _bring_up(ctx: Context, serial: str) -> tuple[Any, str]:
     """``(previous keyboard, fallback note)`` once the QA keyboard is tried."""
+    run_id = str(getattr(ctx, "run_id", "") or "")
     carried = str(getattr(ctx, "typing_fallback", "") or "")
+    # Decided ONCE per run: a later step does not retry a 16 s install.
+    carried = carried or str(imes_record.read_fallback(run_id).get("error") or "")
     up: dict = (
         {"error": carried, "content": None} if carried else await keyboard_up(serial)
     )
@@ -29,6 +32,7 @@ async def _bring_up(ctx: Context, serial: str) -> tuple[Any, str]:
     if previous is not None:
         await keyboard_down(serial, str(previous))
     ctx.typing_fallback = detail
+    imes_record.write_fallback(run_id, detail)
     return None, ime.fallback_notice(detail, serial)
 
 

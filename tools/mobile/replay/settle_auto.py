@@ -94,12 +94,22 @@ async def _probe_skip(ctx: Context, screen: Any) -> bool:
     """
     base = screen_anchor.before_action(ctx.serial, _screen_hash(screen))
     if base is None:
+        step_timing.note("skip_miss:" + screen_anchor.miss_reason(ctx.serial))
         return False
     until = _settle_deadline(ctx) + (dump_latency.p90_ms(ctx.serial) or 0) / 1000.0
+    unmoved = await _unmoved(ctx, base, until)
+    if unmoved:
+        step_timing.mark("probe_skip")
+    return unmoved
+
+
+async def _unmoved(ctx: Context, base: Any, until: float) -> bool:
+    """True when the frame never left *base* before *until*; a miss is ledgered."""
     try:
         unmoved = await wait_moved(ctx, base, until) is None
     except (OSError, ValueError, RuntimeError):
+        step_timing.note("skip_miss:probe_error")
         return False
-    if unmoved:
-        step_timing.mark("probe_skip")
+    if not unmoved:
+        step_timing.note("skip_miss:screen_changed")
     return unmoved

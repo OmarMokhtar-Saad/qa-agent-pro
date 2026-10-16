@@ -63,6 +63,13 @@ def on_mark(state: dict, name: str) -> None:
         _push(state.setdefault("ledger", []), row, MAX_LEDGER_ROWS)
 
 
+def on_note(state: dict, reason: str, ms: int) -> None:
+    """A non-dump fact (probe cost, why a probe skip did not fire): ledger it."""
+    _push(state.setdefault("trace", []), reason, MAX_TRACE_NAMES)
+    row = _with_caller({"reason": reason, "ms": int(ms), "skipped": False})
+    _push(state.setdefault("ledger", []), row, MAX_LEDGER_ROWS)
+
+
 def _clean_row(item: dict) -> dict:
     row = {
         "reason": str(item.get("reason") or "")[:40],

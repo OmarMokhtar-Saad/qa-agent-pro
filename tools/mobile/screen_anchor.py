@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from tools.mobile import dump_latency_state, dump_reuse, screen_probe
+from tools.mobile import dump_latency_state, dump_reuse, screen_probe, step_timing
 
 ANCHOR_BUDGET_S = 3.0
 #: Seconds one anchor probe is assumed to cost until one has been timed.
@@ -90,6 +90,7 @@ async def _anchor(serial: str, gen: int) -> None:
     started = time.monotonic()
     reading = await screen_probe.baseline(serial, ANCHOR_BUDGET_S)
     _COST[serial] = time.monotonic() - started
+    step_timing.note("probe", int(_COST[serial] * 1000))
     if before is None or reading is None or not screen_probe.same(before, reading):
         return
     if gen == dump_reuse.token(serial):
@@ -119,6 +120,17 @@ def worth_waiting(serial: str) -> bool:
     dump_ms = dump_latency_state.p90_ms(key)
     cost = _COST.get(key, PROBE_GUESS_S)
     return dump_ms is not None and dump_ms / 1000.0 > WAIT_PAYBACK_RATIO * cost
+
+
+def miss_reason(serial: str) -> str:
+    """Why :func:`before_action` holds no baseline (a ledger reason)."""
+    key = str(serial or "")
+    if key in _ANCHOR:
+        return "other_screen"
+    task = _PENDING.get(key)
+    if task is not None and not task.done() and not worth_waiting(key):
+        return "cheaper_to_dump"
+    return "no_anchor" if key in _READ else "no_baseline"
 
 
 async def ready(serial: str) -> None:
