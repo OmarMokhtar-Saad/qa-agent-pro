@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.125.0] - 2026-10-16
+## [1.125.1] - 2026-10-16
 
 ### Added
 
@@ -29,18 +29,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- The skip of the screen-unchanged probe now compares against the
-  speed of the read path the next read will use (fast or fallback),
-  so one slow fallback read no longer keeps the probe running.
-- A learned flow is split at a permission dialog: the permission
-  answers become their own short flow. A new flow that repeats one
-  already saved is skipped; one that contains an older flow replaces it.
+- The QA keyboard is now 1.2.0. Its screen reads include a permission
+  or ANR dialog shown over the app, so the fast read path no longer
+  falls back to the slow one there. 1.2.0 is signed with a new key, so
+  on a device holding 1.1.0 the run removes the old QA keyboard and
+  installs 1.2.0 in its place; your own keyboard is restored as usual.
 
 ### Fixed
 
-- A wait no longer polls to its limit when a system dialog sits in
-  front of an unchanged screen; it stops at once.
-- A flow that taps a permission decline is not learned.
-- (Needs the QA keyboard 1.2.0, shipped separately.) Screen reads
-  include a permission or ANR dialog shown over the app, so the fast
-  read path no longer falls back to the slow one there.
+- Tests now pin that prune keeps a flow covering a skipped packet,
+  that a failed flow save keeps the flows it would replace, and that
+  a read naming no source keeps the last real one.

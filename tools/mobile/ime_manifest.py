@@ -21,8 +21,8 @@ preflight and ``scripts/build_dist.py``'s mobile-file exclusion all consult the
 same absence and start passing together.
 """
 
-#: Release this pin describes. Matches the tag `qa-ime-v1.1.0`.
-IME_VERSION = "1.1.0"
+#: Release this pin describes. Matches the tag `qa-ime-v1.2.0`.
+IME_VERSION = "1.2.0"
 
 #: applicationId / namespace from mobile/qa-ime/build.gradle.kts.
 IME_PACKAGE = "io.qaagents.ime"
@@ -33,12 +33,15 @@ IME_SERVICE = "io.qaagents.ime.QaImeService"
 #: The published release asset. HTTPS, and the only URL the downloader accepts.
 IME_ASSET_URL = (
     "https://github.com/OmarMokhtar-Saad/qa-agent-pro/releases/download/"
-    "qa-ime-v1.1.0/qa-ime-1.1.0.apk"
+    "qa-ime-v1.2.0/qa-ime-1.2.0.apk"
 )
 
-#: SHA-256 of the 653758 bytes served at IME_ASSET_URL, verified 2026-10-16
-#: against the asset itself and against its published .sha256 sidecar.
-IME_SHA256 = "f3bdb2f5249c96dc646b673d596240d29721e760231628414eea150db18e5669"
+#: SHA-256 of the 654626 bytes served at IME_ASSET_URL, verified 2026-10-16
+#: against the asset itself and against its published .sha256 sidecar. 1.2.0 is signed
+#: with a NEW key (cert SHA-256 b2c15076...; the 1.1.0 key is lost), so a device holding
+#: 1.1.0 refuses the update and ime_fresh.install_pinned replaces OUR package once in the
+#: same run; imes_upgrade.refused_note's uninstall line shows only if that also fails.
+IME_SHA256 = "ec4599937d88624da4068a0921e6defa084851bc71bbc579b8b1b81a0dc9f0a5"
 
 #: The text-field broadcasts QaImeService registers in onCreate (QaImeService.kt:72-113; it also
 #: registers ARM/DISARM/DUMP, which this module does not state).
