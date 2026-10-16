@@ -20,10 +20,9 @@ def _params_problem(template: dict, params: dict) -> str:
     missing = [p for p in declared if p not in params]
     extra = sorted(str(k)[:40] for k in params if k not in declared)
     if missing or extra:
-        return "flow parameters do not match: missing %s, unknown %s" % (
-            missing or "none",
-            extra or "none",
-        )
+        return (
+            "flow parameters do not match: missing %s, unknown %s; expected keys: %s"
+        ) % (missing or "none", extra or "none", declared or "none")
     for key, value in params.items():
         if not isinstance(value, str) or len(value) > actions.MAX_TEXT_CHARS:
             return "parameter `%s` must be text of at most %d characters" % (

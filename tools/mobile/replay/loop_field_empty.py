@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from tools.mobile.replay.context import _ReplayRun
 
 ADVANCED_NOTE = (
-    "Typed; the screen advanced, so the read-back is unknown (not a failure)."
+    "Typed; confirmed by screen advance (field read-back unknown, not a failure)."
 )
 
 

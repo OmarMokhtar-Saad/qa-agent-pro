@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import adb
+from tools.mobile import a11y_fresh, adb
 from tools.mobile.a11y_device import (
     _items,
     _norm,
@@ -54,6 +54,7 @@ def _restore_target(run_id: str) -> tuple:
     serial = str(record.get("serial") or remembered)
     if serial:
         adb.clear_dump_provider(serial)
+        a11y_fresh.forget(serial)
         reset_streaks(serial)
     return record, serial
 

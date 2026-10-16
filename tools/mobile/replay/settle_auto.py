@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 from tools.mobile import dump_latency, latency_scale, screen_anchor, step_timing
 from tools.mobile.replay.context import Context, _sleep
@@ -59,8 +59,37 @@ async def _focus_stable(ctx: Context, until: float) -> None:
 # ``before_hash`` stays in the signature for the caller; the caller compares.
 async def _auto_settle(ctx: Context, screen: Any, before_hash: str) -> Any:
     """After an action whose first read showed no change: probe cheaply, read once."""
+    return (await _auto_settle_seen(ctx, screen, before_hash)).screen
+
+
+class Settled(NamedTuple):
+    """The settle's read, and what it saw: did the frame move, did the read fail."""
+
+    screen: Any
+    frame_moved: bool
+    read_failed: bool
+
+
+# What the caller needs to tell "the tap did nothing" from "the picture moved
+# and no tree could show it": a frame that moved while every tree stayed the
+# same is NOT proof of no change (run 8f3169's stale a11y tree), so the caller
+# reports it as unverified rather than ``no_change``.
+async def _auto_settle_seen(ctx: Context, screen: Any, before_hash: str) -> Settled:
+    """:func:`_auto_settle`, also saying whether the frame moved or the read failed."""
     deadline = _settle_deadline(ctx)
     until = deadline - dump_latency.p90_ms(ctx.serial) / 1000.0
+    moved = await _frame_moved(ctx, screen, (deadline, until))
+    if moved is None:
+        return Settled(screen, False, False)
+    dumped = await _dump(ctx)
+    if dumped.get("error"):
+        return Settled(screen, moved, True)
+    return Settled(dumped.get("content"), moved, False)
+
+
+async def _frame_moved(ctx: Context, screen: Any, window: tuple) -> bool | None:
+    """``None`` when the frame never moved (no read needed), else whether it moved."""
+    deadline, until = window
     base = await screen_anchor.trusted_baseline(
         ctx.serial, _screen_hash(screen), deadline - time.monotonic()
     )
@@ -68,12 +97,11 @@ async def _auto_settle(ctx: Context, screen: Any, before_hash: str) -> Any:
         # Frame probe equal before and after the read's own dump: a frame that
         # never moves leaves the first read standing, with NO second dump.
         if await wait_moved(ctx, base, until) is None:
-            return screen
+            return None
         await _focus_stable(ctx, until)
-    else:
-        await _focus_wait(ctx, deadline, until)
-    dumped = await _dump(ctx)
-    return screen if dumped.get("error") else dumped.get("content")
+        return True
+    await _focus_wait(ctx, deadline, until)
+    return False
 
 
 async def _focus_wait(ctx: Context, deadline: float, until: float) -> None:

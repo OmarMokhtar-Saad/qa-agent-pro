@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from tools.mobile import perception
@@ -42,6 +43,14 @@ def _keyed(xml: str):
             continue
         out[_node_key(element)] = _node_value(element)
     return out
+
+
+def node_digest(xml: str) -> str:
+    """A digest of the nodes parity compares, or ``""`` when *xml* cannot be pruned."""
+    keyed = _keyed(xml)
+    if keyed is None:
+        return ""
+    return hashlib.sha1(repr(sorted(keyed.items())).encode("utf-8")).hexdigest()
 
 
 def _unparsed() -> dict:

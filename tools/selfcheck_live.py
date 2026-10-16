@@ -16,6 +16,7 @@ from typing import Any
 LIVE_ENV: frozenset = frozenset(
     {
         "QA_MCP_ENABLED",
+        "QA_DUMP_SOURCE",
         "QA_EXPORT_DIR",
         "QA_DIST_MODE",
         "QA_UPDATE_REPO",

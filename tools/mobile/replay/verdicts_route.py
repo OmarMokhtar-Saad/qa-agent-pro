@@ -53,7 +53,7 @@ def _actuated(trace: Any) -> bool:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if str(entry.get("outcome") or "") not in ("ok", "no_change"):
+        if str(entry.get("outcome") or "") not in ("ok", "no_change", "unverified"):
             continue
         action = entry.get("action")
         action = action if isinstance(action, dict) else {}

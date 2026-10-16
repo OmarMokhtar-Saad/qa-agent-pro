@@ -8,7 +8,7 @@ import os
 import time
 from typing import NamedTuple
 
-from tools.mobile import adb, ime_nonce
+from tools.mobile import a11y_fresh, adb, ime_nonce
 from tools.mobile.a11y_device import (
     _VALUE_RE,
     MASTER,
@@ -33,6 +33,11 @@ A11Y_CONNECT_POLL_INTERVAL_S = 0.5
 
 #: Refusal codes that mean "not ready yet" while the service connects.
 _NOT_READY = ("no_service", "no_window")
+
+#: The operator's switch that keeps the fast reader off (the live gate's uiautomator mode),
+#: read from os.environ: QA_DUMP_SOURCE=uiautomator.
+FORCE_ENV = "QA_DUMP_SOURCE"
+FORCE_UIAUTOMATOR = "uiautomator"
 
 
 class _Turn(NamedTuple):
@@ -121,7 +126,9 @@ async def _verify_parity(serial: str, run_id: str) -> dict:
 
 
 def _unsupported(serial: str) -> dict | None:
-    """The silent no-op for a legacy APK or an unarmed keyboard, else None."""
+    """The silent no-op for a forced uiautomator, legacy APK or unarmed keyboard."""
+    if os.environ.get(FORCE_ENV, "").strip().lower() == FORCE_UIAUTOMATOR:
+        return _off("forced_uiautomator")
     if ime_nonce.protocol(serial) == 1:
         return _off("legacy")
     if not ime_nonce.get(serial):
@@ -156,7 +163,8 @@ async def _verified(serial: str, run_id: str) -> dict | None:
     if checked.get("error"):
         return checked
     reset_streaks(str(serial))
-    adb.set_dump_provider(serial, provider)
+    a11y_fresh.forget(serial)
+    adb.set_dump_provider(serial, a11y_fresh.guarded(provider))
     return None
 
 

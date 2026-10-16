@@ -135,6 +135,8 @@ def _a11y_off_reason(on: dict) -> str:
     content = on.get("content") or {}
     if content.get("enabled") is not False:
         return ""
+    if content.get("reason") == "forced_uiautomator":
+        return "QA_DUMP_SOURCE=uiautomator"
     if content.get("reason") == "keyboard_not_armed":
         return "the QA keyboard is not armed"
     return "the QA keyboard is an old version"

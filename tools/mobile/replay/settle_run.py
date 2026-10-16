@@ -14,7 +14,12 @@ from tools.mobile.replay.context_consts import (
 )
 from tools.mobile.replay.dump import _dump
 from tools.mobile.replay.screen import _stamp_after
-from tools.mobile.replay.settle_auto import _auto_settle, _probe_skip
+from tools.mobile.replay.settle_auto import (
+    Settled,
+    _auto_settle,  # noqa: F401  (public-names shim)
+    _auto_settle_seen,
+    _probe_skip,
+)
 from tools.mobile.replay.settle_cut import Cut, CutView, _cut_detail, _cut_of
 from tools.mobile.replay.settle_dialog import _answer_dialogs
 from tools.mobile.replay.settle_mark import (
@@ -25,6 +30,13 @@ from tools.mobile.replay.settle_mark import (
 )
 
 logger = logging.getLogger("tools.mobile.executor")
+
+NO_CHANGE = "no_change"
+UNVERIFIED = "unverified"
+UNVERIFIED_DETAIL = (
+    "The screen's picture changed after this action but its element tree did "
+    "not; the change could not be confirmed -- look at the screenshot."
+)
 
 
 # Re-read the screen after an action that could have changed it.
@@ -56,9 +68,8 @@ async def _settle(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
     screen = await _answer_dialogs(job, view)
     # BOTH halves (hash and id), through the one producer, never re-derived.
     _stamp_after(job.entry, screen)
-    screen, unchanged = await _settle_unchanged(job, screen, opts)
-    if unchanged:
-        job.entry["outcome"] = "no_change"
+    screen, outcome = await _settle_unchanged(job, screen, opts)
+    _record_outcome(job.entry, outcome)
     cut = _cut_of(job.ctx, view._replace(screen=screen))
     if cut.kind:
         return screen, _cut_stop(job, screen, cut)
@@ -116,9 +127,10 @@ def _target_in_hand(target: Any, screen: Any) -> bool:
     return (hit.get("content") or {}).get("element") is not None
 
 
-# ``(screen, unchanged)``: did the action change nothing, after auto-settle.
+# ``(screen, outcome)``: ``"no_change"``, ``"unverified"`` (the frame moved or
+# the read failed while the tree stayed the same) or ``""`` (it changed).
 async def _settle_unchanged(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
-    """``(screen, unchanged)``: did the action change nothing, after auto-settle."""
+    """``(screen, outcome)``: did the action change nothing, after auto-settle."""
     before = _mark_of(job.entry, "before")
     unchanged = opts.mark_no_change and _unchanged(before, _mark_of(job.entry, "after"))
     # AUTO-SETTLE only on a read this call took itself: a skipped redump
@@ -126,15 +138,31 @@ async def _settle_unchanged(job: SettleJob, screen: Any, opts: SettleOpts) -> tu
     # own poll (`mark_no_change=False`) is its own settle.
     # A script whose next op waits for the screen to change observes it anyway.
     skip = _no_auto_settle(screen, opts) or job.entry.get("probe_skip") is True
-    if unchanged and opts.redump and before.content_hash and not skip:
-        read = await _auto_settle(job.ctx, screen, before.content_hash)
-        _stamp_after(job.entry, read)
-        unchanged = _unchanged(before, _mark_of(job.entry, "after"))
-        # PROVEN only when the settle took a fresh read (a failed dump hands
-        # the old screen back): the learner never calls a tap dead otherwise.
-        job.entry["settled_unchanged"] = unchanged and read is not screen
-        screen = read
-    return screen, unchanged
+    if not (unchanged and opts.redump and before.content_hash and not skip):
+        return screen, NO_CHANGE if unchanged else ""
+    seen = await _auto_settle_seen(job.ctx, screen, before.content_hash)
+    return seen.screen, _settled_outcome(job, screen, seen)
+
+
+def _record_outcome(entry: dict, outcome: str) -> None:
+    """Write the settle's verdict onto the entry; ``""`` leaves it alone."""
+    if outcome:
+        entry["outcome"] = outcome
+    if outcome == UNVERIFIED:
+        entry["detail"] = UNVERIFIED_DETAIL
+
+
+def _settled_outcome(job: SettleJob, screen: Any, seen: Settled) -> str:
+    """Stamp the settle's read; ``""``, ``"no_change"`` or ``"unverified"``."""
+    _stamp_after(job.entry, seen.screen)
+    if not _unchanged(_mark_of(job.entry, "before"), _mark_of(job.entry, "after")):
+        job.entry["settled_unchanged"] = False
+        return ""
+    doubt = seen.frame_moved or seen.read_failed
+    # PROVEN only when the settle took a fresh read nothing contradicts: the
+    # learner never calls a tap dead otherwise.
+    job.entry["settled_unchanged"] = not doubt and seen.screen is not screen
+    return UNVERIFIED if doubt else NO_CHANGE
 
 
 # The replay result for an app that is not where the script thinks it is.

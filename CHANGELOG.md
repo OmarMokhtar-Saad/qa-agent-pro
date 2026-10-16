@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.126.0] - 2026-10-16
+## [1.127.0] - 2026-10-16
 
 ### Added
 
@@ -29,11 +29,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- qa_mobile_test takes a new opt-in `grant_permissions` option (needs
-  `apply: true`). Before the first step it grants the run's own app
-  every runtime permission it asked for but does not hold yet, so
-  permission dialogs no longer interrupt the run. It never overrides
-  a permission you or a device policy fixed ("don't ask again"),
-  never grants Health Connect (health data) access, and a grant the
-  device refuses never stops the run; the permission-dialog handler
-  still covers anything left. It is off by default.
+- qa_mobile_test now double-checks a fast screen read. When the read
+  right after a step is identical to the one before it, the run confirms
+  it with a slow, reliable read; if the two disagree, fast reading is
+  switched off for the rest of the run instead of acting on old content.
+  Set QA_DUMP_SOURCE=uiautomator to always use the slow reader.
+- A step whose screen tree did not change but whose frame moved, or
+  whose re-read failed, is now reported as "unverified" instead of
+  "no change", so a step that may have worked is no longer treated
+  as a dead tap; its report asks you to look at the screenshot.
+- A flow-parameter mismatch error now lists the expected keys. A typed
+  field that reads empty but whose screen then advanced is noted as
+  "confirmed by screen advance".
