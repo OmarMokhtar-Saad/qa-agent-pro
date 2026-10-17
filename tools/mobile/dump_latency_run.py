@@ -8,7 +8,12 @@ import time
 from typing import Any, Awaitable
 
 from tools.mobile import step_timing
-from tools.mobile.dump_latency_state import _INFLIGHT, _record, before_dump
+from tools.mobile.dump_latency_state import (
+    _INFLIGHT,
+    _record,
+    before_dump,
+    take_aside,
+)
 
 
 def _source() -> str:
@@ -20,18 +25,24 @@ def _source() -> str:
 async def _timed(serial: str, awaitable: Awaitable[Any]) -> Any:
     before_dump(serial)  # e.g. screen_anchor's "before" probe
     step_timing.note_source("")  # so the source read below is THIS dump's
+    take_aside(serial)
     started = time.monotonic()
     try:
         result = await awaitable
     except asyncio.CancelledError:
         raise
     except Exception:
-        _record(serial, time.monotonic() - started, _source())
+        _record(serial, _net(serial, started), _source())
         raise
     # The source (a11y, uiautomator fallback) keeps a 0.1 s dump out of the
     # same p90 as a 2.5 s one.
-    _record(serial, time.monotonic() - started, _source())
+    _record(serial, _net(serial, started), _source())
     return result
+
+
+def _net(serial: str, started: float) -> float:
+    """Seconds since *started* without the confirmation dumps inside it."""
+    return max(0.0, time.monotonic() - started - take_aside(serial))
 
 
 def _on_done(finished: asyncio.Future, key: str) -> None:

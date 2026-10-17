@@ -14,6 +14,7 @@ from tools.mobile.session_explore_ids import explore_turn_case_id
 from tools.mobile.session_explore_prior import (
     _explore_prior_turn_blocked,
     _explore_prior_verified,
+    _replay_verified,
 )
 from tools.mobile.session_explore_stop import _prior_guard_stop_explore
 from tools.mobile.session_submit_inputs import _combine_queued_actions
@@ -128,7 +129,10 @@ def _guard_refuses(resolved: dict) -> bool:
 def _arm_explore_guards(run_id: str, ctx: Context, resolved: dict) -> None:
     """Set the run-wide evidence and guard policy the executor reads."""
     ctx.prior_turn_blocked = _explore_prior_turn_blocked(run_id)
-    ctx.prior_verified = _explore_prior_verified(run_id)
+    replayed = _replay_verified(resolved.get("explore"))
+    ctx.prior_verified = (
+        _explore_prior_verified(run_id) if replayed is None else replayed
+    )
     ctx.guard_refuses = _guard_refuses(resolved)
     ctx.prior_guard_stop = _prior_guard_stop_explore(
         run_id, explore_turn_case_id(resolved.get("explore"))

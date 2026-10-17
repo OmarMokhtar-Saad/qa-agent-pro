@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.128.0] - 2026-10-16
+## [1.129.0] - 2026-10-17
 
 ### Added
 
@@ -29,24 +29,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- qa_mobile_test now double-checks a fast screen read. When the read
-  right after a step is identical to the one before it, the run confirms
-  it with a slow, reliable read; if the two disagree, fast reading is
-  switched off for the rest of the run instead of acting on old content.
-  Set QA_DUMP_SOURCE=uiautomator to always use the slow reader.
-- A step whose screen tree did not change but whose frame moved, or
-  whose re-read failed, is now reported as "unverified" instead of
-  "no change", so a step that may have worked is no longer treated
-  as a dead tap; its report asks you to look at the screenshot.
-- A flow-parameter mismatch error now lists the expected keys. A typed
-  field that reads empty but whose screen then advanced is noted as
-  "confirmed by screen advance".
-- Saved flows replay again when you word an input differently from how
-  it was recorded (for example "otp" for "login_otp"); an
-  ambiguous name is never guessed.
-- A saved flow can start when its first screen key drifted, if its first
-  step has exactly one matching target on the live screen.
-- After a stale fast read, fast reading pauses until the screen changes,
-  is re-checked once, and stays off for the run after three strikes.
-- A chained flow is no longer started when only optional steps that
-  leave the screen unchanged remain; the reason is in the note.
+- Before a mobile run, the App Tester app is skipped when the app is
+  installed and its build is the newest one listed, or no listing is
+  known yet.
+- A saved flow that was replayed automatically and has no assert of its
+  own no longer counts as a pass.
+- Long numbers you type, such as national IDs, are masked in the report,
+  case titles and findings; passwords and codes are redacted when
+  results are written.
+- A wait that missed before 90% of its time limit had passed is no
+  longer learned as a timeout.
+- A recorded route with one step read from a degraded screen key is now
+  saved, cut before that step or with that key blanked, instead of
+  being rejected.
+- Once a run has timed its screen reads, the screen-change probe is
+  skipped when a full screen read is cheaper than the probe.
+- The screen-read timing used to size waits no longer counts
+  double-check reads or the first, warm-up read.
+- A wait-until-the-screen-is-quiet step is built in but stays off
+  until the next keyboard app release (qa-ime 1.2.1).

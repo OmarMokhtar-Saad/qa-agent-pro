@@ -19,6 +19,7 @@ from typing import NamedTuple
 from tools.mobile import (
     app_flows,
     kstg_flow_build,
+    kstg_flow_cut,
     kstg_flow_dedupe,
     kstg_flow_gate,
     kstg_flow_merge,
@@ -99,7 +100,7 @@ def _write(package: str, plan: list, result: StageResult) -> list:
 
 
 def _save_all(lc, goal_recs: tuple, result: StageResult) -> None:
-    goal, recs = goal_recs
+    goal, recs = goal_recs[0], kstg_flow_cut.repair(goal_recs[1])
     refused = kstg_flow_gate.reject(recs)
     if refused:
         result.notes.append("%s: not saved, %s" % (lc.package, refused))

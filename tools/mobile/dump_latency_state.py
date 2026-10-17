@@ -26,11 +26,36 @@ _INFLIGHT: dict = {}
 _WARNED: collections.OrderedDict = collections.OrderedDict()
 
 
+#: Seconds of a confirmation dump run INSIDE the dump being timed, per serial.
+_ASIDE: dict = {}
+
+
 def _append(table: dict, key: str, seconds: float) -> None:
     samples = table.get(key)
     if samples is None:
-        samples = table[key] = collections.deque(maxlen=SAMPLE_COUNT)
+        # The first dump of a source is a warm-up (cold service, cold
+        # cache): count it nowhere, it would lift the p90 for 20 dumps.
+        table[key] = collections.deque(maxlen=SAMPLE_COUNT)
+        return
     samples.append(seconds)
+
+
+def record_aside(serial: str, seconds: float, source: str) -> None:
+    """Time a dump that ran INSIDE the dump being timed (a freshness confirm).
+
+    It is kept under its own *source* and taken out of the enclosing dump's
+    time, so it never reads as that dump's latency.
+    """
+    key = str(serial or "")
+    sources = _BY_SOURCE.setdefault(key, {})
+    if source in sources or len(sources) < MAX_SOURCES:
+        _append(sources, source, max(0.0, float(seconds)))
+    _ASIDE[key] = _ASIDE.get(key, 0.0) + max(0.0, float(seconds))
+
+
+def take_aside(serial: str) -> float:
+    """Seconds recorded by :func:`record_aside` since the last take; resets."""
+    return _ASIDE.pop(str(serial or ""), 0.0)
 
 
 def _record(serial: str, seconds: float, source: str = "") -> None:

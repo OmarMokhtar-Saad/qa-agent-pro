@@ -9,7 +9,7 @@ import logging
 import zlib
 
 from config.settings_guard import never_raise
-from tools.mobile import adb, ime, ime_nonce
+from tools.mobile import a11y_events, adb, ime, ime_nonce
 
 logger = logging.getLogger("tools.mobile.a11y")
 
@@ -95,6 +95,12 @@ def _failed(exc: BaseException | None) -> dict:
     }
 
 
+def _record_events(serial: str, reply: dict, decoded: dict) -> None:
+    """Keep the reply's ``n:`` event clock; a dump without it clears the clock."""
+    clock = a11y_events.parse(str(reply.get("events") or ""))
+    a11y_events.record(serial, clock if decoded.get("error") is None else None)
+
+
 async def fetch_dump(serial: str) -> dict:
     """One DUMP broadcast -> ``{"error", "content": xml}``. Never raises."""
     with never_raise(logger, "mobile.a11y.fetch_dump failed", exc_info=True) as g:
@@ -110,7 +116,9 @@ async def fetch_dump(serial: str) -> dict:
         error = _reply_error(reply)
         if error:
             return error
-        return decode(str(reply["dump"]))
+        decoded = decode(str(reply["dump"]))
+        _record_events(serial, reply, decoded)
+        return decoded
     return _failed(g.exc)
 
 
@@ -138,6 +146,7 @@ async def provider(serial: str) -> dict:
     got = await fetch_dump(serial)
     if got.get("error"):
         _strike(serial, str(got["error"]))
+        a11y_events.record(serial, None)  # a failed read leaves no stale clock
         return got
     reset_streaks(serial)
     return got

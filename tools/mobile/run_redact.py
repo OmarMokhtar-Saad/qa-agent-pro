@@ -1,5 +1,8 @@
 """Redaction at the WRITE, not at the reader.
 
+:mod:`tools.mobile.run_mask_id` adds the value rules: ID-like digit runs masked
+to the last four, credential-field values redacted, password nodes blanked.
+
 :func:`redact` runs inside every write path. It masks two things: any value
 under a key in ``SECRET_VALUE_KEYS`` inside an object marked ``secret: true``,
 and any value under a key in ``ALWAYS_MASKED_KEYS`` wherever it appears.
@@ -17,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tools.mobile import run_consts
+from tools.mobile import run_consts, run_mask_id
 
 
 def _is_secret(value: object) -> bool:
@@ -54,6 +57,7 @@ def redact(obj: object) -> Any:
         out: dict = {key: redact(value) for key, value in obj.items()}
         _mask_marked(out)
         _mask_always(out)
+        run_mask_id.mask_node(out)
         return out
     if isinstance(obj, (list, tuple)):
         return [redact(item) for item in obj]

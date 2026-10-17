@@ -14,6 +14,7 @@ from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
 from tools.mobile.replay.probe_gate import KEEPS_GATE, TEXT, open_gate, rebased
 from tools.mobile.replay.screen import _screen_has_element
 from tools.mobile.replay.waits_interrupt import _interruption_of
+from tools.mobile.replay.waits_quiet import settled
 from tools.mobile.replay.waits_types import Pace, Poll, Probe
 
 
@@ -84,10 +85,12 @@ def _interrupted(ctx: Context, current: object, screen: object) -> bool:
 
 
 async def _begin(ctx: Context, screen: object, probe: Probe) -> tuple:
-    """``(deadline, ticker, gate)`` a watched poll starts from."""
+    """``(deadline, ticker, gate, screen)`` a watched poll starts from."""
     budget = (probe.ms / 1000.0) if probe.ms else DEFAULT_WAIT_UNTIL_TEXT_S
+    deadline = _wait_deadline(ctx, budget)
     gate = await open_gate(ctx, screen, probe.gate)
-    return _wait_deadline(ctx, budget), watch.Ticker(probe.label), gate
+    screen = await settled(ctx, screen, deadline)
+    return deadline, watch.Ticker(probe.label), gate, screen
 
 
 # ``probe.met(previous, current)`` is the condition; ``previous`` is ``None``
@@ -101,8 +104,8 @@ async def _wait_for(ctx: Context, screen: object, probe: Probe) -> tuple:
 
 async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
     """The poll loop of :func:`_wait_for` for a condition not yet met."""
-    deadline, ticker, gate = await _begin(ctx, screen, probe)
-    previous, current, took = None, screen, 0.0
+    deadline, ticker, gate, current = await _begin(ctx, screen, probe)
+    previous, took = None, 0.0
     while True:
         if probe.met(previous, current):
             return True, current, False

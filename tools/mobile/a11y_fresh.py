@@ -29,13 +29,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
-from tools.mobile import adb, dump_reuse, step_timing
+from tools.mobile import adb, dump_latency_state, dump_reuse, step_timing
 from tools.mobile.a11y_parity import compare, node_digest
 
 logger = logging.getLogger("tools.mobile.a11y")
 
+#: The dump-latency source of the freshness confirmation dump.
+CONFIRM_SOURCE = "uia-fresh-confirm"
 #: The ledger note and refusal for a fast tree uiautomator contradicted.
 STALE_NOTE = "a11y_stale"
 STALE_REFUSAL = "the a11y tree repeated across an action and uiautomator disagrees"
@@ -98,7 +101,9 @@ def _stale(serial: str, digest: str) -> dict:
 
 async def _judge(serial: str, xml: str) -> dict | None:
     """``None`` when uiautomator confirms *xml*, else the refusal to return."""
+    started = time.monotonic()
     slow = await adb.uiautomator_dump(serial, use_provider=False)
+    dump_latency_state.record_aside(serial, time.monotonic() - started, CONFIRM_SOURCE)
     if slow.get("error"):
         step_timing.note(UNCHECKED_NOTE)
         return {"error": UNCHECKED_REFUSAL, "content": None}

@@ -4,8 +4,9 @@
   scrolls from the list's top (only recorded when the top was proven);
 * the Firebase app id of a package (``1:<number>:android:<hash>``), which makes
   the App Tester release page reachable by a link with no scrolling at all;
-* the newest build the app page listed (``latest``), trusted for minutes, so an
-  installed copy that already is it skips the App Tester entirely.
+* the newest build the app page listed (``latest``), keyed by (device, package,
+  installed versionCode) with no timeout: an installed copy that already is it
+  skips the App Tester entirely, until the installed code changes.
 
 Persisted by ``app_tester_ui_store`` (survives the process): a wrong entry
 costs one verifying read, never a wrong tap.
@@ -14,7 +15,7 @@ costs one verifying read, never a wrong tap.
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import NamedTuple, Optional
 from urllib.parse import unquote
 
 from tools.mobile.install_sources import app_tester_ui_store as store
@@ -94,14 +95,27 @@ def known_bundle(serial: str, label: str) -> str:
     return str(store.get("rows", _label_key(serial, label)) or "")
 
 
-def remember_latest(serial: str, package: str, code: int) -> None:
-    """The highest versionCode the app's page listed."""
-    if package and code:
-        store.put("latest", _key(serial, package), code)
+class Installed(NamedTuple):
+    """The device, the package and the versionCode installed on it right now."""
+
+    serial: str
+    package: str
+    code: int
 
 
-def known_latest(serial: str, package: str) -> Optional[int]:
-    code = store.get("latest", _key(serial, package)) if package else None
+def _latest_key(at: Installed) -> str:
+    return _key(at.serial, at.package) + "|" + str(at.code)
+
+
+def remember_latest(at: Installed, latest: int) -> None:
+    """The highest versionCode the app's page listed while *at* was installed."""
+    if at.package and at.code and latest:
+        store.put("latest", _latest_key(at), latest)
+
+
+def known_latest(at: Installed) -> Optional[int]:
+    """The newest listed build remembered for exactly this installed copy."""
+    code = store.get("latest", _latest_key(at)) if at.package and at.code else None
     return code if isinstance(code, int) else None
 
 

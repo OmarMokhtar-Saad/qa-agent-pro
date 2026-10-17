@@ -73,6 +73,20 @@ def _explore_prior_verified(run_id: str) -> bool:
     return False
 
 
+# An AUTO-REPLAYED turn (the server ran a learned flow before this turn, its
+# steps ride in ``state["auto_trace"]``) is judged on that flow's own steps:
+# an earlier turn's assert must not vouch for a flow that asserted nothing
+# (mrun-20261016-224910-5e7f51 TC-005: 8 replayed taps, no assert, recorded a
+# pass off TC-004's check). ``None`` = not an auto-replayed turn, so the
+# run-wide explore rule above stays in force unchanged.
+def _replay_verified(explore: object) -> bool | None:
+    """Whether the flow auto-replayed into this turn asserted; ``None`` if none ran."""
+    carried = explore.get("auto_trace") if isinstance(explore, dict) else None
+    if not carried:
+        return None
+    return any(is_positive_pass(item) for item in carried)
+
+
 def _latest_case(listed: dict) -> dict | None:
     """The checkpointed case with the highest turn number in its ``tc_id``."""
     latest: dict | None = None

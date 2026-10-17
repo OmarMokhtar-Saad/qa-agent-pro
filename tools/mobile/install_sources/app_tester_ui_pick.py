@@ -89,7 +89,11 @@ class _PickMixin:
     async def is_latest(self: _Flow, serial: str, package: str) -> bool:
         """True when the installed copy already is the newest build the app's
         page listed a moment ago (no App Tester screen is driven for it)."""
-        latest = memory.known_latest(serial, package)
-        have = await self._versions(serial, package) if latest else None
+        have = await self._versions(serial, package)  # one cheap read, no UI
         code = have.version_code if have else None
-        return code is not None and latest is not None and code >= latest
+        if code is None:
+            return False  # package missing (or unreadable): the UI is needed
+        latest = memory.known_latest(memory.Installed(serial, package, code))
+        return (
+            latest is None or code >= latest
+        )  # no listing known: only a missing app opens it

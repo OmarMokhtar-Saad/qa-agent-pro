@@ -32,6 +32,8 @@ def _set_field(fields: dict, part: str) -> None:
         fields["protocol"] = int(part[2:]) if part[2:].strip().isdigit() else 0
     elif part.startswith("x:"):
         fields["dump"] = part[2:].strip()
+    elif part.startswith("n:"):
+        fields["events"] = part[2:].strip()
 
 
 def _reply_fields(data: str) -> dict:
@@ -43,6 +45,7 @@ def _reply_fields(data: str) -> dict:
         "refusal": "",
         "protocol": 0,
         "dump": "",
+        "events": "",
     }
     for part in data.split(";"):
         _set_field(fields, part.strip())
@@ -58,7 +61,7 @@ def _reply_of_parts(result: int, parts: dict, reveal_text: bool) -> dict:
         "ime_visible": parts["visible"],
     }
     # Present only when non-empty, so a legacy reply keeps its exact shape.
-    for key in ("refusal", "protocol", "dump"):
+    for key in ("refusal", "protocol", "dump", "events"):
         if parts[key]:
             reply[key] = parts[key]
     if reveal_text:

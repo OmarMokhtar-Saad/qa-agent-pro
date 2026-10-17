@@ -25,8 +25,11 @@ from tools.mobile.resolve import PickOpts, decide, resolve_or_ask
 def _note_latest(run: _Run, texts) -> None:
     """Remember the newest build the page lists (read once, before any tap)."""
     codes = [rel.version_code for rel in parse_releases(texts) if rel.version_code]
-    if codes:
-        memory.remember_latest(run.request.serial, run.request.package, max(codes))
+    have = run.before.version_code if run.before else None
+    if codes and have:
+        req = run.request
+        at = memory.Installed(req.serial, req.package, have)
+        memory.remember_latest(at, max(codes))
 
 
 class _DetailMixin:

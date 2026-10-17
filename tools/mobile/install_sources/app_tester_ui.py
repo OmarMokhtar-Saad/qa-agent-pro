@@ -56,6 +56,7 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (  # noqa: F401
     _refuse_request,
     parse_releases,
 )
+from tools.mobile.install_sources.app_tester_ui_gate import remember_landed
 from tools.mobile.install_sources.app_tester_ui_pick import _PickMixin
 from tools.mobile.install_sources.app_tester_ui_screens import _ScreenMixin
 from tools.mobile.resolve import AskCb, PickOpts, decide, resolve_or_ask  # noqa: F401
@@ -163,6 +164,7 @@ class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
         after: Any = await self._versions(run.request.serial, run.request.package)
         if not _improved(run.before, after, run.request.target_version_code):
             return None
+        remember_landed(run, after)
         return InstallOutcome(
             True, "", "Installed through the App Tester.", after.version_code
         )

@@ -122,8 +122,8 @@ async def _baseline(ctx: Context, screen: object, mode: str) -> object:
 
 async def open_gate(ctx: Context, screen: object, mode: str) -> Gate | None:
     """A gate for a wait in *mode*, or ``None`` when the probe cannot be trusted."""
-    if mode not in (TEXT, CALM):
-        return None
+    if mode not in (TEXT, CALM) or screen_anchor.cheaper_to_dump(ctx.serial):
+        return None  # a dump is cheaper than the probe: plain dump polling
     base = await _baseline(ctx, screen, mode)
     if not base:
         return None

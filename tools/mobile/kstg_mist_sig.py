@@ -69,6 +69,8 @@ def signature_of(rec: dict) -> str:
         return "text_not_landed"
     if _dead_tap(rec):
         return "dead_tap"
+    if rec.get("wait_early"):
+        return ""  # the wait ended before its limit: nothing proved, never learned
     return _OUTCOME_SIGNATURE.get(str(rec.get("outcome") or ""), "")
 
 

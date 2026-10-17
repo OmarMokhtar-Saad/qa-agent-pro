@@ -15,7 +15,7 @@ from tools.mobile.replay.waits_changed import (
     _wait_until_changed,
     _watch_after_wait,
 )
-from tools.mobile.replay.waits_spec import _unchanged_detail
+from tools.mobile.replay.waits_spec import _unchanged_detail, stamp_early
 from tools.mobile.replay.waits_types import AfterWait, ChangedStep, StopView
 
 
@@ -59,6 +59,7 @@ async def _poll_changed(run: _ReplayRun, step: ChangedStep, screen: object) -> t
     step.entry["detail"] = _changed_detail(step.op, step.wait_ms, changed)
     if step.op != "wait" and not changed:
         step.entry["detail"] = _unchanged_detail(step.wait_ms, elapsed_ms)
+        stamp_early(step.entry, elapsed_ms, step.wait_ms)
     after = AfterWait(before_wait, changed, reusable)
     screen, reusable, interruption = await _watch_after_wait(run.ctx, screen, after)
     return screen, changed, reusable, interruption

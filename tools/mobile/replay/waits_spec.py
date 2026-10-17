@@ -72,6 +72,21 @@ def _condition_words(action: object, kind: str, wait_text: str) -> tuple[str, st
     return "found " + label, "timed out waiting for " + label, label
 
 
+# A wait that ended before this share of its limit was cut short, not run out.
+EARLY_FRACTION = 0.9
+
+
+def ended_early(elapsed_ms: int, wait_ms: int) -> bool:
+    """True when a wait of *wait_ms* ended in under ``EARLY_FRACTION`` of it."""
+    return wait_ms > 0 and elapsed_ms < wait_ms * EARLY_FRACTION
+
+
+def stamp_early(entry: dict, elapsed_ms: int, wait_ms: int) -> None:
+    """Mark *entry* ``wait_early`` when its wait ended early (LEARN reads it)."""
+    if ended_early(elapsed_ms, wait_ms):
+        entry["wait_early"] = True
+
+
 # The "did not change" sentence names the time the wait REALLY took. A wait cut
 # short (a dump that kept failing, the focus probe giving up) came back well
 # inside its limit, and "did not change in 15s" for a 1.1 s wait is the
@@ -79,7 +94,7 @@ def _condition_words(action: object, kind: str, wait_text: str) -> tuple[str, st
 # watched. A wait that ran to its limit keeps the plain wording.
 def _unchanged_detail(wait_ms: int, elapsed_ms: int) -> str:
     """What an unchanged ``wait_until_changed`` DID: the real time, and an early end."""
-    if elapsed_ms >= wait_ms * 0.9:
+    if not ended_early(elapsed_ms, wait_ms):
         return "the screen did not change in " + _secs(wait_ms)
     return (
         "the screen did not change in "

@@ -40,6 +40,7 @@ class StepRec(TypedDict, total=False):
     tester_correction: bool
     fired: list
     settled_unchanged: bool
+    wait_early: bool
 
 
 def _text(value: Any, limit: int = 200) -> str:
@@ -90,6 +91,7 @@ def _tail(entry: dict) -> StepRec:
         popup=_text(entry.get("popup"), 80),
         tester_correction=bool(entry.get("tester_correction")),
         settled_unchanged=entry.get("settled_unchanged") is True,
+        wait_early=entry.get("wait_early") is True,
         fired=list(entry.get("knowledge") or entry.get("fired") or [])[:10],
     )
 

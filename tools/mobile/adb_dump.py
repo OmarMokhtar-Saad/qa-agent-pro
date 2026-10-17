@@ -1,7 +1,6 @@
 """Screen dump: ``uiautomator_dump`` and its provider/refusal helpers (moved from adb.py).
 
-``_DUMP_COMMAND`` and ``_DUMP_PROVIDERS`` live here once; the facade re-exports them.
-"""
+``_DUMP_COMMAND`` and ``_DUMP_PROVIDERS`` live here once; the facade re-exports them."""
 
 from __future__ import annotations
 
@@ -9,7 +8,7 @@ import logging
 
 from config.settings_guard import never_raise
 from tools import tool_status
-from tools.mobile import step_timing
+from tools.mobile import a11y_events, step_timing
 from tools.mobile.adb_consts import DUMP_REMOTE_PATH, FIRST_DUMP_TIMEOUT_S
 from tools.mobile.adb_host import host
 
@@ -57,6 +56,7 @@ def set_dump_provider(serial: str, provider) -> None:
 
 def clear_dump_provider(serial: str) -> None:
     _DUMP_PROVIDERS.pop(str(serial), None)
+    a11y_events.record(serial, None)  # uiautomator dumps carry no event clock
 
 
 #: What the step timing row says served a dump (the manifest ``source``). The

@@ -31,15 +31,15 @@ def _empty_tap_end(recs: list) -> bool:
     return act.get("op") in _TAPS and not _names_target(act)
 
 
-def _family(key: object) -> str:
+def family(key: object) -> str:
     """``sk2`` / ``sk1d`` of a versioned key; ``""`` for any other (unversioned) key."""
     found = _FAMILY_RE.match(str(key or ""))
     return found.group(1) if found else ""
 
 
-def _mixed_keys(recs: list) -> bool:
+def mixed_keys(recs: list) -> bool:
     keys = [r.get(w) for r in recs for w in ("screen_key", "after_screen_key")]
-    return len({f for f in map(_family, keys) if f}) > 1
+    return len({f for f in map(family, keys) if f}) > 1
 
 
 def _still(rec: dict) -> bool:
@@ -81,7 +81,7 @@ def reject(recs: list) -> str:
     """Why *recs* must not be saved as a flow, or ``""`` when they pass."""
     if _empty_tap_end(recs):
         return "ends in a tap that names no target"
-    if _mixed_keys(recs):
+    if mixed_keys(recs):
         return "mixes screen-key families"
     if _noop_loop(recs):
         return "repeats a tap that changed nothing"

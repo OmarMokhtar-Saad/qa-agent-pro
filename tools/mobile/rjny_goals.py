@@ -10,6 +10,7 @@ from tools.mobile.rjny_args import _GoalSlot, _JourneyData, _Thumb, _TurnIn
 from tools.mobile.rjny_thumb import _thumb_html
 from tools.mobile.rjny_turn import _turn_html
 from tools.mobile.rjny_words import _count, _result_pill
+from tools.mobile.run_mask_id import mask_id
 
 
 def _goal_meta(facts: list) -> list:
@@ -61,7 +62,7 @@ def _goal_html(slot: _GoalSlot, data: _JourneyData, page: _PageData) -> str:
         + '"><div class="goalhead"><h3 id="goal-'
         + str(slot.gi)
         + '" dir="auto">'
-        + esc(slot.group["goal"], 400)
+        + esc(mask_id(slot.group["goal"]), 400)
         + "</h3>"
         + _result_pill(_goal_result(slot.group["cases"]))
         + '<span class="goalmeta">'

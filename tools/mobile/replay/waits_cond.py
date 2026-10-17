@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from tools.mobile.replay.context import ReplayStop, _append, _ReplayRun, _result
 from tools.mobile.replay.context_consts import STATUS_NEEDS_MODEL
 from tools.mobile.replay.screen import _stamp_after
@@ -9,7 +11,7 @@ from tools.mobile.replay.settle_mark import SettleJob, SettleOpts
 from tools.mobile.replay.settle_run import _settle
 from tools.mobile.replay.waits_poll import _wait_until_element
 from tools.mobile.replay.waits_prior import note_gone
-from tools.mobile.replay.waits_spec import _condition_words
+from tools.mobile.replay.waits_spec import _condition_words, stamp_early
 from tools.mobile.replay.waits_text import _wait_until_idle, _wait_until_text
 from tools.mobile.replay.waits_types import (
     CondStep,
@@ -75,6 +77,13 @@ def _record_miss(entry: dict, interruption: str, missed: str) -> None:
         entry["detail"] = missed
 
 
+def _miss(entry: dict, words: tuple, timing: tuple) -> None:
+    """:func:`_record_miss`, plus ``wait_early`` when the wait ended early."""
+    _record_miss(entry, *words)
+    started, wait_ms = timing
+    stamp_early(entry, int((time.monotonic() - started) * 1000), wait_ms)
+
+
 def _needs_model_reply(run: _ReplayRun, screen: object, entry: dict) -> dict:
     """The reply that hands a missed wait back to the model."""
     stop = ReplayStop(
@@ -105,6 +114,7 @@ async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tu
     ``reply`` is ``None`` when the condition was met and the replay goes on.
     """
     action, spec, entry = step
+    started = time.monotonic()
     found, screen, interruption = await _poll_condition(
         WaitView(run.ctx, screen), action, spec
     )
@@ -114,7 +124,7 @@ async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tu
         if stop is not None:
             return screen, stop
     else:
-        _record_miss(entry, _miss_words(interruption, label), missed)
+        _miss(entry, (_miss_words(interruption, label), missed), (started, spec[2]))
     _stamp_after(entry, screen)
     _append(run.trace, entry)
     return screen, (None if found else _needs_model_reply(run, screen, entry))

@@ -17,14 +17,15 @@ from tools.mobile import paths, run_io
 logger = logging.getLogger("tools.mobile.install_sources.app_tester_ui_store")
 
 FILE = "app_tester_memory.json"
-#: Seconds an entry stays trusted, per section (the latest build changes often).
+#: Seconds an entry stays trusted, per section. ``None`` = no expiry: ``latest``
+#: is keyed by the installed versionCode, so it ends when that code changes.
 WEEK_S = 7 * 24 * 3600
-TTL_S = {
+TTL_S: dict = {
     "pages": WEEK_S,
     "spages": WEEK_S,
     "rows": WEEK_S,
     "ids": WEEK_S,
-    "latest": 15 * 60,
+    "latest": None,
 }
 MAX_PER_SECTION = 200
 
@@ -47,7 +48,8 @@ def get(section: str, key: str) -> Any:
         entry = (_load().get(section) or {}).get(key)
         if not isinstance(entry, dict):
             return None
-        if time.time() - float(entry.get("at") or 0) > TTL_S[section]:
+        ttl = TTL_S[section]
+        if ttl is not None and time.time() - float(entry.get("at") or 0) > ttl:
             return None
         return entry.get("v")
     except Exception:
