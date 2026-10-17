@@ -22,6 +22,10 @@ HALF_LIFE_S = 30 * 86400.0
 _Z = 1.96
 #: Replays that all failed before a flow that never reached its goal is dead.
 DEAD_RUNS = 2
+#: Replays that all failed before a flow that once reached its goal is dead too: the
+#: route was real once, so it gets more tries, but 0 landed replays in this many means
+#: the app moved on (run mrun-20261017-205436: a reached flow at 0 of 11 still picked).
+DEAD_RUNS_REACHED = 4
 _FIELDS = ("runs", "ok", "seen")
 _FLOWS_FILE = "flows.json"
 
@@ -100,7 +104,11 @@ def counters(template: dict) -> dict:
 
 
 def dead(template: dict) -> bool:
-    """A flow that never reached its goal and never replayed ok in 2 or more tries."""
+    """A flow that never replayed ok in its dead-run threshold of tries.
+
+    The threshold is ``DEAD_RUNS`` for a flow that never reached its goal and
+    ``DEAD_RUNS_REACHED`` for one that did."""
     meta = template.get("meta") or {}
     stats = counters(template)
-    return not meta.get("reached") and stats["ok"] == 0 and stats["runs"] >= DEAD_RUNS
+    limit = DEAD_RUNS_REACHED if meta.get("reached") else DEAD_RUNS
+    return stats["ok"] == 0 and stats["runs"] >= limit

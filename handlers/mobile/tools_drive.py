@@ -50,6 +50,7 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
         capture_ack: bool = False,
         reset_app: bool = False,
         grant_permissions: bool = False,
+        launch: bool = True,
         charter: str = "",
         note: str = "",
         env: str = "",

@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.130.0] - 2026-10-17
+## [1.130.1] - 2026-10-17
 
 ### Added
 
@@ -45,7 +45,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
   (other routes stay at 4); leftover parts of a broken chain that never
   ran successfully are pruned.
 - Automatic replay never picks a saved route that failed every one of
-  2 or more tries and never reached its goal;
+  2 or more tries and never reached its goal, or that reached its goal
+  but replayed ok 0 times in 4 or more tries;
   routes saved before run counts existed start at zero runs, and old
   routes are pruned after every save that reached its goal.
 - Only one saved route is kept per goal: when a new route repeats or
@@ -64,6 +65,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - The fast screen reader's start check reads the screen again while the
   app is still loading, so a screen that changes during the check no
   longer turns the fast reader off for the whole run.
+- qa_mobile_test takes launch=false: a goal or explore run starts on the
+  screen the device already shows instead of opening the app first
+  (default: launch). reset_app=true and scripted case runs still open
+  the app.
+- When a case ends blocked and the run stays open, the reply says to
+  clear the blocker or call qa_mobile_stop to end the run.
 
 ### Known
 

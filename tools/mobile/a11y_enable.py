@@ -32,7 +32,7 @@ A11Y_CONNECT_POLL_INTERVAL_S = 0.5
 #: Refusal codes that mean "not ready yet" while the service connects.
 _NOT_READY = ("no_service",)
 
-#: The operator's switch that keeps the fast reader off (the live gate's uiautomator mode),
+#: The operator's switch that keeps the fast reader off (forced uiautomator runs),
 #: read from os.environ: QA_DUMP_SOURCE=uiautomator.
 FORCE_ENV = "QA_DUMP_SOURCE"
 FORCE_UIAUTOMATOR = "uiautomator"

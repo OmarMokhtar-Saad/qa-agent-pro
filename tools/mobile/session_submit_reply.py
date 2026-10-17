@@ -10,6 +10,14 @@ from tools.mobile.session_submit_args import _TurnReply
 
 logger = logging.getLogger("tools.mobile.session")
 
+#: A blocked ``done()`` that did not end the run: the run stays open so the model can
+#: still clear the blocker, but it must know the device stays leased until it stops
+#: (run mrun-20261017-205436 learned that only from the next reply).
+BLOCKED_OPEN_NOTICE = (
+    "The run is still open after this blocked verdict: clear the blocker and "
+    "continue, or call qa_mobile_stop to end the run and release the device."
+)
+
 
 # Only a turn whose ``done()`` judged the goal writes a verdict; every
 # other turn keeps "" plus its status, because an exploratory turn has no
@@ -43,6 +51,13 @@ def _explore_turn_case(checkpoint: dict, outcome: dict, verdict: str) -> dict:
     }
 
 
+def _notice(reply: _TurnReply) -> str:
+    """The turn's notice, plus the stop hint when a blocked verdict left the run open."""
+    if reply.stopped or reply.case.get("verdict") != "blocked":
+        return reply.notice
+    return " ".join(t for t in (reply.notice, BLOCKED_OPEN_NOTICE) if t)
+
+
 def _explore_turn_reply(reply: _TurnReply) -> dict:
     """The chat reply for one folded exploratory turn."""
     return {
@@ -52,7 +67,7 @@ def _explore_turn_reply(reply: _TurnReply) -> dict:
             "case": reply.case,
             "packet": None,
             "next": {},
-            "notice": reply.notice,
+            "notice": _notice(reply),
             "field": "",
             "resolved": reply.resolved,
         },

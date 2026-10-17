@@ -48,7 +48,7 @@ async def _prepare_tail(
     ``done`` is ``(target, locale_taken, capture_result)``; ``prepared`` is
     ``(target, locale_taken, capture_result, reset_result)``."""
     target, locale_taken, capture_result = done
-    await _mobile_launch_target(serial, target)
+    await _mobile_launch_target(serial, target if req.launch else "")
     reset_stage, reset_result = await mobile_run.mobile_reset_app_stage(
         mobile_run._ResetCall(serial, target, req.reset_app, req.apply)
     )
