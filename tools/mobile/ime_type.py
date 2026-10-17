@@ -6,10 +6,15 @@ import base64
 import logging
 from typing import NamedTuple
 
-from tools.mobile.ime_consts import MAX_TEXT_CHARS, TypeOpts
+from tools.mobile.ime_consts import LANDED_NO, LANDED_UNKNOWN, MAX_TEXT_CHARS, TypeOpts
 from tools.mobile.ime_host import host
 from tools.mobile.ime_landed import Seen, _landed_verdict
-from tools.mobile.ime_query import _field_snapshot, _focused_field, _undelivered
+from tools.mobile.ime_query import (
+    _field_snapshot,
+    _focused_field,
+    _undelivered,
+    last_field,
+)
 
 logger = logging.getLogger("tools.mobile.ime")
 
@@ -88,8 +93,13 @@ async def _commit_and_verify(job: _TypeJob, value: str) -> dict:
 
 async def _verified_result(job: _TypeJob, value: str, before: str | None) -> dict:
     """Read the field again and build the success envelope."""
+    prior = last_field(job.serial)
     after = await _field_snapshot(job.serial, job.actions, job.secret)
     landed = _landed_verdict(Seen(before, after), value, job.secret)
+    # A different field in focus than before an EMPTY read: the screen moved on
+    # (an auto-submitting OTP), which is not "the field took nothing".
+    if landed == LANDED_NO and prior and last_field(job.serial) != prior:
+        landed = LANDED_UNKNOWN
     result = _typed_result(value, job.secret, landed)
     # EMPTY after the commit: only the screen can say whether that is a dead
     # field or an auto-submitting OTP that moved on, so the replay asks it.

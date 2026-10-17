@@ -16,6 +16,7 @@ from tools.safe_parse import parse_xml
 
 LIST_RID = ":id/appListRecyclerView"
 ROW_RID = ":id/row"
+LOADING_RID = ":id/progressListLoadingSpinner"
 AAB_SETUP_RID = ":id/aab_instructions_dialog_container"
 _END = "</hierarchy>"
 _BOUNDS_RE = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
@@ -62,6 +63,11 @@ def parse_rows(xml: str) -> list:
 def has_rid(xml: str, suffix: str) -> bool:
     root = _root(xml)
     return root is not None and any(_rid(n).endswith(suffix) for n in root.iter())
+
+
+def is_loading(xml: str) -> bool:
+    """True while the list screen shows its loading spinner."""
+    return has_rid(xml, LOADING_RID)
 
 
 def is_listing(xml: str) -> bool:

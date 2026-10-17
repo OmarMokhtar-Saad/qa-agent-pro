@@ -8,7 +8,7 @@ import os
 import time
 from typing import NamedTuple
 
-from tools.mobile import a11y_arming, a11y_fresh, a11y_settle, adb, ime_nonce
+from tools.mobile import a11y_arming, a11y_fresh, a11y_parity_proof, adb, ime_nonce
 from tools.mobile.a11y_device import (
     _VALUE_RE,
     MASTER,
@@ -116,7 +116,7 @@ async def _verify_parity(serial: str, run_id: str) -> dict:
         await restore(run_id)
         return connected
 
-    checked = await a11y_settle.checked(serial, str(connected["content"]))
+    checked = await a11y_parity_proof.checked(serial, str(connected["content"]))
     if checked.get("error"):
         await restore(run_id)
     return checked

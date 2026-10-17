@@ -1,6 +1,6 @@
 """Arming the fast reader while a system dialog hides every app window.
 
-Measured: on the live-gate runs of 2026-10-17 the notification-permission dialog was in
+Measured: on the device runs of 2026-10-17 the notification-permission dialog was in
 front while the service connected, so every connect poll answered ``no_window``,
 arming gave up after ten polls and the whole run read with uiautomator. ``no_window``
 is the CONNECTED service saying nothing readable is in front, so arming stops polling

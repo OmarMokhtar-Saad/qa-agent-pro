@@ -28,6 +28,7 @@ from tools.mobile import (
     kstg_flow_packets,
     kstg_flow_prune,
     kstg_flow_sig,
+    kstg_flow_trim,
 )
 from tools.mobile.knowledge_learn import StageResult
 
@@ -105,8 +106,9 @@ def _write(package: str, plan: list, result: StageResult) -> list:
 
 
 def _save_all(lc, goal_recs: tuple, result: StageResult) -> None:
-    goal, recs = goal_recs[0], kstg_flow_cut.repair(goal_recs[1])
-    refused = kstg_flow_gate.reject(recs)
+    goal = goal_recs[0]
+    recs = kstg_flow_cut.repair(kstg_flow_trim.trim(goal_recs[1], lc.package))
+    refused = kstg_flow_gate.reject(recs, lc.package)
     if refused:
         result.notes.append("%s: not saved, %s" % (lc.package, refused))
         return

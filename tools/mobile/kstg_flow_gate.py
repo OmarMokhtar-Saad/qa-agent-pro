@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 
+from tools.mobile.kstg_foreign import observed
 from tools.mobile.kstg_popup_permission import is_permission_decline
 
 _FAMILY_RE = re.compile(r"^(sk[0-9]+[a-z]*):")
@@ -60,24 +61,35 @@ def _noop_loop(recs: list) -> bool:
     return False
 
 
-def _declines_permission(recs: list) -> bool:
-    """True when a tap in the route answers a runtime-permission dialog with a decline."""
-    for rec in recs:
-        act = rec.get("flow_action") or {}
-        got = act.get("target")
-        target: dict = got if isinstance(got, dict) else {}
-        labels = (
-            act.get("text"),
-            act.get("label"),
-            target.get("text"),
-            target.get("label"),
-        )
-        if act.get("op") in _TAPS and any(map(is_permission_decline, labels)):
-            return True
-    return False
+def declines(rec: dict) -> bool:
+    """True when the step taps a label that declines a runtime permission."""
+    act = rec.get("flow_action") or {}
+    got = act.get("target")
+    target: dict = got if isinstance(got, dict) else {}
+    labels = (
+        act.get("text"),
+        act.get("label"),
+        target.get("text"),
+        target.get("label"),
+    )
+    return act.get("op") in _TAPS and any(map(is_permission_decline, labels))
 
 
-def reject(recs: list) -> str:
+def foreign_decline(rec: dict, package: str) -> bool:
+    """A decline on a screen not proven to be *package*'s own (an OS permission dialog).
+
+    Replay allows OS permission dialogs, so a flow must not decline one. A decline on
+    the app's own sheet is part of the app's route and replays as recorded.
+    """
+    return declines(rec) and (not package or observed(rec) != package)
+
+
+def _declines_permission(recs: list, package: str) -> bool:
+    """True when a tap declines a permission outside the app's own screens."""
+    return any(foreign_decline(rec, package) for rec in recs)
+
+
+def reject(recs: list, package: str = "") -> str:
     """Why *recs* must not be saved as a flow, or ``""`` when they pass."""
     if _empty_tap_end(recs):
         return "ends in a tap that names no target"
@@ -85,6 +97,6 @@ def reject(recs: list) -> str:
         return "mixes screen-key families"
     if _noop_loop(recs):
         return "repeats a tap that changed nothing"
-    if _declines_permission(recs):
+    if _declines_permission(recs, package):
         return "taps a runtime-permission decline"
     return ""

@@ -22,6 +22,9 @@ LISTING_DEADLINE_S = 90.0
 #: Re-reads of a screen that parsed to no rows (a spinner) before giving up.
 MAX_EMPTY_REREADS = 3
 
+#: Longest wait for a list that shows its loading spinner to show rows.
+LIST_LOAD_WAIT_S = 20.0
+
 #: Back presses (and screen reads after each) made to leave the app page App
 #: Tester reopens on and reach its app list.
 MAX_BACK_TO_LIST = 3

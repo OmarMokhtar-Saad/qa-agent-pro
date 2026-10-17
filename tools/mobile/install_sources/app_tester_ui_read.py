@@ -2,25 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 
 from tools.mobile.install_source import DeviceUi
-from tools.mobile.install_sources.app_tester_ui_consts import MAX_EMPTY_REREADS, _Run
-from tools.mobile.install_sources.app_tester_ui_rows import parse_rows
+from tools.mobile.install_sources.app_tester_ui_consts import (
+    APP_TESTER_POLL_S,
+    LIST_LOAD_WAIT_S,
+    MAX_EMPTY_REREADS,
+    _Run,
+)
+from tools.mobile.install_sources.app_tester_ui_rows import is_loading, parse_rows
 
 log = logging.getLogger(__name__)
 
 
 async def read_rows(ui: DeviceUi, xml: str = "") -> list:
-    """The rows on the screen. A screen that shows none (a spinner, a dump that
-    failed) is read again, at most MAX_EMPTY_REREADS times; ``[]`` after that.
-    It is never answered with the rows of an earlier screen."""
+    """The rows on the screen. A screen that shows none is read again: while it
+    shows the list's loading spinner, until rows appear or LIST_LOAD_WAIT_S
+    passes; otherwise (a dump that failed) at most MAX_EMPTY_REREADS times.
+    ``[]`` after that. It is never answered with the rows of an earlier screen."""
     rows = parse_rows(xml)
-    for _ in range(MAX_EMPTY_REREADS):
-        if rows:
-            return rows
+    deadline = time.monotonic() + LIST_LOAD_WAIT_S
+    misses = 0
+    while not rows and misses < MAX_EMPTY_REREADS:
+        if is_loading(xml) and time.monotonic() < deadline:
+            await asyncio.sleep(APP_TESTER_POLL_S)
+        else:
+            misses += 1
         shot = await ui.screen()
-        rows = parse_rows(shot.xml) if shot else []
+        xml = shot.xml if shot else ""
+        rows = parse_rows(xml)
     return rows
 
 

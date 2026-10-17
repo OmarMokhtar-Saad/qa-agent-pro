@@ -11,7 +11,7 @@ import logging
 import time
 from pathlib import Path
 
-from tools.mobile import run_consts, run_io
+from tools.mobile import media_pending, run_consts, run_io
 
 logger = logging.getLogger("tools.mobile.run_store")
 
@@ -35,6 +35,13 @@ def _case_file(run_id: str, tc_id: str) -> Path:
     return run_io.run_path(run_id) / run_consts.CASES_DIR / (tc_id + ".json")
 
 
+def _drain_media(run_id: str, tc_id: str, body: dict) -> None:
+    """Index media produced before this case had a record."""
+    late = media_pending.take(run_id, tc_id)
+    if late:
+        body["media"] = [*list(body.get("media") or []), *late]
+
+
 def write_case(run_id: str, tc_id: str, payload: dict) -> dict:
     """Checkpoint one case. The payload is redacted before it touches disk."""
     try:
@@ -44,6 +51,7 @@ def write_case(run_id: str, tc_id: str, payload: dict) -> dict:
         body = dict(payload or {})
         body.setdefault("tc_id", tc_id)
         body.setdefault("updated", time.time())
+        _drain_media(run_id, tc_id, body)
         run_io._write_json(_case_file(run_id, tc_id), body)
         return {"error": None, "content": {"tc_id": tc_id}}
     except Exception as exc:

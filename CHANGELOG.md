@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.130.1] - 2026-10-17
+## [1.131.0] - 2026-10-17
 
 ### Added
 
@@ -71,6 +71,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
   the app.
 - When a case ends blocked and the run stays open, the reply says to
   clear the blocker or call qa_mobile_stop to end the run.
+- The fast screen reader's start check is remembered per device build
+  and keyboard build for 7 days, so later runs skip the slow first
+  screen reads (about 20 s); a failed check forgets it.
+- A goal run that reached its goal saves its route even when it
+  declined a permission sheet in the app; steps before the app first
+  showed, and declines on system dialogs, are left out of the route.
+- A saved route that kept failing is tried again after 7 days.
+- Screenshots and recordings taken before a case is written are now
+  linked to that case.
+- Reading the App Tester build list waits for it to finish loading
+  (up to 20 s) instead of reporting 0 builds.
+- A one-time code that submits itself and moves to the next screen
+  reads as unknown, not as not typed.
 
 ### Known
 

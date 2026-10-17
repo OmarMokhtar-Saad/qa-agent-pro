@@ -51,6 +51,15 @@ async def probe(serial: str) -> dict:
     }
 
 
+#: The field id the keyboard last reported per serial (absent when none was readable).
+_LAST_FIELD: dict[str, str] = {}
+
+
+def last_field(serial: str) -> str:
+    """The id of the focused field at the latest snapshot of *serial*."""
+    return _LAST_FIELD.get(serial, "")
+
+
 async def _field_snapshot(serial: str, actions: dict, secret: bool):
     """What the focused field holds, or ``None`` when the keyboard cannot say.
 
@@ -61,15 +70,22 @@ async def _field_snapshot(serial: str, actions: dict, secret: bool):
     For a secret this returns an INT (the length) and never the text; see
     ``_parse_reply``'s ``reveal_text``.
     """
+    _LAST_FIELD.pop(serial, None)
     sent = await host().broadcast(serial, str(actions["query"]))
     if sent.get("error"):
         return None
-    payload = sent.get("content") or {}
-    raw = str(payload.get("out") or "") + str(payload.get("err") or "")
-    reply = _parse_reply(raw, reveal_text=not secret)
+    reply = _sent_reply(sent, secret)
     if int(reply.get("result", -1)) != 1:
         return None
+    _LAST_FIELD[serial] = str(reply.get("field") or "")
     return reply["text_len"] if secret else reply["text"]
+
+
+def _sent_reply(sent: dict, secret: bool) -> dict:
+    """The parsed keyboard reply carried by a broadcast result."""
+    payload = sent.get("content") or {}
+    raw = str(payload.get("out") or "") + str(payload.get("err") or "")
+    return _parse_reply(raw, reveal_text=not secret)
 
 
 async def _focused_field(serial: str, actions: dict) -> str:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from config.settings_guard import never_raise
-from tools.mobile import run_store
+from tools.mobile import media_pending, run_store
 
 logger = logging.getLogger("tools.mobile.media")
 
@@ -30,6 +30,15 @@ def _held(fresh: dict, records: list) -> list:
     return held
 
 
+def _hold_for_case(run_id: str, tc_id: str, records: list) -> dict:
+    """Buffer records of a case with no record yet; ``write_case`` drains them."""
+    media_pending.hold(run_id, tc_id, records)
+    _warn_no_case(run_id, tc_id, records)
+    if isinstance((run_store.read_case(run_id, tc_id) or {}).get("content"), dict):
+        return remember(run_id, tc_id, [])  # the record landed meanwhile
+    return {"error": None, "content": []}
+
+
 def _warn_no_case(run_id: str, tc_id: str, records: list) -> None:
     """Say that records were produced for a case that has no record."""
     # SAY SO. This is the one path where records are produced and then
@@ -40,8 +49,8 @@ def _warn_no_case(run_id: str, tc_id: str, records: list) -> None:
     # exists yet, which in production means `start_case` did not run or
     # its write failed. The pictures are still on disk beside the run.
     logger.warning(
-        "mobile.media.remember: no case record for %s/%s; %d media "
-        "record(s) not indexed",
+        "mobile.media.remember: no case record for %s/%s yet; %d media "
+        "record(s) held until it is written",
         run_id,
         tc_id,
         len([item for item in list(records or []) if isinstance(item, dict)]),
@@ -61,8 +70,7 @@ def remember(run_id: str, tc_id: str, records: list) -> dict:
     ):
         fresh = (run_store.read_case(run_id, tc_id) or {}).get("content")
         if not isinstance(fresh, dict):
-            _warn_no_case(run_id, tc_id, records)
-            return {"error": None, "content": []}
+            return _hold_for_case(run_id, tc_id, records)
         held = _held(fresh, records)
         fresh["media"] = held
         run_store.write_case(run_id, tc_id, fresh)

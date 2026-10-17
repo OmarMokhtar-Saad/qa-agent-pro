@@ -1,6 +1,6 @@
 """The arming parity check on a settled screen.
 
-Measured: on the live-gate runs of 2026-10-17 (2 of 12 a11y runs) the eager arming check
+Measured: on the device runs of 2026-10-17 (2 of 12 a11y runs) the eager arming check
 refused with "share too few nodes" on a freshly reset app that was still loading: the
 fast dump and the uiautomator dump (~2.3 s on that device) were of two different frames.
 So the check reads fast, then uiautomator, then fast again. When the two fast dumps

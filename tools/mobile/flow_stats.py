@@ -26,6 +26,9 @@ DEAD_RUNS = 2
 #: route was real once, so it gets more tries, but 0 landed replays in this many means
 #: the app moved on (run mrun-20261017-205436: a reached flow at 0 of 11 still picked).
 DEAD_RUNS_REACHED = 4
+#: Seconds a dead flow stays out of the pick after its last replay (7 days): an app update
+#: may have fixed the route, so one more try is allowed, and a failure re-buries it.
+DEAD_TTL_S = 7 * 86400.0
 _FIELDS = ("runs", "ok", "seen")
 _FLOWS_FILE = "flows.json"
 
@@ -103,12 +106,16 @@ def counters(template: dict) -> dict:
     return {"runs": 0, "ok": 0, **of(template)}
 
 
-def dead(template: dict) -> bool:
+def dead(template: dict, now: float = 0.0) -> bool:
     """A flow that never replayed ok in its dead-run threshold of tries.
 
     The threshold is ``DEAD_RUNS`` for a flow that never reached its goal and
-    ``DEAD_RUNS_REACHED`` for one that did."""
+    ``DEAD_RUNS_REACHED`` for one that did. The verdict lapses ``DEAD_TTL_S`` after
+    the flow's last event so the app's later versions get one more try."""
     meta = template.get("meta") or {}
     stats = counters(template)
     limit = DEAD_RUNS_REACHED if meta.get("reached") else DEAD_RUNS
-    return stats["ok"] == 0 and stats["runs"] >= limit
+    if stats["ok"] or stats["runs"] < limit:
+        return False
+    last = float(stats.get("last") or 0.0)
+    return not last or (now or time.time()) - last < DEAD_TTL_S
