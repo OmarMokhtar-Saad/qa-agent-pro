@@ -22,6 +22,7 @@ from tools.mobile import (
     kstg_flow_cut,
     kstg_flow_dedupe,
     kstg_flow_gate,
+    kstg_flow_goal,
     kstg_flow_merge,
     kstg_flow_meta,
     kstg_flow_packets,
@@ -63,17 +64,21 @@ def _save(package: str, packet: _Packet) -> _Outcome:
     return _Outcome("", note, packet.name)
 
 
-def _packets(acts: list) -> tuple:
-    """``(packets, why)``: the replayable prefix packets, or why nothing is saved."""
-    packets = kstg_flow_packets.chunk(acts)
+def _packets(recs: list) -> tuple:
+    """``(packets, why)``: the replayable prefix packets, or why nothing is saved.
+
+    A run whose every step is kept (it reached the goal) may take up to
+    ``MAX_REACHED_PACKETS`` packets; a partial prefix keeps ``MAX_FLOW_PACKETS``.
+    """
+    packets = kstg_flow_packets.chunk([r["flow_action"] for r in recs])
     if not packets:
         return [], "the first step cannot be replayed on its own; nothing saved"
-    if len(packets) > kstg_flow_packets.MAX_FLOW_PACKETS:
-        limit = kstg_flow_packets.MAX_FLOW_PACKETS
-        return [], "flow has %d steps, over the %d-packet limit; nothing saved" % (
-            len(acts),
-            limit,
-        )
+    limit = kstg_flow_packets.MAX_FLOW_PACKETS
+    if kstg_flow_meta.all_kept(recs, packets):
+        limit = kstg_flow_packets.MAX_REACHED_PACKETS
+    if len(packets) > limit:
+        why = "flow needs %d packets (%d steps), over the %d-packet limit"
+        return [], why % (len(packets), len(recs), limit) + "; nothing saved"
     return packets, ""
 
 
@@ -105,18 +110,24 @@ def _save_all(lc, goal_recs: tuple, result: StageResult) -> None:
     if refused:
         result.notes.append("%s: not saved, %s" % (lc.package, refused))
         return
-    packets, why = _packets([r["flow_action"] for r in recs])
+    packets, why = _packets(recs)
     if why:
         result.notes.append("%s: %s" % (lc.package, why))
         return
+    _commit(lc.package, (goal, recs, packets), result)
+
+
+def _commit(package: str, parts: tuple, result: StageResult) -> None:
+    """Save ``(goal, recs, packets)``, then keep one flow per goal and prune."""
+    goal, recs, packets = parts
     kept = kstg_flow_packets.kept(packets)
     if kept < len(recs):
-        note = "%s: kept first %d of %d steps" % (lc.package, kept, len(recs))
+        note = "%s: kept first %d of %d steps" % (package, kept, len(recs))
         result.notes.append(note)
-    plan = _plan(goal, recs, packets)
-    held = _write(lc.package, plan, result)
-    if held and kept == len(recs):  # a covering flow holds a skipped packet: keep it
-        kstg_flow_prune.prune(lc.package, held, kept)
+    held = _write(package, _plan(goal, recs, packets), result)
+    if held:  # a covering flow holds a skipped packet: keep it
+        kstg_flow_goal.collapse(package, held)
+        kstg_flow_prune.prune(package, held, kept)
 
 
 def run(conn, lc) -> StageResult:

@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 #: Seconds after which a flow's score halves (30 days).
 HALF_LIFE_S = 30 * 86400.0
 _Z = 1.96
+#: Replays that all failed before a flow that never reached its goal is dead.
+DEAD_RUNS = 2
 _FIELDS = ("runs", "ok", "seen")
 _FLOWS_FILE = "flows.json"
 
@@ -90,3 +92,15 @@ def record(package: str, name: str, ok: bool) -> None:
         app_store.update_json(package, _FLOWS_FILE, mutate)
     except Exception:
         logger.exception("flow stats record failed")
+
+
+def counters(template: dict) -> dict:
+    """The counters of a flow; one saved before they existed counts as ``runs 0, ok 0``."""
+    return {"runs": 0, "ok": 0, **of(template)}
+
+
+def dead(template: dict) -> bool:
+    """A flow that never reached its goal and never replayed ok in 2 or more tries."""
+    meta = template.get("meta") or {}
+    stats = counters(template)
+    return not meta.get("reached") and stats["ok"] == 0 and stats["runs"] >= DEAD_RUNS

@@ -100,17 +100,28 @@ def p90_ms(serial: str, source: str | None = None) -> int | None:
     return _p90(_BY_SOURCE.get(key, {}).get(source) or ())
 
 
+def next_dump_p90_labelled(serial: str) -> tuple[str, int | None]:
+    """``(bucket, ms)`` of the p90 the next dump is judged by.
+
+    The bucket is the last dump's source; ``"any"`` when that bucket is empty and the
+    all-sample p90 answered instead. ``ms`` is ``None`` when nothing is recorded.
+    """
+    source = last_source(serial)
+    own = p90_ms(serial, source) if source else None
+    if own is not None:
+        return source, own
+    return "any", p90_ms(serial)
+
+
 def next_dump_p90(serial: str) -> int | None:
     """The p90 of the source the next dump most likely uses (the last one's)."""
-    own = p90_ms(serial, last_source(serial))
-    return own if own is not None else p90_ms(serial)
+    return next_dump_p90_labelled(serial)[1]
 
 
 def note_p90(serial: str) -> None:
-    """Ledger the p90 the anchor-probe skip reads, named by its source."""
-    ms = next_dump_p90(serial)
+    """Ledger the p90 the anchor-probe skip reads, named by the bucket it came from."""
+    label, ms = next_dump_p90_labelled(serial)
     if ms is not None:
-        label = last_source(serial) or "any"
         step_timing.note(("p90:" + label)[:40], ms)
 
 

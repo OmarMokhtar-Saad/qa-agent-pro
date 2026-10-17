@@ -9,7 +9,7 @@ import logging
 import zlib
 
 from config.settings_guard import never_raise
-from tools.mobile import a11y_events, adb, ime, ime_nonce
+from tools.mobile import a11y_events, a11y_retry, adb, ime, ime_nonce, ime_proof
 
 logger = logging.getLogger("tools.mobile.a11y")
 
@@ -141,12 +141,15 @@ async def provider(serial: str) -> dict:
     """The dump provider ``adb.uiautomator_dump`` consults; drops itself after repeated failures.
 
     A ``no_window`` refusal counts on its own, longer streak: the service is alive,
-    only the window is hidden, so that dump alone falls back to uiautomator.
+    only the window is hidden. It is re-asked within a bounded budget
+    (:mod:`tools.mobile.a11y_retry`); one that outlasts it falls back to
+    uiautomator for that dump alone.
     """
-    got = await fetch_dump(serial)
+    got = await a11y_retry.until_tree(fetch_dump, serial)
     if got.get("error"):
         _strike(serial, str(got["error"]))
         a11y_events.record(serial, None)  # a failed read leaves no stale clock
         return got
     reset_streaks(serial)
+    ime_proof.on_dump(serial)
     return got

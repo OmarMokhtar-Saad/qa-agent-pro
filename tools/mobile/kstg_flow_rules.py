@@ -20,7 +20,7 @@ STALE_S = 90 * 86400.0
 
 
 def _low(template: dict) -> bool:
-    stats = flow_stats.of(template)
+    stats = flow_stats.counters(template)
     runs = stats.get("runs", 0)
     return runs >= MIN_RUNS and flow_stats.wilson(stats.get("ok", 0), runs) < MIN_WILSON
 

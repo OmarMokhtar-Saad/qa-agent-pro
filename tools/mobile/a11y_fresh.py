@@ -20,6 +20,9 @@ the screen and :func:`tools.mobile.a11y_parity.compare` judges the two:
 * uiautomator fails -- nothing proves the repeat, so the provider refuses this
   dump and uiautomator is asked once more; the provider stays registered.
 
+A repeat the service's event clock proves unchanged (see
+:mod:`tools.mobile.a11y_clock`) skips that dump too.
+
 The check costs one uiautomator dump only when a tree repeats across an
 actuation, which is a "tap did nothing" or the first poll of a wait: a
 working fast path pays nothing.
@@ -27,12 +30,13 @@ working fast path pays nothing.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
-import time
 from typing import Any, Awaitable, Callable
 
-from tools.mobile import adb, dump_latency_state, dump_reuse, step_timing
+from tools.mobile import a11y_clock, adb, dump_reuse, step_timing
+from tools.mobile.a11y_confirm import uiautomator_aside
 from tools.mobile.a11y_parity import compare, node_digest
 
 logger = logging.getLogger("tools.mobile.a11y")
@@ -72,6 +76,7 @@ def forget(serial: str) -> None:
     """Drop the remembered tree and the suspension (a fresh enable, a restore)."""
     for table in (_LAST, _SUSPENDED, _STRIKES):
         table.pop(str(serial), None)
+    a11y_clock.forget(serial)
 
 
 def _digest(xml: str) -> str:
@@ -90,6 +95,7 @@ def _stale(serial: str, digest: str) -> dict:
     step_timing.note(STALE_NOTE)
     _STRIKES[serial] = _STRIKES.get(serial, 0) + 1
     _LAST.pop(serial, None)
+    a11y_clock.forget(serial)
     _SUSPENDED[serial] = digest
     if _STRIKES[serial] >= MAX_STALE_STRIKES:
         logger.warning("mobile.a11y: stale tree on %s; fast reading off", serial)
@@ -101,9 +107,7 @@ def _stale(serial: str, digest: str) -> dict:
 
 async def _judge(serial: str, xml: str) -> dict | None:
     """``None`` when uiautomator confirms *xml*, else the refusal to return."""
-    started = time.monotonic()
-    slow = await adb.uiautomator_dump(serial, use_provider=False)
-    dump_latency_state.record_aside(serial, time.monotonic() - started, CONFIRM_SOURCE)
+    slow = await uiautomator_aside(serial, CONFIRM_SOURCE)
     if slow.get("error"):
         step_timing.note(UNCHECKED_NOTE)
         return {"error": UNCHECKED_REFUSAL, "content": None}
@@ -124,6 +128,17 @@ async def _resume(serial: str, xml: str) -> dict | None:
     return refused
 
 
+async def _verdict(serial: str, xml: str, started_under: int) -> dict | None:
+    """``None`` when *xml* may be served, else the refusal (suspended, stale, unchecked)."""
+    if serial in _SUSPENDED:
+        return await _resume(serial, xml)
+    digest = _digest(xml)
+    if not _repeats(serial, digest, started_under):
+        return None
+    confirm = functools.partial(_judge, serial, xml)
+    return await a11y_clock.judged(serial, digest, confirm)
+
+
 async def checked(serial: str, inner: Provider) -> dict:
     """*inner*'s dump, refused when it repeats across an actuation and is not confirmed."""
     key = str(serial)
@@ -133,15 +148,11 @@ async def checked(serial: str, inner: Provider) -> dict:
     if got.get("error") or not xml:
         return got
     digest = _digest(xml)
-    if key in _SUSPENDED:
-        refused = await _resume(key, xml)
-    elif _repeats(key, digest, started_under):
-        refused = await _judge(key, xml)
-    else:
-        refused = None
+    refused = await _verdict(key, xml, started_under)
     if refused is not None:
         return refused
     _LAST[key] = (dump_reuse.token(key), digest)
+    a11y_clock.served(key, digest)
     return got
 
 

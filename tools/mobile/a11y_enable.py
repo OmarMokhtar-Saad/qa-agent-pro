@@ -8,7 +8,7 @@ import os
 import time
 from typing import NamedTuple
 
-from tools.mobile import a11y_fresh, adb, ime_nonce
+from tools.mobile import a11y_arming, a11y_fresh, a11y_settle, adb, ime_nonce
 from tools.mobile.a11y_device import (
     _VALUE_RE,
     MASTER,
@@ -20,10 +20,8 @@ from tools.mobile.a11y_device import (
     read_state,
 )
 from tools.mobile.a11y_dump import fetch_dump, provider, reset_streaks
-from tools.mobile.a11y_parity import compare
 from tools.mobile.a11y_record import write_record
 from tools.mobile.a11y_restore import _RUNS, restore
-from tools.mobile.replay import dump as replay_dump
 
 logger = logging.getLogger("tools.mobile.a11y")
 
@@ -32,7 +30,7 @@ A11Y_CONNECT_MAX_POLLS = 10
 A11Y_CONNECT_POLL_INTERVAL_S = 0.5
 
 #: Refusal codes that mean "not ready yet" while the service connects.
-_NOT_READY = ("no_service", "no_window")
+_NOT_READY = ("no_service",)
 
 #: The operator's switch that keeps the fast reader off (the live gate's uiautomator mode),
 #: read from os.environ: QA_DUMP_SOURCE=uiautomator.
@@ -59,6 +57,8 @@ async def _await_connected(serial: str) -> dict:
         if not got.get("error"):
             return got
         last = got
+        if a11y_arming.hidden_window(got):
+            return got  # connected; parity waits for the first readable tree
         if not any(code in str(got["error"]) for code in _NOT_READY):
             return got
         if poll < A11Y_CONNECT_MAX_POLLS - 1:
@@ -110,16 +110,13 @@ async def _turn_on(turn: _Turn) -> dict | None:
 async def _verify_parity(serial: str, run_id: str) -> dict:
     """Wait for the service, compare its dump with uiautomator's; restore on any error."""
     connected = await _await_connected(serial)
+    if a11y_arming.hidden_window(connected):
+        return {"error": None, "content": None, "deferred": True}
     if connected.get("error"):
         await restore(run_id)
         return connected
 
-    slow = await replay_dump.dump_raw(serial, use_provider=False)
-    checked = (
-        slow
-        if slow.get("error")
-        else compare(str(connected["content"]), str(slow["content"]))
-    )
+    checked = await a11y_settle.checked(serial, str(connected["content"]))
     if checked.get("error"):
         await restore(run_id)
     return checked
@@ -164,7 +161,10 @@ async def _verified(serial: str, run_id: str) -> dict | None:
         return checked
     reset_streaks(str(serial))
     a11y_fresh.forget(serial)
-    adb.set_dump_provider(serial, a11y_fresh.guarded(provider))
+    inner = (
+        a11y_arming.deferred(provider, run_id) if checked.get("deferred") else provider
+    )
+    adb.set_dump_provider(serial, a11y_fresh.guarded(inner))
     return None
 
 

@@ -145,7 +145,8 @@ def pick(package: str, key: str, skip: Any = ()) -> tuple:
     (``flow_replay_match_anchor``); a key match always beats that.
     Names in *skip* (already replayed this run) are never offered again.
     """
-    rows = [(n, t) for n, t in _templates(package) if n not in set(skip)]
+    live = [(n, t) for n, t in _templates(package) if not flow_stats.dead(t)]
+    rows = [(n, t) for n, t in live if n not in set(skip)]
     for by_key in (True, False):
         fits = [(n, t, at) for n, t in rows if (at := _first_at(t, key, by_key)) >= 0]
         if fits:

@@ -1,0 +1,86 @@
+"""Confirming a repeated a11y tree with the service's event clock, not a second dump.
+
+A tree that repeats across an actuation is normally proven by one uiautomator dump
+(:mod:`tools.mobile.a11y_fresh`). qa-ime 1.2.1 also tells how many window/content
+events its service has heard since it connected (:mod:`tools.mobile.a11y_events`).
+When the digest is identical AND that count did not move since the tree was first
+served, nothing happened on screen the service could hear, so the repeat is real
+and the confirming dump is skipped (note ``a11y_repeat_by_clock``).
+
+The skip is allowed only when all of these hold, because a deaf service (the
+8f3169 stale run) also reports an unchanged count:
+
+* this serial's count already advanced across an earlier screen change, which proves
+  the service hears events at all (``proven``);
+* at most :data:`MAX_SKIPS` repeats in a row are taken on the clock; the next one
+  runs the uiautomator confirm again;
+* the clock is that of the dump just taken. A reply without a clock (qa-ime older
+  than 1.2.1) clears the state, so those runs keep the uiautomator confirm.
+
+The count is per service connection, not monotonic: a smaller count means a new
+connection, which is a change.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Awaitable, Callable
+
+from tools.mobile import a11y_events, step_timing
+
+#: Consecutive repeats the clock may confirm before uiautomator checks again.
+MAX_SKIPS = 2
+#: The ledger note for a repeat the clock confirmed.
+BY_CLOCK_NOTE = "a11y_repeat_by_clock"
+
+Confirm = Callable[[], Awaitable["dict | None"]]
+
+
+@dataclass
+class _Seen:
+    digest: str
+    count: int
+    proven: bool
+    skips: int = 0
+
+
+_SEEN: dict[str, _Seen] = {}
+
+
+def forget(serial: str) -> None:
+    """Drop the stored count and the proof (an enable, a restore, a stale verdict)."""
+    _SEEN.pop(str(serial), None)
+
+
+def _unchanged(serial: str, digest: str) -> bool:
+    seen, clock = _SEEN.get(serial), a11y_events.latest(serial)
+    if seen is None or clock is None or seen.digest != digest:
+        return False
+    return seen.proven and seen.skips < MAX_SKIPS and clock.count == seen.count
+
+
+async def judged(serial: str, digest: str, confirm: Confirm) -> "dict | None":
+    """``None`` when the clock proves the repeat, else the result of *confirm*."""
+    if _unchanged(serial, digest):
+        _SEEN[serial].skips += 1
+        step_timing.note(BY_CLOCK_NOTE)
+        return None
+    refused = await confirm()
+    seen = _SEEN.get(serial)
+    if refused is None and seen is not None:
+        seen.skips = 0
+    return refused
+
+
+def served(serial: str, digest: str) -> None:
+    """Remember the count of the tree just served; no clock forgets everything."""
+    clock, seen = a11y_events.latest(serial), _SEEN.get(serial)
+    if clock is None:
+        forget(serial)
+    elif seen is None or seen.digest != digest:
+        advanced = seen is not None and clock.count > seen.count
+        _SEEN[serial] = _Seen(
+            digest, clock.count, bool(advanced or (seen and seen.proven))
+        )
+    elif clock.count != seen.count:
+        seen.count, seen.skips = clock.count, 0

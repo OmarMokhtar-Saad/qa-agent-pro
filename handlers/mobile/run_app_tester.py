@@ -10,7 +10,10 @@ from tools.mobile.app_label_from_goal import goal_app_label
 from tools.mobile.install_source import InstallOutcome, InstallRequest
 from tools.mobile.install_sources.app_tester_ui import AppTesterUiSource
 from tools.mobile.install_sources.app_tester_ui_funcs import _label_required
-from tools.mobile.install_sources.app_tester_ui_memory import parse_app_id
+from tools.mobile.install_sources.app_tester_ui_memory import (
+    known_bundle,
+    parse_app_id,
+)
 from tools.mobile.install_sources.app_tester_ui_pick import ListedApp
 from tools.mobile.render_install import (
     APP_TESTER_HINT,
@@ -76,13 +79,23 @@ async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
 async def known_package(serial: str, label: str) -> str:
     """The package this label is already known to name on this device: the
     resolved-app cache first, then the one installed app the label fits (no
-    question is asked here). ``""`` when neither knows. Only a hint for the
-    list scan: a package the list does not hold changes nothing."""
+    question is asked here), then the package an earlier App Tester scan
+    matched to this label, if it is installed. ``""`` when none knows. Only a
+    hint for the list scan: a package the list does not hold changes nothing."""
     key = resolve_cache.cache_key(serial, label)
     cached = run_store.read_resolved_app(key) if label else {}
     if cached.get("package"):
         return str(cached["package"])
-    return (await app_stage_pick.pick_installed(serial, label)).package
+    picked = (await app_stage_pick.pick_installed(serial, label)).package
+    return picked or await _listed_and_installed(serial, label)
+
+
+async def _listed_and_installed(serial: str, label: str) -> str:
+    package = known_bundle(serial, label)
+    if not package:
+        return ""
+    have = (await mobile_adb.installed_packages(serial)).get("content") or []
+    return package if package in have else ""
 
 
 async def app_tester_stage(call: _AppCall, target: str) -> tuple:

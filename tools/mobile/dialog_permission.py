@@ -40,3 +40,20 @@ HANDLER = ChoiceHandler(
 def is_permission_button(text: object) -> bool:
     """Whether *text* is the label of a runtime-permission dialog button."""
     return str(text or "").strip().lower() in {b.lower() for b in PERMISSION_BUTTONS}
+
+
+#: The packages of the permission-controller dialog (not the legacy installer).
+_CONTROLLER = frozenset(p for p in PERMISSION_PACKAGES if "permissioncontroller" in p)
+
+GRANT_HINT = (
+    " The front window is the runtime-permission dialog: rerun with "
+    "`grant_permissions=true` and `apply=true` to grant the app's permissions "
+    "up front (leave it off only when testing the permission prompt)."
+)
+
+
+def front_hint(screen: object) -> str:
+    """``GRANT_HINT`` when *screen*'s front window is the permission controller."""
+    body = screen if isinstance(screen, dict) else {}
+    front = {str(body.get("package") or ""), str(body.get("dialog_package") or "")}
+    return GRANT_HINT if front & _CONTROLLER else ""

@@ -67,7 +67,7 @@ def _failed(out: str) -> list[str]:
     ]
 
 
-async def _ungranted(serial: str, package: str) -> dict:
+async def ungranted(serial: str, package: str) -> dict:
     result = await host().shell(serial, ["dumpsys", "package", package])
     body = result.get("content") or {}
     if result.get("error") or int(body.get("rc") or 0) != 0:
@@ -83,7 +83,7 @@ async def grant_runtime(serial: str, package: str) -> dict:
     """Grant every not-yet-granted runtime permission *package* requests."""
     if not valid_package_name(package) or package.startswith(SYSTEM_PACKAGE_PREFIXES):
         return {"error": "Refusing to grant for " + repr(package[:60]), "content": None}
-    pending = await _ungranted(serial, package)
+    pending = await ungranted(serial, package)
     perms = pending.get("content") or []
     if pending.get("error") or not perms:
         return {"error": pending.get("error"), "content": {"granted": [], "failed": []}}

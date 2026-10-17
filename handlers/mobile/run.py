@@ -46,6 +46,7 @@ from handlers.mobile.run_new import (
     _new_run_open,
     _new_run_start,
 )
+from handlers.mobile.run_permission_hint import with_hint
 from handlers.mobile.run_prepare import _prepare_tail
 from handlers.mobile.run_request import (  # noqa: F401
     _app_call,
@@ -154,7 +155,7 @@ async def _mobile_new_run(req: _MobileTestRequest) -> str:
             return idle_note
         stopped, prepared = await _mobile_prepare_app(req, serial, owner)
         if stopped:
-            return stopped
+            return await with_hint(req, serial, stopped)
         if not picked:
             return req.source_menu()
         reply, handed_off = await _new_run_start(req, (picked, owner, serial), prepared)

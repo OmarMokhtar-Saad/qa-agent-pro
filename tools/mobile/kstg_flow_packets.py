@@ -17,6 +17,8 @@ from tools.mobile import actions, kstg_flow_build, kstg_flow_perm
 
 #: Most packets one goal may become (4 x MAX_MODEL_ACTIONS = MAX_ACTIONS steps).
 MAX_FLOW_PACKETS = 4
+#: A run that reached its goal may take as many as the names allow (-p1 .. -p9).
+MAX_REACHED_PACKETS = 9
 _SUFFIX_ROOM = 3  # "-p" plus one digit
 PACKET_RE = re.compile(r"^(?P<base>.+)-p(?P<n>[1-9][0-9]*)$")
 

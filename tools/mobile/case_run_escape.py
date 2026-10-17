@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tools.mobile import dialog_permission
 from tools.mobile import run_packets as mobile_run
 from tools.mobile.case_run_checkpoint import _step_payload
 from tools.mobile.case_run_consts import (
@@ -86,7 +87,7 @@ def _budget_cap_payload(step: _Step, view: dict, uncharged: dict) -> dict:
 # `_budget_cap_payload`, passes it because that is the branch that increments.
 def _escape_cap_payload(step: _Step, view: dict, ask: _Ask) -> dict:
     """The blocked outcome for a case that spent every escape it was given."""
-    reason = str(step.result.get("reason") or "")
+    reason = _stop_reason(step)
     return _step_payload(
         step,
         view,
@@ -107,6 +108,12 @@ def _fresh_queue(result: dict, reason_key: str) -> object:
     return result.get("queued_actions") if reason_key == REASON_BUDGET else None
 
 
+def _stop_reason(step: _Step) -> str:
+    """The stop's reason, naming the grant rerun when a permission dialog is up."""
+    reason = str(step.result.get("reason") or "")
+    return reason + dialog_permission.front_hint(step.new_screen)
+
+
 def _escape_packet(step: _Step, view: dict, ask: _Ask) -> dict:
     """The escape-hatch job the model is asked to answer."""
     return mobile_run.build_escape_job(
@@ -116,7 +123,7 @@ def _escape_packet(step: _Step, view: dict, ask: _Ask) -> dict:
         run_id=step.run_id,
         tc_id=step.tc_id,
         escapes=ask.used,
-        reason=str(step.result.get("reason") or ""),
+        reason=_stop_reason(step),
     )
 
 
@@ -128,7 +135,7 @@ def _ask_model_payload(step: _Step, view: dict, ask: _Ask) -> dict:
         view,
         verdict="",
         status=NEEDS_MODEL,
-        reason=str(result.get("reason") or ""),
+        reason=_stop_reason(step),
         escapes=ask.used,
         packet=_escape_packet(step, view, ask),
         uncharged=ask.uncharged,

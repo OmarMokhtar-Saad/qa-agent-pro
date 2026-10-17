@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import app_flows, kstg_flow_rules
+from tools.mobile import app_flows, kstg_flow_chain, kstg_flow_rules
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +33,9 @@ def _doomed(package: str, rows: list, kept: tuple) -> list:
     """Names to delete; *kept* is ``(names just saved, steps of the new route)``."""
     keep, total = kept
     short = [r["name"] for r in rows if _stale(r, keep, total)]
-    weak = kstg_flow_rules.doomed(_templates(package, rows))
-    return list(dict.fromkeys(short + [n for n in weak if n not in keep]))
+    items = _templates(package, rows)
+    weak = short + [n for n in kstg_flow_rules.doomed(items) if n not in keep]
+    return list(dict.fromkeys(weak + kstg_flow_chain.doomed(items, weak, keep)))
 
 
 def prune(package: str, keep: list, total: int) -> list:

@@ -62,14 +62,29 @@ def _diverged(head: Head, pos: int, why: str) -> str:
     )
 
 
+def _span(head: Head, pos: int) -> str:
+    """``steps A-B of N`` (1-based): the steps replayed, not just where it ended."""
+    total = len(head.template.get("steps") or [])
+    first = min(head.start + 1, pos)
+    if first == pos:
+        return "step %d of %d" % (pos, total)
+    return "steps %d-%d of %d" % (first, pos, total)
+
+
+def _landed(head: Head, pos: int) -> str:
+    """``all landed`` only for a replay of the whole flow; else just the ran steps."""
+    whole = head.start == 0 and pos == len(head.template.get("steps") or [])
+    return "all landed" if whole else "each replayed step landed"
+
+
 def text(head: Head, pos: int, why: str) -> str:
     """The whole note for a replay that ran steps ``head.start`` .. *pos* - 1."""
     total = len(head.template.get("steps") or [])
-    base = "auto-replayed flow `%s`: %d of %d steps" % (head.name, pos, total)
+    base = "auto-replayed flow `%s`: %s" % (head.name, _span(head, pos))
     ran = done_lines(head, pos)
     steps = "\nreplayed: " + "; ".join(ran) if ran else ""
     if not why:
-        return "%s, all landed.%s" % (base, steps)
+        return "%s, %s.%s" % (base, _landed(head, pos), steps)
     left = total - pos
     skipped = "\nnot replayed: %d step(s) left (from step %d)." % (left, pos + 1)
     stop = "\n%s. Continue from this screen yourself." % _diverged(head, pos, why)

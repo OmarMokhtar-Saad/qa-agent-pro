@@ -30,10 +30,15 @@ def step_sig(step: dict, before: str) -> list:
     return [before, str(step.get("op") or ""), _target(step)]
 
 
-def signature(steps: list, befores: list) -> str:
-    """Short hash of the ordered step identities (*befores* may be shorter than *steps*)."""
+def identities(steps: list, befores: list) -> list:
+    """The ordered step identities (*befores* may be shorter than *steps*)."""
     padded = list(befores) + [""] * (len(steps) - len(befores))
-    ids = [step_sig(s, str(b or "")) for s, b in zip(steps, padded)]
+    return [step_sig(s, str(b or "")) for s, b in zip(steps, padded)]
+
+
+def signature(steps: list, befores: list) -> str:
+    """Short hash of the ordered step identities."""
+    ids = identities(steps, befores)
     raw = json.dumps(ids, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:SIG_CHARS]
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import time
 
-from tools.mobile import a11y_events
+from tools.mobile import a11y_events, ime_proof
 from tools.mobile.replay.context import Context, _sleep
 from tools.mobile.replay.dump import _dump
 
@@ -45,6 +45,7 @@ async def settled(ctx: Context, screen: object, deadline: float) -> object:
     """*screen*, or the newer one a quiet dump read; a dump error keeps *screen*."""
     before = a11y_events.latest(ctx.serial)
     if before is None:
+        ime_proof.note_once(ctx.serial, "quiet_wait_unavailable")
         return screen
     stop = min(deadline, time.monotonic() + QUIET_CAP_S)
     while time.monotonic() < stop:
