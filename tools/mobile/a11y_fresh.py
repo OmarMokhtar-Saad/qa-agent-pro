@@ -33,6 +33,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import logging
+import re
 from typing import Any, Awaitable, Callable
 
 from tools.mobile import a11y_clock, a11y_reread, adb, dump_reuse, step_timing
@@ -58,6 +59,8 @@ _LAST: dict[str, tuple[int, str]] = {}
 _SUSPENDED: dict[str, str] = {}
 #: serial -> stale verdicts this run.
 _STRIKES: dict[str, int] = {}
+#: serial -> packages of the tree uiautomator contradicted (another screen is not it).
+_PKGS: dict[str, frozenset] = {}
 
 #: Stale verdicts in one run before fast reading stays off for the rest of it.
 #: One is a transition lag (a tree read just before the screen moved); two can be
@@ -74,7 +77,7 @@ Provider = Callable[[str], Awaitable[dict]]
 
 def forget(serial: str) -> None:
     """Drop the remembered tree and the suspension (a fresh enable, a restore)."""
-    for table in (_LAST, _SUSPENDED, _STRIKES):
+    for table in (_LAST, _SUSPENDED, _STRIKES, _PKGS):
         table.pop(str(serial), None)
     a11y_clock.forget(serial)
 
@@ -82,6 +85,17 @@ def forget(serial: str) -> None:
 def _digest(xml: str) -> str:
     """The node digest, or the raw hash when the tree cannot be pruned."""
     return node_digest(xml) or hashlib.sha1(xml.encode("utf-8", "replace")).hexdigest()
+
+
+def _packages(xml: str) -> frozenset:
+    """The ``package`` attribute values of *xml*: which apps own the tree."""
+    return frozenset(re.findall(r'package="([^"]*)"', xml))
+
+
+def _other_screen(serial: str, xml: str) -> bool:
+    """True when *xml* belongs to other packages than the tree judged stale."""
+    now, was = _packages(xml), _PKGS.get(serial)
+    return bool(now and was and now != was)
 
 
 def _repeats(serial: str, digest: str, started_under: int) -> bool:
@@ -114,6 +128,7 @@ async def _judge(serial: str, xml: str) -> dict | None:
         return {"error": UNCHECKED_REFUSAL, "content": None}
     if compare(xml, str(slow.get("content") or "")).get("error"):
         a11y_reread.keep(serial, under, slow)
+        _PKGS[serial] = _packages(xml)
         return _stale(serial, _digest(xml))
     step_timing.note(CONFIRMED_NOTE)
     return None
@@ -124,7 +139,7 @@ async def _resume(serial: str, xml: str) -> dict | None:
     if _digest(xml) == _SUSPENDED[serial]:
         step_timing.note(SUSPENDED_NOTE)
         return {"error": SUSPENDED_REFUSAL, "content": None}
-    refused = await _judge(serial, xml)
+    refused = None if _other_screen(serial, xml) else await _judge(serial, xml)
     if refused is None:
         _SUSPENDED.pop(serial, None)
     return refused

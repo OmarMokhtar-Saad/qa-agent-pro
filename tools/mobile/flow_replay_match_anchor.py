@@ -45,6 +45,15 @@ def _known(template: dict, keys: tuple) -> bool:
     return bool(own & set(keys))
 
 
+def target_unique(step: dict, screen: Any) -> bool:
+    """Whether *screen* shows exactly one element that *step* aims at."""
+    elements = screen.get("elements") if isinstance(screen, dict) else None
+    wanted = _wanted(step)
+    if not elements or not wanted:
+        return False
+    return sum(_is(e, wanted) for e in elements if isinstance(e, dict)) == 1
+
+
 def fits(template: dict, keys: Any, at: int) -> bool:
     """Whether step *at* may start on the live screen carried by *keys*."""
     screen = getattr(keys, "screen", None)

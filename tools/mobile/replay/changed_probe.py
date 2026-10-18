@@ -92,7 +92,7 @@ async def _on_move(ctx: Context, plan: Plan, now: object) -> tuple:
 async def probed_changed(ctx: Context, screen: object, plan: Plan) -> tuple:
     """``(screen, changed, reusable)`` like ``_wait_until_changed``, probe-driven."""
     before, base = _screen_hash(screen), plan.base
-    until = plan.deadline - dump_latency.p90_ms(ctx.serial) / 1000.0
+    until = plan.deadline - (dump_latency.p90_ms(ctx.serial) or 0) / 1000.0
     current, fresh = screen, False
     while time.monotonic() < until and (moved := await wait_moved(ctx, base, until)):
         got, outcome = await _on_move(ctx, Plan(base, plan.deadline), moved)

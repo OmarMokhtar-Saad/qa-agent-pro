@@ -20,6 +20,7 @@ from tools.mobile.replay.context_consts import (
 )
 from tools.mobile.replay.probe_gate import PROBE_BUDGET_S
 from tools.mobile.replay.screen import _screen_hash
+from tools.mobile.replay.waits_idle_clock import clock_idle
 from tools.mobile.replay.waits_poll import _read_now, _wait_deadline
 
 IDLE_FRAMES = 2
@@ -72,7 +73,11 @@ async def _timed_out_read(ctx: Context, screen: object) -> tuple:
 
 
 async def probe_idle(ctx: Context, screen: object, ms: int) -> tuple | None:
-    """``(idle, screen, timed_out)`` from probe frames, or ``None`` to fall back."""
+    """``(idle, screen, timed_out)`` from the event clock, else probe frames, or
+    ``None`` to fall back to dumps."""
+    clocked = await clock_idle(ctx, screen, ms)
+    if clocked is not None:
+        return clocked
     deadline = _wait_deadline(ctx, (ms / 1000.0) if ms else DEFAULT_WAIT_UNTIL_TEXT_S)
     first, trusted = await _first(ctx, screen)
     if first is None:

@@ -13,6 +13,7 @@ from typing import Any, NamedTuple
 
 from tools.mobile import (
     actions,
+    flow_replay_anchor,
     flow_replay_batch,
     flow_replay_dialog,
     flow_replay_match,
@@ -95,7 +96,7 @@ async def _land(ctx: Any, screen: Any, wants: tuple) -> tuple:
     return _at(ctx, latest, wants), latest
 
 
-async def _run_batch(ctx: Any, ref: media.ClipRef, steps: list) -> dict:
+async def run_batch(ctx: Any, ref: media.ClipRef, steps: list) -> dict:
     """The replay content of *steps* as one script on one clip; ``{}`` if it cannot run."""
     parsed = actions.parse_script({"actions": steps}, max_actions=actions.MAX_ACTIONS)
     if parsed.get("error"):
@@ -167,13 +168,7 @@ def _idle(plan: Plan, walk: Walk, batch: flow_replay_batch.Batch) -> Walk:
     return walk._replace(pos=batch.end, why=MISSING_INPUT + " `%s`" % name)
 
 
-def _failed_at(content: dict, batch: flow_replay_batch.Batch) -> int:
-    """The flow position of the step the batch stopped on, by its script index:
-    entries the replay inserts (a dialog tap, a screen check) never shift it."""
-    trace = [e for e in content.get("trace") or [] if isinstance(e, dict)]
-    marks = [e["index"] for e in trace if isinstance(e.get("index"), int)]
-    at = marks[-1] if marks else len(trace) - 1
-    return batch.origin[min(max(at, 0), len(batch.origin) - 1)]
+_failed_at = flow_replay_batch.failed_at
 
 
 async def _batch(ctx: Any, plan: Plan, walk: Walk) -> Walk:
@@ -182,12 +177,12 @@ async def _batch(ctx: Any, plan: Plan, walk: Walk) -> Walk:
     if not batch.steps:
         return _idle(plan, walk, batch)
     with flow_replay_batch.armed(ctx, _gate(ctx, plan, batch), walk.screen):
-        content = await _run_batch(ctx, plan.ref, batch.steps)
+        content = await run_batch(ctx, plan.ref, batch.steps)
     trace = walk.trace + list(content.get("trace") or [])
     screen = content.get("screen") or walk.screen
     if not _ok(content):
         why = flow_replay_stop.failed_why(content)
-        return Walk(screen, _failed_at(content, batch), trace, why)
+        return Walk(screen, flow_replay_batch.failed_at(content, batch), trace, why)
     return await _finish(ctx, plan, Walk(screen, batch.origin[-1] + 1, trace))
 
 
@@ -196,4 +191,6 @@ async def run(ctx: Any, plan: Plan, walk: Walk) -> Walk:
     total = len(plan.template.get("steps") or [])
     while walk.pos < total and not walk.why:
         walk = await _batch(ctx, plan, walk)
+        at = flow_replay_anchor.skip_to(plan.template, walk.pos, walk.screen)
+        walk = walk._replace(pos=at) if not walk.why else walk
     return walk

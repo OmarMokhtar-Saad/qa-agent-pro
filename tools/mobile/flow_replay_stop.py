@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from tools.mobile import flow_replay_anchor
+from tools.mobile.replay.screen_has import _screen_has
 from tools.mobile.replay.settle_cut import Cut, CutView, _cut_detail, _cut_of
 
 #: Start of the stop reason when the step took the foreground away from the app.
@@ -58,14 +60,22 @@ def _inert(template: dict, at: int) -> bool:
     return not last or last == key
 
 
-def inert_tail(template: dict, pos: int) -> bool:
-    """True when every step from *pos* is optional and leaves the screen as it was."""
+def _idle_step(step: dict, screen: Any) -> bool:
+    """An optional step, or an anchor wait whose text the live *screen* already shows."""
+    if step.get("op") in OPTIONAL_OPS:
+        return True
+    return flow_replay_anchor.is_anchor(step) and _screen_has(screen, step["text"])
+
+
+def inert_tail(template: dict, pos: int, screen: Any = None) -> bool:
+    """True when every step from *pos* is optional and leaves the screen as it was.
+
+    With the live *screen*, an anchor wait for text it already shows counts as optional."""
     steps = (template.get("steps") or [])[pos:]
     if not steps:
         return False
     return all(
-        s.get("op") in OPTIONAL_OPS and _inert(template, pos + i)
-        for i, s in enumerate(steps)
+        _idle_step(s, screen) and _inert(template, pos + i) for i, s in enumerate(steps)
     )
 
 

@@ -100,9 +100,6 @@ class _ReplayState:
     screen: dict | None
     deadline: float
     baseline_texts: set | None = None
-    # ``(step index, screen hash)`` of the last optional tap that read the
-    # screen and found it unchanged: the next step may rely on that.
-    settled: tuple = ()
 
 
 def _append(trace: list[dict], entry: dict) -> None:

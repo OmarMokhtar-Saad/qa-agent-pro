@@ -87,7 +87,7 @@ class Gate:
         dump then re-anchor. ``"unsure"``: a quiet poll that cannot vouch for the
         screen in hand; dump, then re-anchor. ``"drop"``: the window is spent;
         dump now and stop gating, so that dump is the confirming read."""
-        until = deadline - dump_latency.p90_ms(self.ctx.serial) / 1000.0
+        until = deadline - (dump_latency.p90_ms(self.ctx.serial) or 0) / 1000.0
         if time.monotonic() >= until:
             return "drop"
         trusted = self._trusts(current)

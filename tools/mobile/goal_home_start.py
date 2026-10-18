@@ -43,8 +43,44 @@ def goal_starts_at_home(goal: str) -> bool:
     return False
 
 
+_PRONOUN_CHECK = re.compile(
+    r"^\W*(?:verify|confirm|check|ensure|make sure)\s+(?:that\s+)?(?:it|this|that)\b",
+    re.IGNORECASE,
+)
+_ACTION = re.compile(
+    r"app\s*tester|install|update|download|launch|\bopen", re.IGNORECASE
+)
+
+
+def _check_clauses(sentence: str) -> list[str]:
+    """Clauses that check the home screen: one naming it with a verify word, or
+    "verify it ..." right after a clause naming it (the pronoun is the home screen)."""
+    parts = _CLAUSE.split(sentence)
+    return [
+        c
+        for i, c in enumerate(parts)
+        if (_HOME.search(c) and _VERIFY.search(c))
+        or (i and _HOME.search(parts[i - 1]) and _PRONOUN_CHECK.search(c))
+    ]
+
+
+def _first_check(goal: str) -> str:
+    """The first clause of *goal* that checks the home screen, or ``""``."""
+    for part in _home_sentences(goal):
+        found = _check_clauses(part)
+        if found:
+            return found[0]
+    return ""
+
+
 def goal_checks_home(goal: str) -> bool:
     """True when the goal asks to confirm, verify or see the home screen."""
-    return any(
-        _VERIFY.search(c) for part in _home_sentences(goal) for c in _home_clauses(part)
-    )
+    return bool(_first_check(goal))
+
+
+def home_check_is_preflight(goal: str) -> bool:
+    """True when the home check comes before any install, App Tester, launch or
+    open clause of the goal, so the server can do it itself before those steps."""
+    clause = _first_check(goal)
+    at = str(goal).find(clause) if clause else -1
+    return at >= 0 and not _ACTION.search(str(goal)[:at])

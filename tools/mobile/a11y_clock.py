@@ -12,8 +12,8 @@ The skip is allowed only when all of these hold, because a deaf service (the
 
 * this serial's count already advanced across an earlier screen change, which proves
   the service hears events at all (``proven``);
-* at most :data:`MAX_SKIPS` repeats in a row are taken on the clock; the next one
-  runs the uiautomator confirm again;
+* at most :data:`MAX_SKIPS` repeats in a row are taken on the clock, and as many
+  on heard events; the next one runs the uiautomator confirm again;
 * the clock is that of the dump just taken. A reply without a clock (qa-ime older
   than 1.2.1) clears the state, so those runs keep the uiautomator confirm.
 
@@ -32,6 +32,10 @@ from tools.mobile import a11y_events, step_timing
 MAX_SKIPS = 2
 #: The ledger note for a repeat the clock confirmed.
 BY_CLOCK_NOTE = "a11y_repeat_by_clock"
+#: The ledger note for a repeat proven by events heard after the action.
+BY_EVENT_NOTE = "a11y_repeat_by_event"
+#: Device ms with no event after which a service that heard the action has rested.
+EVENT_QUIET_MS = 200
 
 Confirm = Callable[[], Awaitable["dict | None"]]
 
@@ -42,6 +46,8 @@ class _Seen:
     count: int
     proven: bool
     skips: int = 0
+    #: Repeats taken on heard events; ``served`` never resets it, only a confirm.
+    heard: int = 0
 
 
 _SEEN: dict[str, _Seen] = {}
@@ -59,16 +65,35 @@ def _unchanged(serial: str, digest: str) -> bool:
     return seen.proven and seen.skips < MAX_SKIPS and clock.count == seen.count
 
 
+def _heard_after(serial: str, digest: str) -> bool:
+    """True when a proven service heard events since the tree was served, then rested.
+
+    The action reached the service (events newer than the last served tree
+    arrived) and the screen went quiet, so the repeat is the settled screen,
+    not a deaf service replaying an old frame.
+    """
+    seen, clock = _SEEN.get(serial), a11y_events.latest(serial)
+    if seen is None or clock is None or seen.digest != digest or not seen.proven:
+        return False
+    if seen.heard >= MAX_SKIPS:
+        return False
+    return clock.count > seen.count and clock.quiet_ms() >= EVENT_QUIET_MS
+
+
 async def judged(serial: str, digest: str, confirm: Confirm) -> "dict | None":
     """``None`` when the clock proves the repeat, else the result of *confirm*."""
     if _unchanged(serial, digest):
         _SEEN[serial].skips += 1
         step_timing.note(BY_CLOCK_NOTE)
         return None
+    if _heard_after(serial, digest):
+        _SEEN[serial].heard += 1
+        step_timing.note(BY_EVENT_NOTE)
+        return None
     refused = await confirm()
     seen = _SEEN.get(serial)
     if refused is None and seen is not None:
-        seen.skips = 0
+        seen.skips = seen.heard = 0
     return refused
 
 

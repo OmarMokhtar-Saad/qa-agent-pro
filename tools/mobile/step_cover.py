@@ -14,7 +14,8 @@ import time
 #: Spans kept per step; past it the oldest are dropped (a step has a handful).
 MAX_SPANS = 400
 
-#: Ledger rows kept before the closing row is appended (matches the ledger cap).
+#: Ledger rows kept before the closing row is appended; step_ledger folds older
+#: rows by reason+caller so its list never exceeds this.
 KEEP_ROWS = 39
 
 #: Ledger reason for the wall time no span covers.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from tools.mobile import dump_latency, latency_scale, watch
+from tools.mobile import a11y_events, dump_latency, latency_scale, watch
 from tools.mobile.replay.context import Context, _sleep
 from tools.mobile.replay.context_consts import (
     DEFAULT_WAIT_UNTIL_TEXT_S,
@@ -59,11 +59,13 @@ async def _next_read(ctx: Context, current: object, pace: Pace) -> tuple:
     return final, content, time.monotonic() - started
 
 
-def _pause_after(took: float, quiet: int = 0) -> float:
+def _pause_after(took: float, quiet: int = 0, clocked: bool = False) -> float:
     """The pause before the next read: a dump that already took a poll interval
     or longer is itself the pause, so none is added. After *quiet* unchanged
-    reads the interval doubles each time, up to ``WAIT_POLL_MAX_S``."""
-    interval = min(WAIT_POLL_S * (2 ** max(0, quiet)), WAIT_POLL_MAX_S)
+    reads the interval doubles each time, up to ``WAIT_POLL_MAX_S``; with an
+    event clock reads are cheap and it stays at ``WAIT_POLL_S``."""
+    cap = WAIT_POLL_S if clocked else WAIT_POLL_MAX_S
+    interval = min(WAIT_POLL_S * (2 ** max(0, quiet)), cap)
     return 0.0 if took >= interval else interval
 
 
@@ -74,7 +76,11 @@ async def _poll(ctx: Context, current: object, poll: Poll) -> tuple:
     verdict = await gate.verdict(current, deadline) if gate else ""
     if verdict == "calm":
         return None, current, took, verdict
-    pause = 0.0 if verdict else _pause_after(took, quiet)
+    pause = (
+        0.0
+        if verdict
+        else _pause_after(took, quiet, a11y_events.latest(ctx.serial) is not None)
+    )
     final, content, took = await _next_read(ctx, current, Pace(deadline, pause))
     return final, content, took, verdict
 

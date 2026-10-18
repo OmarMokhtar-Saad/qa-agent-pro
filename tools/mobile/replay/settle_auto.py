@@ -77,7 +77,7 @@ class Settled(NamedTuple):
 async def _auto_settle_seen(ctx: Context, screen: Any, before_hash: str) -> Settled:
     """:func:`_auto_settle`, also saying whether the frame moved or the read failed."""
     deadline = _settle_deadline(ctx)
-    until = deadline - dump_latency.p90_ms(ctx.serial) / 1000.0
+    until = deadline - (dump_latency.p90_ms(ctx.serial) or 0) / 1000.0
     moved = await _frame_moved(ctx, screen, (deadline, until))
     if moved is None:
         return Settled(screen, False, False)

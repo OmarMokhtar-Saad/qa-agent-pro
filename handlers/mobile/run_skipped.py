@@ -8,6 +8,17 @@ from tools.untrusted import single_line
 _SKIPPED: dict[str, tuple[str, str]] = {}
 _TESTER: dict[str, tuple[str, bool]] = {}
 _LAUNCH: dict[str, str] = {}
+_HOME: dict[str, str] = {}
+
+
+def mark_home_checked(serial: str, seen: str) -> None:
+    """Record the server's own home-screen check (what it saw) for the reply."""
+    _HOME[serial] = seen
+
+
+def home_checked(serial: str) -> bool:
+    """Whether the server already checked the home screen in this start."""
+    return serial in _HOME
 
 
 def mark_skipped(serial: str, target: str, asked: str) -> None:
@@ -32,13 +43,13 @@ def mark_launch(serial: str, state: str) -> None:
 
 def forget_run(serial: str) -> None:
     """Drop the per-start marks of *serial* before a new app stage."""
-    for marks in (_SKIPPED, _TESTER, _LAUNCH):
+    for marks in (_SKIPPED, _TESTER, _LAUNCH, _HOME):
         marks.pop(serial, None)
 
 
 def reset() -> None:
     """Forget every mark (tests)."""
-    for marks in (_SKIPPED, _TESTER, _LAUNCH):
+    for marks in (_SKIPPED, _TESTER, _LAUNCH, _HOME):
         marks.clear()
 
 
@@ -63,6 +74,18 @@ async def _tester_note(serial: str, launched: bool) -> str:
     )
 
 
+def _home_note(serial: str) -> str:
+    """The briefing line for the home-screen check the server did first."""
+    seen = _HOME.pop(serial, "")
+    if not seen:
+        return ""
+    return (
+        "> Home screen check done by this server before the app steps: "
+        + single_line(seen, 200)
+        + ". Cite this for the goal's home-screen check; do not press Home again.\n\n"
+    )
+
+
 _NOT_LAUNCHED = {
     "home": "the goal starts from the home screen and no install step ran",
     "off": "launch=false was passed",
@@ -74,9 +97,9 @@ def _launch_note(state: str) -> str:
     still show the home screen the goal asked to confirm."""
     if state == "launched+check":
         return (
-            "> The goal asks to confirm the home screen. The app was launched first, "
-            'so the first packet shows the app: send {"op": "home"} first and '
-            "confirm the home screen in that result before the next step.\n\n"
+            "> The goal asks to confirm the home screen AFTER the app step. Send "
+            '{"op": "home"} and confirm the home screen in that result; Home closes '
+            'the app, so a {"op": "launch"} must follow and the reopen is expected.\n\n'
         )
     if state in _NOT_LAUNCHED:
         return (
@@ -92,13 +115,14 @@ def _launch_note(state: str) -> str:
 async def take_note(serial: str) -> str:
     """Markdown for the install steps done or skipped on *serial* (once), or ``""``."""
     state = _LAUNCH.pop(serial, "launched")
-    tester = await _tester_note(serial, state.startswith("launched"))
+    home = _home_note(serial)
+    tester = home + await _tester_note(serial, state.startswith("launched"))
     target, asked = _SKIPPED.pop(serial, ("", ""))
     if not target:
         return tester + _launch_note(state)
     version = await imes_upgrade.installed_version(serial, target)
     have = "already installed" + (" v" + version if version else "")
-    return (
+    return home + (
         "> Skipped: install of `"
         + single_line(target)
         + "` (source `"

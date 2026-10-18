@@ -30,6 +30,11 @@ async def _mobile_launch_target(serial: str, target: str) -> None:
         await mobile_adb.launch(serial, target)
 
 
+def _check_after(goal: str, serial: str) -> bool:
+    """Whether the goal checks home and the server has not already done it."""
+    return goal_checks_home(goal) and not run_skipped.home_checked(serial)
+
+
 async def _launch_for_start(req: _MobileTestRequest, serial: str, target: str) -> None:
     """Launch the app unless ``launch=false`` or, with no install stage having
     run, the goal itself starts from the home screen; note which in the reply."""
@@ -41,7 +46,7 @@ async def _launch_for_start(req: _MobileTestRequest, serial: str, target: str) -
     launch = req.launch and not home
     state = "home" if home else "off"
     if launch:
-        state = "launched+check" if goal_checks_home(req.goal) else "launched"
+        state = "launched+check" if _check_after(req.goal, serial) else "launched"
     run_skipped.mark_launch(serial, state)
     await _mobile_launch_target(serial, target if launch else "")
 

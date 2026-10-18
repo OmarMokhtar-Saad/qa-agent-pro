@@ -27,6 +27,7 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from config.settings_guard import never_raise
+from tools import mcp_arg_tolerance
 from tools import mcp_rejection_hint as rejection_hint
 
 try:
@@ -137,6 +138,7 @@ def build_middleware():
 
     class _RejectionLog(Middleware):
         async def on_call_tool(self, context, call_next):
+            await mcp_arg_tolerance.tolerate(context)
             with never_raise() as g:
                 return await call_next(context)
             assert g.exc is not None

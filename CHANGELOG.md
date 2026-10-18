@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.133.0] - 2026-10-18
+## [1.134.0] - 2026-10-18
 
 ### Added
 
@@ -117,6 +117,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
   second), so they use less device time.
 - When the fast screen reader is found stale, the slow screen read that
   proved it is reused, so the screen is read once instead of twice.
+- A goal that checks the home screen before installing or opening the
+  app gets that check done by the server first, so the app is no longer
+  closed and opened again; a check after the launch says a launch follows.
+- A stray goal_reached argument on a tool call is ignored, not rejected.
+- A replayed route stops its optional popup steps once its next screen
+  is reached, and does not chain routes that repeat the same popups.
+- Missing optional taps share one calm-screen proof instead of waiting
+  about a second each; any new screen event ends that proof.
+- Waiting for an idle screen uses the fast reader's event clock or two
+  equal screen reads instead of three screenshots.
+- A slow screen read that proved the fast reader stale stays valid until
+  the next action, not two seconds.
+- The start check waits for the screen to go quiet before a slow screen
+  read, and slow reads no longer stretch later wait deadlines.
+- The step time table folds older rows and names replay time.
 
 ### Known
 

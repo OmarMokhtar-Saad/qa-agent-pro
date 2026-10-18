@@ -24,6 +24,7 @@ from tools.mobile import (
     held_inputs,
     media,
     session_explore_ids,
+    step_timing,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,7 +98,11 @@ def _next(auto: Auto, ctx: Any) -> tuple:
     key = flow_replay_match.live_keys(auto.screen, ctx)
     got = _resume(auto.body, key, str(getattr(ctx, "package", "") or ""))
     name, template, pos = got
-    if template and auto.ran and flow_replay_stop.inert_tail(template, pos):
+    if (
+        template
+        and auto.ran
+        and flow_replay_stop.inert_tail(template, pos, auto.screen)
+    ):
         flow_replay_stop.chain_done(auto.body, name, pos)
         return name, {}, pos
     return got
@@ -111,8 +116,9 @@ async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
     case = session_explore_ids.explore_turn_case_id(auto.body)
     ref = media.ClipRef(run_id, case, str(getattr(ctx, "serial", "") or ""))
     plan = flow_replay_run.Plan(template, _inputs(run_id, ctx), ref)
-    walk = await flow_replay_run.run(
-        ctx, plan, flow_replay_run.Walk(auto.screen, pos, [])
+    walk = await step_timing.timed(
+        "replay",
+        flow_replay_run.run(ctx, plan, flow_replay_run.Walk(auto.screen, pos, [])),
     )
     live = flow_replay_match.live_key(auto.screen, ctx)
     _record(auto.body, flow_replay_note.Head(name, template, pos, live), walk)

@@ -11,7 +11,7 @@ screen that did not move is final, so a real mismatch still turns the reader off
 
 from __future__ import annotations
 
-from tools.mobile import a11y_dump
+from tools.mobile import a11y_dump, a11y_quiet
 from tools.mobile.a11y_parity import compare, node_digest
 from tools.mobile.replay import dump as replay_dump
 
@@ -24,6 +24,7 @@ async def fast_read(serial: str) -> dict:
 
 
 async def slow_read(serial: str) -> dict:
+    await a11y_quiet.wait_quiet(serial)
     return await replay_dump.dump_raw(serial, use_provider=False)
 
 

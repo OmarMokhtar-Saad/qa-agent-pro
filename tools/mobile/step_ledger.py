@@ -9,7 +9,7 @@ nothing here awaits or raises.
 
 from __future__ import annotations
 
-from tools.mobile import step_site
+from tools.mobile import step_fold, step_site
 
 #: Distinct mark names kept per step.
 MAX_MARKS = 20
@@ -41,6 +41,14 @@ def _push(items: list, value: object, cap: int) -> None:
     del items[:-cap]
 
 
+def _push_row(state: dict, row: dict) -> None:
+    """Add a ledger row; past the cap the oldest fold into per-reason sums."""
+    rows = state.setdefault("ledger", [])
+    rows.append(row)
+    if len(rows) >= MAX_LEDGER_ROWS:  # leave room for step_cover's closing row
+        state["ledger"] = step_fold.fold(rows, MAX_LEDGER_ROWS - 1)
+
+
 def _with_caller(row: dict) -> dict:
     """*row* plus the optional ``caller`` key naming the asking code site."""
     site = step_site.caller()
@@ -52,7 +60,7 @@ def on_phase(state: dict, name: str, ms: int) -> None:
     _push(state.setdefault("trace", []), name, MAX_TRACE_NAMES)
     reason = "dump" if name == "ui_dump" else name
     row = _with_caller({"reason": reason, "ms": int(ms), "skipped": False})
-    _push(state.setdefault("ledger", []), row, MAX_LEDGER_ROWS)
+    _push_row(state, row)
 
 
 def on_mark(state: dict, name: str) -> None:
@@ -60,14 +68,14 @@ def on_mark(state: dict, name: str) -> None:
     _push(state.setdefault("trace", []), name, MAX_TRACE_NAMES)
     if name in _DUMP_EVENTS:
         row = _with_caller({"reason": name, "ms": 0, "skipped": name in SKIPS})
-        _push(state.setdefault("ledger", []), row, MAX_LEDGER_ROWS)
+        _push_row(state, row)
 
 
 def on_note(state: dict, reason: str, ms: int) -> None:
     """A non-dump fact (probe cost, why a probe skip did not fire): ledger it."""
     _push(state.setdefault("trace", []), reason, MAX_TRACE_NAMES)
     row = _with_caller({"reason": reason, "ms": int(ms), "skipped": False})
-    _push(state.setdefault("ledger", []), row, MAX_LEDGER_ROWS)
+    _push_row(state, row)
 
 
 def _clean_row(item: dict) -> dict:
@@ -78,6 +86,8 @@ def _clean_row(item: dict) -> dict:
     }
     if item.get("caller"):
         row["caller"] = str(item["caller"])[:40]
+    if int(item.get("n") or 0) > 1:
+        row["n"] = int(item["n"])
     return row
 
 

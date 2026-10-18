@@ -23,6 +23,13 @@ _SAMPLES: collections.OrderedDict = collections.OrderedDict()
 _BY_SOURCE: dict = {}
 _LAST_SOURCE: dict = {}
 _INFLIGHT: dict = {}
+#: Dumps of the slow uiautomator fallback (it waits for 1 s of no events, up to
+#: 10 s): kept out of the all-source p90 so one cannot stretch every deadline.
+_UIA: dict = {}
+_SLOW: set = set()
+#: Slow samples needed before they stand in for an empty all-source p90.
+UIA_MIN_SAMPLES = 3
+_SLOW_SOURCE = "uiautomator-dump"
 _WARNED: collections.OrderedDict = collections.OrderedDict()
 
 
@@ -58,22 +65,47 @@ def take_aside(serial: str) -> float:
     return _ASIDE.pop(str(serial or ""), 0.0)
 
 
-def _record(serial: str, seconds: float, source: str = "") -> None:
-    key = str(serial or "")
-    samples = _SAMPLES.pop(key, None)
+def mark_slow(serial: str, real: bool = True) -> None:
+    """The dump now running is a real uiautomator run (*real*): its sample is
+    not an "any" one. A confirm read (``use_provider=False``) passes False."""
+    if real:
+        _SLOW.add(str(serial or ""))
+
+
+def _bucket(key: str, source: str) -> collections.deque:
+    """The deque this sample counts in: slow ones apart from the all-source p90."""
+    slow = key in _SLOW or source == _SLOW_SOURCE
+    _SLOW.discard(key)
+    table = _UIA if slow else _SAMPLES
+    samples = table.pop(key, None)
     if samples is None:
         samples = collections.deque(maxlen=SAMPLE_COUNT)
+    table[key] = samples
+    return samples
+
+
+def _record(serial: str, seconds: float, source: str = "") -> None:
+    key = str(serial or "")
+    samples = _bucket(key, source)
     samples.append(max(0.0, float(seconds)))
-    _SAMPLES[key] = samples
     sources = _BY_SOURCE.setdefault(key, {})
     if source in sources or len(sources) < MAX_SOURCES:
         _append(sources, source, samples[-1])
         if source:  # a failed dump names none; keep the last real one
             _LAST_SOURCE[key] = source
-    while len(_SAMPLES) > MAX_SERIALS:
-        old, _gone = _SAMPLES.popitem(last=False)
-        _BY_SOURCE.pop(old, None)
-        _LAST_SOURCE.pop(old, None)
+    _evict(_SAMPLES)
+    _evict(_UIA)  # a serial with only slow samples must age out too
+
+
+def _evict(table: dict) -> None:
+    """Drop the least recently sampled serials of *table* past MAX_SERIALS;
+    their source notes go once neither table holds them."""
+    while len(table) > MAX_SERIALS:
+        old = next(iter(table))
+        table.pop(old)
+        if old not in _SAMPLES and old not in _UIA:
+            _BY_SOURCE.pop(old, None)
+            _LAST_SOURCE.pop(old, None)
 
 
 def _p90(samples: collections.abc.Iterable[float]) -> int | None:
@@ -96,7 +128,8 @@ def p90_ms(serial: str, source: str | None = None) -> int | None:
     """
     key = str(serial or "")
     if source is None:
-        return _p90(_SAMPLES.get(key) or ())
+        slow = _UIA.get(key) or ()
+        return _p90(_SAMPLES.get(key) or (slow if len(slow) >= UIA_MIN_SAMPLES else ()))
     return _p90(_BY_SOURCE.get(key, {}).get(source) or ())
 
 
@@ -135,6 +168,8 @@ def reset() -> None:
             pass
     _INFLIGHT.clear()
     _SAMPLES.clear()
+    _UIA.clear()
+    _SLOW.clear()
     _BY_SOURCE.clear()
     _LAST_SOURCE.clear()
     _WARNED.clear()

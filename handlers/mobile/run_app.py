@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tools.mobile.session_device as session_device
 from handlers import _common
-from handlers.mobile import run_skipped
+from handlers.mobile import run_home, run_skipped
 from handlers.mobile.run_app_tester import installed_tester
 from handlers.mobile.run_install import (
     _app_stage_not_installed,
@@ -174,6 +174,7 @@ async def _mobile_app_stage(call: _AppCall) -> tuple:
     """Get the app under test onto the device. ``(markdown_or_empty, package)``."""
 
     run_skipped.forget_run(call.serial)
+    await run_home.check_first(call.serial, call.goal)
     label = str(call.source or "").strip()
     install_source = mobile_render.install_source_for_label(label)
     target = call.typed_package

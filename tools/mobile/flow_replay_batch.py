@@ -11,7 +11,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, NamedTuple
 
-from tools.mobile import flow_nochange, flow_replay_inputs, flow_replay_match
+from tools.mobile import (
+    flow_nochange,
+    flow_replay_anchor,
+    flow_replay_inputs,
+    flow_replay_match,
+)
 
 
 class Batch(NamedTuple):
@@ -23,7 +28,10 @@ class Batch(NamedTuple):
 
 
 def build(template: dict, inputs: dict, pos: int) -> Batch:
-    """Steps from *pos* up to the first one missing a tester input (no-change steps drop)."""
+    """Steps from *pos* up to the first one missing a tester input (no-change steps drop).
+
+    A batch also ends after an anchor wait that optional steps follow, so the replay
+    can see whether those steps are still needed (see ``flow_replay_anchor``)."""
     steps: list = []
     origin: list = []
     flow = template["steps"]
@@ -31,13 +39,28 @@ def build(template: dict, inputs: dict, pos: int) -> Batch:
     at = pos
     while at < len(flow):
         if not flow_nochange.skip_at(template, at):
-            name = flow_replay_match.needed(flow[at])
-            if name and name not in inputs:
+            if _missing(flow[at], inputs):
                 break
             steps.append(flow_replay_match.fill(flow[at], inputs))
             origin.append(at)
+            if flow_replay_anchor.ends_batch(flow, at):
+                return Batch(steps, origin, at + 1)
         at += 1
     return Batch(steps, origin, at)
+
+
+def _missing(step: dict, inputs: dict) -> bool:
+    name = flow_replay_match.needed(step)
+    return bool(name) and name not in inputs
+
+
+def failed_at(content: dict, batch: Batch) -> int:
+    """The flow position of the step the batch stopped on, by its script index:
+    entries the replay inserts (a dialog tap, a screen check) never shift it."""
+    trace = [e for e in content.get("trace") or [] if isinstance(e, dict)]
+    marks = [e["index"] for e in trace if isinstance(e.get("index"), int)]
+    at = marks[-1] if marks else len(trace) - 1
+    return batch.origin[min(max(at, 0), len(batch.origin) - 1)]
 
 
 def wanted(template: dict, pos: int) -> str:
