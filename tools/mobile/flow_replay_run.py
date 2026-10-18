@@ -16,6 +16,7 @@ from tools.mobile import (
     flow_replay_anchor,
     flow_replay_batch,
     flow_replay_dialog,
+    flow_replay_lead,
     flow_replay_match,
     flow_replay_record,
     flow_replay_stop,
@@ -30,10 +31,8 @@ logger = logging.getLogger(__name__)
 
 #: Longest the server waits for a step's recorded screen to appear.
 LANDING_WAIT_MS = 6000
-
 #: Start of the stop reason when a step needs a tester input not yet given.
 MISSING_INPUT = "the tester has not supplied"
-
 #: The stop reason when the live screen is not the one a step was saved from.
 WRONG_SCREEN = "the screen is not the one this step was saved from"
 
@@ -176,6 +175,7 @@ _failed_at = flow_replay_batch.failed_at
 async def _batch(ctx: Any, plan: Plan, walk: Walk) -> Walk:
     """Run every step from ``walk.pos`` that can run, as one script."""
     batch = flow_replay_batch.build(plan.template, plan.inputs, walk.pos)
+    batch = batch._replace(steps=flow_replay_lead.cap(batch.steps, walk.screen))
     if not batch.steps:
         return _idle(plan, walk, batch)
     gate = _gate(ctx, plan, batch)

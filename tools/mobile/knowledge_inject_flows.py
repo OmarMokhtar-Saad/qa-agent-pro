@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tools.mobile import knowledge_inject, kstg_flow_packets
+from tools.mobile import flow_goal_fit, knowledge_inject, kstg_flow_packets
 
 _PRIO = 1
 
@@ -58,25 +58,34 @@ def _item(base: str, rows: list) -> dict:
     }
 
 
-def _rank(got: list) -> tuple:
-    """Best-first order of one packet group: reached, replay score, longest route."""
+def _rank(got: list, goal: str = "") -> tuple:
+    """Best-first order of one packet group: reached, good replays, goal fit, score, route.
+
+    Proven beats untried; the goal fit only breaks a tie between equally proven routes."""
     first = got[0]
     return (
         bool(first.get("reached")),
         int(first.get("ok") or 0),
+        flow_goal_fit.fit(goal, first.get("goal")),
         float(first.get("score") or 0),
         sum(int(r.get("steps") or 0) for r in got),
     )
 
 
-def _best_per_goal(groups: dict) -> dict:
+def _best_per_goal(groups: dict, run: str = "") -> dict:
     """Keep one group per route shape (else per goal; a legacy flow is its own)."""
     best: dict = {}
     for base, got in groups.items():
-        goal = str(got[0].get("shape") or got[0].get("goal") or "") or "base:" + base
-        if goal not in best or _rank(got) > _rank(best[goal][1]):
-            best[goal] = (base, got)
+        shape = str(got[0].get("shape") or got[0].get("goal") or "") or "base:" + base
+        if shape not in best or _rank(got, run) > _rank(best[shape][1], run):
+            best[shape] = (base, got)
     return dict(best.values())
+
+
+def _offerable(snap: dict) -> list:
+    """Saved flows worth offering: named, not inert (no required step), not dead (0 ok)."""
+    rows = [r for r in snap.get("flows") or [] if isinstance(r, dict) and r.get("name")]
+    return [r for r in rows if not r.get("inert") and not r.get("dead")]
 
 
 def _why(got: list) -> str:
@@ -93,11 +102,11 @@ def flows(snap: dict, key) -> list:
     """ONE item: the best saved flow (packets grouped), said why; stable block only."""
     if key is not None:
         return []
-    rows = [r for r in snap.get("flows") or [] if isinstance(r, dict) and r.get("name")]
-    best = _best_per_goal(_groups(rows))
+    run = str(snap.get("run_goal") or "")
+    best = _best_per_goal(_groups(_offerable(snap)), run)
     if not best:
         return []
-    base, got = max(best.items(), key=lambda kv: _rank(kv[1]))
+    base, got = max(best.items(), key=lambda kv: _rank(kv[1], run))
     item = _item(base, got)
     return [dict(item, text=item["text"] + _why(got))]
 

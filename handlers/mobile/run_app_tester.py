@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+
 from handlers import _common
 from handlers.mobile import run_skipped
 from handlers.mobile.run_request import _AppCall, _mobile_ask
 from tools.mobile import adb as mobile_adb
-from tools.mobile import app_alias, app_stage_pick, resolve_cache, run_store
+from tools.mobile import (
+    app_alias,
+    app_stage_pick,
+    dump_latency_scope,
+    resolve_cache,
+    run_store,
+)
 from tools.mobile.app_label_from_goal import goal_app_label
 from tools.mobile.install_source import (
     ALREADY_LATEST,
@@ -25,6 +33,8 @@ from tools.mobile.render_install import (
     APP_TESTER_PACKAGES,
     APP_TESTER_STORE_PACKAGE,
 )
+
+logger = logging.getLogger(__name__)
 
 _INSTALLING = (
     "Installing the app through App Tester: its Download button, then the "
@@ -69,10 +79,24 @@ async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
         await _common.emit(call.progress, _ALREADY_LATEST)
         run_skipped.mark_tester_install(call.serial, want.package, False)
         return "", want.package
+    if not want.package:
+        logger.info("app_tester: no known package for the label: scanning the list")
     ask = _mobile_ask(call.choose)
     bundle = await source.find_listed_app(want, ask)
     if isinstance(bundle, InstallOutcome):
         return _failed(bundle), ""
+    return await _install_found(call, want, (source, ask, bundle))
+
+
+async def _install_found(call: _AppCall, want: ListedApp, found: tuple):
+    """Install the listed *bundle* unless the device already holds its newest
+    build (the package was unknown, so the first short-circuit was missed)."""
+    source, ask, bundle = found
+    if bundle != want.package and await source.is_proven_latest(call.serial, bundle):
+        await _common.emit(call.progress, _ALREADY_LATEST)
+        app_alias.remember_alias(call.serial, want.label, bundle)
+        run_skipped.mark_tester_install(call.serial, bundle, False)
+        return "", bundle
     await _common.emit(call.progress, _INSTALLING)
     request = InstallRequest(call.serial, bundle, want.label, latest=True)
     outcome = await source.install(request, ask)
@@ -119,4 +143,7 @@ async def app_tester_stage(call: _AppCall, target: str) -> tuple:
         return _failed(_label_required()), ""
     link = call.source_text
     want = ListedApp(call.serial, label, tester, known, link)
-    return await _install_listed(call, want)
+    try:
+        return await _install_listed(call, want)
+    finally:  # its slow uiautomator dumps must not become the run's p90
+        dump_latency_scope.forget_slow(call.serial)

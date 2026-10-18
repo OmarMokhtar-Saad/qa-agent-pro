@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tools.mobile import flow_replay_dialog, kstg_flow_perm
+from tools.mobile import flow_replay_dialog
 from tools.mobile.replay.screen_pkg import SYSTEM_DIALOG_PACKAGES
 
 MAX_TEXT_CHARS = 200
@@ -27,11 +27,11 @@ def _words(elements: list) -> list:
 
 
 def dialog_text(screen: Any) -> str:
-    """The text of the system dialog on *screen* (all visible text when none is tagged)."""
+    """The text of the system dialog on *screen* (``""`` when none is tagged: never other text)."""
     raw = screen.get("elements") if isinstance(screen, dict) else None
     every = [e for e in raw or [] if isinstance(e, dict)]
     tagged = [e for e in every if e.get("package") in SYSTEM_DIALOG_PACKAGES]
-    return " | ".join(_words(tagged or every))[:MAX_TEXT_CHARS]
+    return " | ".join(_words(tagged))[:MAX_TEXT_CHARS]
 
 
 def mark(trace: list, steps: list, seen: dict) -> list:
@@ -44,8 +44,9 @@ def mark(trace: list, steps: list, seen: dict) -> list:
     for i, entry in enumerate(trace):
         marked = dict(entry, replay=True)
         step = steps[i] if i < len(steps) else {}
-        if flow_replay_dialog.answers_dialog(step):
-            button = kstg_flow_perm.label(step)
+        button = str(entry.get("tapped") or "")
+        ok = entry.get("outcome") == "ok" and bool(button)
+        if ok and flow_replay_dialog.answers_dialog(step):
             marked["popup"] = {"button": button, "text": seen.get(i, "")}
         out.append(marked)
     return out

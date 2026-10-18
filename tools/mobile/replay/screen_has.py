@@ -7,6 +7,21 @@ import re
 from tools.mobile.replay.context_ctx import Context
 
 
+def screen_readable(screen: object) -> bool:
+    """True when *screen* carries at least one element. A blank read (an empty
+    dump, a failed tree) proves nothing: an absence is never claimed from it."""
+    return isinstance(screen, dict) and bool(screen.get("elements"))
+
+
+def absent_from(screen: object, present: bool) -> bool:
+    """True when the thing is proven gone: *present* is False on a readable screen.
+
+    A persistently blank tree (FLAG_SECURE, a canvas or Flutter view without
+    semantics) never proves anything gone, so a gone-wait on such a screen is
+    not satisfied: it ends by its own timeout (always bounded), never hangs."""
+    return not present and screen_readable(screen)
+
+
 def _screen_has(screen: object, needle: str) -> bool:
     want = " ".join(str(needle or "").split()).lower()
     if not want or not isinstance(screen, dict):

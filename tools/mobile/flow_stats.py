@@ -25,7 +25,7 @@ DEAD_RUNS = 2
 #: Replays that all failed before a flow that once reached its goal is dead too: the
 #: route was real once, so it gets more tries, but 0 landed replays in this many means
 #: the app moved on (run mrun-20261017-205436: a reached flow at 0 of 11 still picked).
-DEAD_RUNS_REACHED = 4
+DEAD_RUNS_REACHED = 3
 #: Seconds a dead flow stays out of the pick after its last replay (7 days): an app update
 #: may have fixed the route, so one more try is allowed, and a failure re-buries it.
 DEAD_TTL_S = 7 * 86400.0

@@ -19,7 +19,13 @@ import json
 import logging
 from typing import Any
 
-from tools.mobile import app_flows_meta, app_store, flow_stats, kstg_flow_sig
+from tools.mobile import (
+    app_flows_meta,
+    app_store,
+    flow_inert,
+    flow_stats,
+    kstg_flow_sig,
+)
 from tools.mobile.app_flows_check import secret_fields, template_from_script
 from tools.mobile.app_flows_consts import (
     ALLOWED_OPS,
@@ -142,6 +148,8 @@ def _row(name: str, template: dict) -> dict:
         "score": flow_stats.score(template),
         "ok": flow_stats.of(template).get("ok", 0),
         "shape": kstg_flow_sig.shape(template),
+        "inert": flow_inert.inert(template),
+        "dead": flow_stats.dead(template),
     }
 
 

@@ -11,6 +11,7 @@ from tools.mobile.session_explore_case import (
 from tools.mobile.session_explore_net import _explore_finish_network
 from tools.mobile.session_explore_plan import _explore_planned_case, _persist_explore
 from tools.mobile.session_explore_prior import _latest_finding
+from tools.mobile.session_explore_title import titled_state
 from tools.mobile.session_packets import _finish_evidence
 from tools.mobile.session_submit_args import (
     ExploreCall,
@@ -32,7 +33,8 @@ async def _checkpoint_turn(call: ExploreCall, turn: dict, outcome: dict) -> dict
     finding = _latest_finding(turn.get("state"))
     verdict = _turn_verdict(outcome)
     net = await _explore_finish_network(call.run_id, before, call.ctx)
-    record = TurnRecord(before, outcome, finding, verdict, net)
+    named = titled_state(before, turn.get("state"))
+    record = TurnRecord(named, outcome, finding, verdict, net)
     return _checkpoint_explore_turn(call.run_id, record)
 
 
@@ -92,11 +94,11 @@ async def _commit_explore_turn(
 async def _settle_explore_turn(settle: _Settle) -> dict:
     """Persist the committed explore state, close the run if over, and reply."""
     turn, outcome, resolved = settle.turn, settle.outcome, settle.resolved
-    before = resolved.get("explore") or {}
+    named = titled_state(resolved.get("explore"), turn.get("state"))
     finding = _latest_finding(turn.get("state"))
     verdict = _turn_verdict(outcome)
     committed_state, refused = _committed_explore_state(turn, outcome)
-    planned = _explore_planned_case(settle.checkpoint["tc_id"], before, finding)
+    planned = _explore_planned_case(settle.checkpoint["tc_id"], named, finding)
     _persist_explore(settle.run_id, committed_state, planned=planned)
     # ONE derivation of "has this run stopped", read by BOTH consumers below.
     stopped = refused or str(turn.get("status") or "") != explore_runner.RUNNING

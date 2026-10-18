@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tools.mobile import flow_replay_anchor
+from tools.mobile import flow_inert, flow_replay_anchor
 from tools.mobile.replay.screen_has import _screen_has
 from tools.mobile.replay.settle_cut import Cut, CutView, _cut_detail, _cut_of
 
@@ -57,7 +57,7 @@ def _inert(template: dict, at: int) -> bool:
     before, after = meta.get("before") or [], meta.get("after") or []
     key = before[at] if at < len(before) else ""
     last = after[at] if at < len(after) else ""
-    return not last or last == key
+    return flow_inert.still(key, last)
 
 
 def _idle_step(step: dict, screen: Any) -> bool:

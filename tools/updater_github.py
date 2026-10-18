@@ -9,6 +9,7 @@ from typing import Any, Optional
 from config.settings_guard import never_raise
 from tools import http_port
 from tools.updater_log import logger
+from tools.updater_pick import highest_server_release, is_server_release
 
 _GITHUB_API = "https://api.github.com"
 
@@ -110,11 +111,31 @@ def _fetch_latest_release_uncached(
     repo: str, token: str, timeout: float
 ) -> Optional[dict]:
     """GET /repos/{repo}/releases/latest. Returns ``{tag_name, zipball_url}`` or
-    raises on a network/HTTP error (the caller catches and degrades)."""
+    raises on a network/HTTP error (the caller catches and degrades).
+
+    GitHub's "latest" can be a non-server release (an IME tag published last
+    made every install read "Up to date"), so a latest that is not a plain
+    ``vX.Y.Z`` is replaced by the highest ``vX.Y.Z`` in the release list."""
     url = f"{_GITHUB_API}/repos/{repo}/releases/latest"
     resp = http_port.get(url, _auth_headers(token), timeout)
     resp.raise_for_status()
     data = resp.json()
+    if not is_server_release(data):
+        logger.info("latest release %r is not a server tag", data.get("tag_name"))
+        data = _highest_listed(repo, token, timeout) or data
+    return _release_view(data)
+
+
+def _highest_listed(repo: str, token: str, timeout: float) -> Optional[dict]:
+    """The highest ``vX.Y.Z`` release among the newest 100, or None."""
+    url = f"{_GITHUB_API}/repos/{repo}/releases?per_page=100"
+    resp = http_port.get(url, _auth_headers(token), timeout)
+    resp.raise_for_status()
+    return highest_server_release(resp.json() or [])
+
+
+def _release_view(data: dict) -> dict:
+    """``{tag_name, zipball_url, asset_url}`` of a release payload."""
     asset_url = ""
     for asset in data.get("assets") or []:
         name = str(asset.get("name") or "")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import replace
 from typing import Any, NamedTuple, Optional, Union
@@ -15,6 +16,8 @@ from tools.mobile.install_sources.app_tester_ui_consts import (
 )
 from tools.mobile.install_sources.app_tester_ui_link import open_by_link
 from tools.mobile.resolve import AskCb
+
+logger = logging.getLogger(__name__)
 
 #: Seconds a run left on the app page stays usable by install().
 STAGE_TTL_S = 120
@@ -89,11 +92,38 @@ class _PickMixin:
     async def is_latest(self: _Flow, serial: str, package: str) -> bool:
         """True when the installed copy already is the newest build the app's
         page listed a moment ago (no App Tester screen is driven for it)."""
-        have = await self._versions(serial, package)  # one cheap read, no UI
-        code = have.version_code if have else None
-        if code is None:
-            return False  # package missing (or unreadable): the UI is needed
-        latest = memory.known_latest(memory.Installed(serial, package, code))
-        return (
-            latest is None or code >= latest
-        )  # no listing known: only a missing app opens it
+        verdict, why = await latest_verdict(self._versions, serial, package)
+        logger.info("app_tester is_latest(%s)=%s: %s", package, verdict, why)
+        return verdict
+
+    async def is_proven_latest(self: _Flow, serial: str, package: str) -> bool:
+        """True only when a remembered listing proves the install is current."""
+        return await proven_latest(self._versions, serial, package)
+
+
+async def _code_and_latest(read: Any, serial: str, package: str) -> tuple:
+    """``(installed code, newest remembered listing)``; either may be None."""
+    have = await read(serial, package)
+    code = have.version_code if have else None
+    if code is None:
+        return None, None
+    return code, memory.known_latest(memory.Installed(serial, package, code))
+
+
+async def latest_verdict(read: Any, serial: str, package: str) -> tuple:
+    """``(is_latest, reason)``: one cheap version read, no UI; says why."""
+    code, latest = await _code_and_latest(read, serial, package)
+    if code is None:
+        return False, "version unreadable or app missing: the UI is needed"
+    if latest is None:
+        return True, "installed code %s, no listing remembered: kept" % code
+    if code >= latest:
+        return True, "installed code %s >= listed %s" % (code, latest)
+    return False, "installed code %s < listed %s: update needed" % (code, latest)
+
+
+async def proven_latest(read: Any, serial: str, package: str) -> bool:
+    """True only on positive proof: a remembered listing the installed code
+    reaches. An unknown listing is not proof (the install must run)."""
+    code, latest = await _code_and_latest(read, serial, package)
+    return code is not None and latest is not None and code >= latest

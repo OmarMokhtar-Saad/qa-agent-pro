@@ -17,6 +17,19 @@ def explore_turn_title(state: object, goal: str) -> str:
     return (EXPLORE_TITLE_PREFIX + str(turn) + tag + " \u2014 " + named)[:250]
 
 
+def titled_state(before: object, folded: object) -> dict:
+    """The pre-turn state with the ``sub_goal`` this turn SUBMITTED.
+
+    The case title reads ``sub_goal``; the pre-turn state still holds the
+    PREVIOUS turn's, so a title built from it lags one turn behind.
+    """
+    body = dict(before) if isinstance(before, dict) else {}
+    sub_goal = folded.get("sub_goal") if isinstance(folded, dict) else None
+    if sub_goal:
+        body["sub_goal"] = sub_goal
+    return body
+
+
 def _replay_tag(replay: object) -> str:
     """`` (auto-replay `flow` steps 2-6 of 9)`` for a turn that ran a flow, else ``""``."""
     if not isinstance(replay, dict) or not replay.get("note"):

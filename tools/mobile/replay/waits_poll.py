@@ -13,7 +13,8 @@ from tools.mobile.replay.context_consts import (
 )
 from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
 from tools.mobile.replay.probe_gate import KEEPS_GATE, TEXT, open_gate, rebased
-from tools.mobile.replay.screen import _screen_has_element
+from tools.mobile.replay.screen import _screen_has_element, absent_from
+from tools.mobile.replay.waits_early import gate_is_noise, rest_pause
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_quiet import settled
 from tools.mobile.replay.waits_types import Pace, Poll, Probe
@@ -69,6 +70,12 @@ def _pause_after(took: float, quiet: int = 0, clocked: bool = False) -> float:
     return 0.0 if took >= interval else interval
 
 
+def _read_pause(ctx: Context, took: float, quiet: int) -> float:
+    """The pause before an ungated read; a screen at rest is polled slowly (P3)."""
+    clocked = a11y_events.latest(ctx.serial) is not None
+    return rest_pause(ctx.serial, quiet, _pause_after(took, quiet, clocked))
+
+
 async def _poll(ctx: Context, current: object, poll: Poll) -> tuple:
     """One poll: ``(final, content, took, verdict)``. Verdict ``"calm"`` means
     the gate vouched for *current* and no dump was taken."""
@@ -76,13 +83,25 @@ async def _poll(ctx: Context, current: object, poll: Poll) -> tuple:
     verdict = await gate.verdict(current, deadline) if gate else ""
     if verdict == "calm":
         return None, current, took, verdict
-    pause = (
-        0.0
-        if verdict
-        else _pause_after(took, quiet, a11y_events.latest(ctx.serial) is not None)
-    )
+    pause = 0.0 if verdict else _read_pause(ctx, took, quiet)
     final, content, took = await _next_read(ctx, current, Pace(deadline, pause))
     return final, content, took, verdict
+
+
+async def _keep_gate(gate: object, shown: object, seen: tuple) -> object:
+    """*gate* re-anchored on *shown*, or ``None`` once it only costs time (P4)."""
+    verdict, quiet = seen
+    if verdict not in KEEPS_GATE or gate_is_noise(quiet):
+        return None
+    return await rebased(gate, shown)
+
+
+def _ended(ctx: Context, probe: Probe, seen: tuple):
+    """``(met, current, False)`` once the wait is met or interrupted, else ``None``."""
+    previous, current, screen = seen
+    if probe.met(previous, current):
+        return True, current, False
+    return (False, current, False) if _interrupted(ctx, current, screen) else None
 
 
 def _interrupted(ctx: Context, current: object, screen: object) -> bool:
@@ -116,10 +135,8 @@ async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
     deadline, ticker, gate, current = await _begin(ctx, screen, probe)
     previous, took, quiet = None, 0.0, 0
     while True:
-        if probe.met(previous, current):
-            return True, current, False
-        if _interrupted(ctx, current, screen):
-            return False, current, False
+        if ended := _ended(ctx, probe, (previous, current, screen)):
+            return ended
         final, content, took, verdict = await _poll(
             ctx, current, Poll(gate, deadline, took, quiet)
         )
@@ -129,8 +146,18 @@ async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
         if final:
             return final
         quiet, previous, current = (quiet + 1) * (content == current), current, content
-        gate = await rebased(gate, content) if verdict in KEEPS_GATE else None
+        gate = await _keep_gate(gate, content, (verdict, quiet))
         await ticker.tick()
+
+
+def _element_met(rid: str, text: str, gone: bool):
+    """The ``met`` of an element wait; a blank read never proves it gone (B7)."""
+
+    def met(_previous: object, current: object) -> bool:
+        has = _screen_has_element(current, rid, text)
+        return absent_from(current, has) if gone else has
+
+    return met
 
 
 async def _wait_until_element(ctx: Context, screen: object, want: tuple) -> tuple:
@@ -144,10 +171,5 @@ async def _wait_until_element(ctx: Context, screen: object, want: tuple) -> tupl
     return await _wait_for(
         ctx,
         screen,
-        Probe(
-            ms,
-            lambda _previous, current: _screen_has_element(current, rid, text) != gone,
-            label,
-            TEXT,
-        ),
+        Probe(ms, _element_met(rid, text, gone), label, TEXT),
     )

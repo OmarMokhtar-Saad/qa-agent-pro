@@ -8,7 +8,7 @@ from typing import Any, NamedTuple
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.know_guard import Fired
 from tools.mobile.replay.know_read import _known
-from tools.mobile.replay.screen import _screen_has, _screen_has_element
+from tools.mobile.replay.screen import _screen_has, _screen_has_element, absent_from
 from tools.mobile.replay.waits_poll import _wait_until_element
 from tools.mobile.replay.waits_text import _wait_until_text
 from tools.mobile.replay.waits_types import ElementWait, TextWait
@@ -25,9 +25,10 @@ class WaitJob(NamedTuple):
 def _already_met(screen: Any, then: dict) -> bool:
     """True when the screen already shows what the note waits for."""
     if then.get("until_rid"):
-        return _screen_has_element(
+        has = _screen_has_element(
             screen, str(then["until_rid"]), str(then.get("until_rid_text") or "")
-        ) != bool(then.get("until_gone"))
+        )
+        return absent_from(screen, has) if then.get("until_gone") else has
     return _screen_has(screen, str(then.get("until_text") or ""))
 
 

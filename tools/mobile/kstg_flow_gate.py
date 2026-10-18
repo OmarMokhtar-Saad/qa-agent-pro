@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 
+from tools.mobile import flow_inert
 from tools.mobile.kstg_foreign import observed
 from tools.mobile.kstg_popup_permission import is_permission_decline
 
@@ -56,7 +57,12 @@ def _noop_loop(recs: list) -> bool:
     """True when a tap that left the screen unchanged is immediately repeated."""
     for prev, cur in zip(recs, recs[1:]):
         op = (cur.get("flow_action") or {}).get("op")
-        if op in _TAPS and _still(prev) and _same(prev, cur):
+        if (
+            op in _TAPS
+            and not flow_inert.optional_op(op)
+            and _still(prev)
+            and _same(prev, cur)
+        ):
             return True
     return False
 
@@ -106,4 +112,8 @@ def reject(recs: list, package: str = "") -> str:
         return "repeats a tap that changed nothing"
     if _declines_permission(recs, package):
         return "taps a runtime-permission decline"
+    ops = [(r.get("flow_action") or {}).get("op") for r in recs]
+    keys = [(r.get("screen_key"), r.get("after_screen_key")) for r in recs]
+    if flow_inert.inert_ops(ops, keys):
+        return "only waits and optional taps: nothing to replay"
     return ""

@@ -77,12 +77,15 @@ def fits(label: str, element: dict) -> bool:
 
 def used_note(label: str, element: dict) -> str:
     """The sentence that says which field was filled in place of the label."""
-    return (
-        "No field matched `"
-        + single_line(label, 60)
-        + "`; filled the only empty input field, "
-        + repr(single_line(_name(element), 60))
-        + "."
+    wanted = single_line(label, 60)
+    name = single_line(_name(element), 60)
+    if name == wanted:
+        return (
+            "No field matched `%s` by name; filled the only empty input field." % wanted
+        )
+    return "No field matched `%s`; filled the only empty input field, %r." % (
+        wanted,
+        name,
     )
 
 

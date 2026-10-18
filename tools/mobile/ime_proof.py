@@ -19,6 +19,8 @@ _VERSION: dict = {}
 _SAID: set = set()
 #: run id last begun per serial.
 _RUN: dict = {}
+#: ``(serial, "clock" | "generation")`` seen on a dump this run.
+_SEEN: set = set()
 
 
 def reset() -> None:
@@ -26,6 +28,7 @@ def reset() -> None:
     _VERSION.clear()
     _SAID.clear()
     _RUN.clear()
+    _SEEN.clear()
 
 
 def note_once(serial: str, reason: str) -> None:
@@ -43,6 +46,7 @@ async def begin_run(serial: str, run_id: str) -> None:
     if _RUN.get(key) == run_id:
         return
     _RUN[key] = run_id
+    _SEEN.difference_update({t for t in _SEEN if t[0] == key})
     _SAID.difference_update({t for t in _SAID if t[0] == key})
     if key not in _VERSION:
         await check_installed(serial)
@@ -62,7 +66,24 @@ async def check_installed(serial: str) -> None:
 
 
 def on_dump(serial: str) -> None:
-    """After a successful a11y dump: note a missing event clock."""
-    if a11y_events.latest(serial) is None:
+    """After a successful a11y dump: remember the clock, or note a missing one."""
+    clock = a11y_events.latest(serial)
+    if clock is not None:
+        key = str(serial or "")
+        _SEEN.add((key, "clock"))
+        if clock.generation is not None:
+            _SEEN.add((key, "generation"))
+    if clock is None:
         got = _VERSION.get(str(serial or "")) or "unknown"
         note_once(serial, "ime_clock_missing:" + got)
+
+
+def evidence(serial: str) -> dict:
+    """What the next audit reads from the manifest: the qa-ime ``versionName`` and
+    whether a dump of this run carried the event clock and its generation counter."""
+    key = str(serial or "")
+    return {
+        "version": _VERSION.get(key, ""),
+        "clock": (key, "clock") in _SEEN,
+        "generation_clock": (key, "generation") in _SEEN,
+    }

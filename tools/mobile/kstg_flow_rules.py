@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import time
 
-from tools.mobile import flow_stats, kstg_flow_sig
+from tools.mobile import flow_inert, flow_stats, kstg_flow_sig
 
 MIN_RUNS = 3
 MIN_WILSON = 0.2
@@ -69,5 +69,8 @@ def doomed(items: list, now: float = 0.0) -> list:
     return [
         item[0]
         for item in items
-        if _low(item[1]) or _old(item[1], moment) or _dominated(item, items)
+        if _low(item[1])
+        or _old(item[1], moment)
+        or flow_inert.inert(item[1])
+        or _dominated(item, items)
     ]

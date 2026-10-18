@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 import time
 
@@ -77,6 +78,25 @@ def wait_until_drained(timeout: float = DRAIN_TIMEOUT_S) -> bool:
     return not _calls_in_flight()
 
 
+def _flush_std_streams() -> None:
+    """Best-effort flush of plain stdout/stderr before the exit. The MCP stdio
+    writer keeps its own buffer this cannot reach: that reply is covered by the
+    ``FLUSH_GRACE_S`` grace slept before this call."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+def _exit_after_reply() -> None:
+    """Wait for the reply of the call that scheduled the reload, then exit."""
+    wait_until_drained()
+    time.sleep(FLUSH_GRACE_S)
+    _flush_std_streams()
+    os._exit(86)
+
+
 def schedule_reload(reason: str = "") -> None:
     """Exit the server process shortly after the current response flushes.
 
@@ -91,12 +111,7 @@ def schedule_reload(reason: str = "") -> None:
     on disk before the exit, and EVERY caller gets the verification for free."""
     setup_reload_marker._write_reload_marker(reason)
 
-    def _later() -> None:
-        wait_until_drained()
-        time.sleep(FLUSH_GRACE_S)
-        os._exit(86)
-
-    threading.Thread(target=_later, daemon=True).start()
+    threading.Thread(target=_exit_after_reply, daemon=True).start()
 
 
 def pending_reload_reason(update_status: str) -> str | None:

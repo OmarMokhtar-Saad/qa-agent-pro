@@ -53,6 +53,23 @@ async def _wait_step(
 # ONE rectangle for the guard and the device -- see
 # `_swipe_points`. Both read this packet's own root_bounds
 # rather than each asking adb, whose answer expires.
+def _fill_proof(outcome: dict) -> str:
+    """``field 'X': N/N chars`` for a fill whose field was read back, else ``""``."""
+    content = outcome.get("content") or {}
+    if not content.get("chars"):
+        return ""
+    return "field %r: %s." % (content.get("field") or "?", content["chars"])
+
+
+def _tapped_label(step: _Step) -> str:
+    """The visible label of the control a tap really hit, else ``""``."""
+    element = step.element if isinstance(step.element, dict) else {}
+    for key in ("text", "label", "desc"):
+        if element.get(key):
+            return " ".join(str(element[key]).split())[:60]
+    return ""
+
+
 def _note_ok(step: _Step, outcome: dict) -> None:
     """Record the acted step as ok with its confirmed detail and notes."""
     entry = step.entry
@@ -60,6 +77,11 @@ def _note_ok(step: _Step, outcome: dict) -> None:
     entry["detail"] = _confirmed(
         entry, str((outcome.get("content") or {}).get("detail") or "")
     )
+    if step.op in ("tap", "tap_text", "tap_text_if_present"):
+        entry["tapped"] = _tapped_label(step)
+    proof = _fill_proof(outcome)
+    if proof:
+        entry["detail"] = (proof + " " + entry["detail"]).strip()
     if entry.get("fill_note"):
         entry["detail"] = (entry["fill_note"] + " " + entry["detail"]).strip()
     if step.scroll_missed:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from tools.mobile import kplg_popup_ref
+from tools.mobile import flow_roles, kplg_popup_ref
 from tools.mobile.app_flows_consts import (
     ALLOWED_OPS,
     CREDENTIAL_WORDS,
@@ -43,13 +43,20 @@ def _label_param(label: str) -> str:
     return name if PLACEHOLDER_RE.fullmatch("{%s}" % name) else ""
 
 
+def _secret_named(field: str, label: str) -> bool:
+    """A plain parameter that names (or sits in) a credential field is a secret step."""
+    words = field.lower().split("_")
+    named = any(word in CREDENTIAL_WORDS for word in words)
+    return named or bool(flow_roles.role(field) or flow_roles.role(label))
+
+
 def _typed(action: dict, out: dict) -> dict:
     field = str(action.get("field") or "")
     if not field:
         name = _label_param(out.get("label", ""))
         return {**out, "text": "{%s}" % name} if name else {}
     out["field"] = field[:80]
-    if action.get("secret"):
+    if action.get("secret") or _secret_named(field, out.get("label", "")):
         out["secret"] = True
     elif PLACEHOLDER_RE.fullmatch("{%s}" % field):
         out["text"] = "{%s}" % field

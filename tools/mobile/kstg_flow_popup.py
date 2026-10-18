@@ -24,12 +24,22 @@ def is_popup_tap(rec: dict, package: str) -> bool:
 
 
 def as_optional(rec: dict, package: str) -> dict:
-    """*rec* with a popup tap turned into an optional step on the app's own record."""
+    """*rec* with a popup tap turned into an optional step on the app's own record.
+
+    Answering the popup leaves the app screen as it was, so the step's after key is its
+    before key: a route of only such steps stays inert (``flow_inert``)."""
     if not is_popup_tap(rec, package):
         return rec
     text = kstg_flow_perm.label(rec["flow_action"])
     act = {"op": "tap_text_if_present", "text": text, "max_s": POPUP_WAIT_S}
-    return dict(rec, flow_action=act, screen_package=package, activity="")
+    still = rec.get("screen_key")
+    return dict(
+        rec,
+        flow_action=act,
+        screen_package=package,
+        activity="",
+        after_screen_key=still,
+    )
 
 
 def _text_tap(act: dict) -> bool:

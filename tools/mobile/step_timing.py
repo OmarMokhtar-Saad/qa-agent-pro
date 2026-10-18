@@ -49,7 +49,7 @@ def _record(name: str, seconds: float) -> None:
     if name not in phases and len(phases) >= MAX_TIMED_PHASES:
         return
     step_ledger.on_phase(state, name, int(seconds * 1000))
-    step_cover.span(state, seconds)
+    step_cover.span(state, seconds, name)
     total, count = phases.get(name, (0.0, 0))
     phases[name] = (total + seconds, count + 1)
 
@@ -101,13 +101,8 @@ def summary() -> dict:
     state = _PHASES.get()
     if state is None:
         return {}
-    return {
-        "total_ms": int((time.monotonic() - state["start"]) * 1000),
-        "phases": {
-            name: {"ms": int(total * 1000), "n": count}
-            for name, (total, count) in state["phases"].items()
-        },
-    }
+    whole = int((time.monotonic() - state["start"]) * 1000)
+    return {"total_ms": whole, "phases": step_cover.phases(state, whole)}
 
 
 @dataclasses.dataclass(frozen=True)

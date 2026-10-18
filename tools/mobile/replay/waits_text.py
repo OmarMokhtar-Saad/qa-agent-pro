@@ -6,7 +6,7 @@ import time
 
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.probe_gate import TEXT
-from tools.mobile.replay.screen import _screen_has, _screen_hash
+from tools.mobile.replay.screen import _screen_has, _screen_hash, absent_from
 from tools.mobile.replay.waits_idle import probe_idle
 from tools.mobile.replay.waits_poll import _wait_for
 from tools.mobile.replay.waits_types import Probe, TextWait
@@ -28,7 +28,8 @@ async def _wait_until_text(ctx: Context, screen: object, want: TextWait) -> tupl
     label = "waiting for " + repr(str(text)[:40]) + (" to go" if gone else "")
 
     def met(_previous: object, current: object) -> bool:
-        return _screen_has(current, text) != gone
+        has = _screen_has(current, text)
+        return absent_from(current, has) if gone else has
 
     return await _wait_for(ctx, screen, Probe(ms, met, label, TEXT))
 

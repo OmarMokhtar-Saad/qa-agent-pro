@@ -15,7 +15,6 @@ from tools.mobile.replay.screen import system_dialog_package
 
 DIALOG_OVER = "a system dialog is open over the screen; this step expects none"
 NO_DIALOG = "no system dialog is open; this step answers one"
-ANSWERED = "answered a system dialog by tapping `%s`"
 
 
 def answers_dialog(step: dict) -> bool:
@@ -47,9 +46,3 @@ def guarded(gate: Any, template: dict, origin: list) -> Any:
         return latest, why or mismatch(steps[origin[index]], latest)
 
     return checked
-
-
-def answers(template: dict, start: int, pos: int) -> list:
-    """The permission answers the replay of steps ``start`` .. ``pos - 1`` tapped."""
-    steps = (template.get("steps") or [])[start:pos]
-    return [ANSWERED % kstg_flow_perm.label(s) for s in steps if answers_dialog(s)]

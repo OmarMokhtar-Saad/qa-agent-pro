@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from tools.mobile import app_flows, flow_stats, screen_key
+from tools.mobile import app_flows, flow_inert, flow_stats, screen_key
 from tools.mobile import flow_replay_match_anchor as anchor
 from tools.mobile.app_flows_consts import PLACEHOLDER_RE
 
@@ -133,6 +133,11 @@ def _rank(item: tuple) -> tuple:
     return (reached, flow_stats.score(template), suffix, -at)
 
 
+def _usable(template: dict) -> bool:
+    """Worth replaying: not dead (0 ok in its tries) and not inert (no required step)."""
+    return not flow_stats.dead(template) and not flow_inert.inert(template)
+
+
 def pick(package: str, key: str, skip: Any = ()) -> tuple:
     """``(name, template, step)`` of the best flow passing *key*, else ``("", {}, 0)``.
 
@@ -145,7 +150,7 @@ def pick(package: str, key: str, skip: Any = ()) -> tuple:
     (``flow_replay_match_anchor``); a key match always beats that.
     Names in *skip* (already replayed this run) are never offered again.
     """
-    live = [(n, t) for n, t in _templates(package) if not flow_stats.dead(t)]
+    live = [(n, t) for n, t in _templates(package) if _usable(t)]
     rows = [(n, t) for n, t in live if n not in set(skip)]
     for by_key in (True, False):
         fits = [(n, t, at) for n, t in rows if (at := _first_at(t, key, by_key)) >= 0]

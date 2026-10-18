@@ -90,14 +90,17 @@ async def _replay_first_screen(
 def _before_texts(op: str, screen: Any, previous: set | None) -> set | None:
     """The BEFORE set for ``assert new_text``.
 
-    Captured for every op that can change the screen -- ``wait`` included,
-    which is the whole point: the reply a case is waiting for arrives during
-    the wait. Any other op keeps the set it had.
+    Captured for every op that can change the screen, BEFORE it acts. A wait
+    does not move it once an action set it: the screen a wait starts on is
+    already the result of the step before it (an OTP that submitted itself),
+    so re-baselining there made a reply that had arrived read as "no new
+    text". Only a script that starts on a wait takes its baseline there.
     """
-    baseline_texts = previous
-    if op in actions_mod.MUTATING_OPS:
-        baseline_texts = _texts(screen)
-    return baseline_texts
+    if op not in actions_mod.MUTATING_OPS:
+        return previous
+    if op in actions_mod.WAIT_OPS and previous is not None:
+        return previous
+    return _texts(screen)
 
 
 def _fresh_entry(index: int, action: Any, screen: Any) -> dict:

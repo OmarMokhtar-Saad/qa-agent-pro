@@ -57,6 +57,8 @@ class Gate:
         #: True while ``base`` equals the "before" reading of the dump in hand;
         #: only then may a quiet poll vouch for that dump (calm mode).
         self.bracketed = True
+        #: True once a poll could not read the probe at all.
+        self.blind = False
 
     async def rebase(self, shown: object) -> bool:
         """Re-anchor on the screen just dumped; False when the probe is unusable.
@@ -67,6 +69,8 @@ class Gate:
         the next polls (``bracketed`` False: they may dump, never go calm), so
         one busy dump never drops the gate for the rest of the wait.
         """
+        if self.blind:  # the probe cannot be read: stop paying for it (P4)
+            return False
         base = await _baseline(self.ctx, shown, self.mode)
         self.bracketed = base is not None
         base = base or await screen_probe.baseline(self.ctx.serial, PROBE_BUDGET_S)
@@ -78,7 +82,9 @@ class Gate:
         passed unmoved, ``"moved"`` when a dump is due."""
         calm = self.mode == CALM
         horizon = min(until, time.monotonic() + WAIT_POLL_S) if calm else until
-        if await wait_moved(self.ctx, self.base, horizon) is not None:
+        moved = await wait_moved(self.ctx, self.base, horizon)
+        if moved is not None:
+            self.blind = not moved.digest  # an unreadable probe (P4)
             return "moved"
         return "quiet" if calm else "idle"
 

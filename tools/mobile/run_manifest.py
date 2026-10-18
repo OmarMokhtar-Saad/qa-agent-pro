@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import time
 
-from tools.mobile import run_consts, run_io, step_timing
+from tools.mobile import ime_proof, run_consts, run_io, step_timing
 
 logger = logging.getLogger("tools.mobile.run_store")
 
@@ -91,6 +91,7 @@ def append_step_timing(run_id: str, row: object) -> dict:
         ):
             return {"error": None, "content": {"written": False}}
         manifest["step_timings"], number = _numbered_rows(manifest, row)
+        manifest["qa_ime"] = ime_proof.evidence(str(manifest.get("serial") or ""))
         run_io._write_json(run_io.run_path(run_id) / run_consts.MANIFEST_FILE, manifest)
         return {"error": None, "content": {"written": True, "index": number}}
     except (OSError, TypeError, ValueError):

@@ -12,8 +12,10 @@ import re
 
 from tools.mobile.deny_terms import normalize
 
+# Arabic "no permission" / "decline" written as \u escapes (no RTL literal in source).
 _DECLINE = re.compile(
-    r"(?<!\w)(?:not allow|don t allow|dont allow|do not allow|deny|permission deny\w*)(?!\w)"
+    r"(?<!\w)(?:not allow|don t allow|dont allow|do not allow|deny|permission deny\w*|"
+    r"\u0639\u062f\u0645 \u0627\u0644\u0633\u0645\u0627\u062d|\u0631\u0641\u0636)(?!\w)"
 )
 
 

@@ -23,8 +23,8 @@ import threading
 from collections import OrderedDict
 from typing import Any
 
+from tools.mobile import flow_goal_fit, knowledge_snapshot, screen_key
 from tools.mobile import knowledge_limits as limits
-from tools.mobile import knowledge_snapshot, screen_key
 from tools.mobile.knowledge_inject_block import (  # noqa: F401
     _line,
     _num,
@@ -92,6 +92,7 @@ def stable_block(run_id: Any) -> str:
             if rid in STABLE:
                 return STABLE[rid]
         snap = knowledge_snapshot.for_run(rid) or knowledge_snapshot.load_for_run(rid)
+        snap = dict(snap, run_goal=flow_goal_fit.run_goal(rid))
         block = stable_text(_items(snap, None))
         with _LOCK:
             STABLE[rid] = block
