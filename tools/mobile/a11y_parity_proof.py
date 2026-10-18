@@ -11,6 +11,7 @@ the full check again; a refusal forgets the proof. Per-dump freshness checks
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import json
@@ -84,8 +85,21 @@ def _write(path, kept: dict) -> None:
         raise
 
 
+#: A ``.tmp`` older than this is the leftover of a killed write and is removed.
+STALE_TMP_S = 300
+
+
+def _sweep_stale(path) -> None:
+    """Remove ``.tmp`` files a hard-killed writer left beside *path*."""
+    for old in path.parent.glob(path.name + ".*.tmp"):
+        with contextlib.suppress(OSError):
+            if time.time() - old.stat().st_mtime > STALE_TMP_S:
+                old.unlink()
+
+
 def _save(proofs: dict) -> None:
     path = paths.state_file(STATE_FILE)
+    _sweep_stale(path)
     kept = dict(sorted(proofs.items(), key=lambda kv: _at(kv[1]))[-MAX_PROOFS:])
     try:
         _write(path, kept)
@@ -125,13 +139,18 @@ async def remember(serial: str) -> None:
     ident = await identity(serial)
     if not ident:
         return
+    await asyncio.to_thread(_keep, str(serial or ""), ident)
+
+
+def _keep(serial: str, ident: str) -> None:
     with _locked():
         proofs = _load()
-        proofs[str(serial or "")] = {"id": ident, "at": time.time()}
+        proofs[serial] = {"id": ident, "at": time.time()}
         _save(proofs)
 
 
 def forget(serial: str) -> None:
+    """Drop the proof of *serial*; blocks on the file lock, so async callers use a thread."""
     with _locked():
         proofs = _load()
         if proofs.pop(str(serial or ""), None) is not None:
@@ -145,7 +164,7 @@ async def checked(serial: str, fast_xml: str) -> dict:
         return {"error": None, "content": {"parity": "remembered"}}
     got = await a11y_settle.checked(serial, fast_xml)
     if got.get("error"):
-        forget(serial)
+        await asyncio.to_thread(forget, serial)
     else:
         await remember(serial)
     return got

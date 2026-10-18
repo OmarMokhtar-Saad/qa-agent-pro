@@ -11,14 +11,19 @@ _PENDING: dict[tuple[str, str], list] = {}
 MAX_HELD_CASES = 64
 
 
+def _trim() -> None:
+    """Drop the oldest cases beyond the cap; the caller holds the lock."""
+    while len(_PENDING) > MAX_HELD_CASES:
+        del _PENDING[next(iter(_PENDING))]
+
+
 def hold(run_id: str, tc_id: str, records: list) -> None:
     """Keep *records* for a case whose record is not written yet."""
     items = [item for item in list(records or []) if isinstance(item, dict)]
     if items:
         with _LOCK:
             _PENDING.setdefault((run_id, tc_id), []).extend(items)
-            while len(_PENDING) > MAX_HELD_CASES:
-                del _PENDING[next(iter(_PENDING))]
+            _trim()
 
 
 def take(run_id: str, tc_id: str) -> list:
@@ -33,6 +38,7 @@ def put_back(run_id: str, tc_id: str, records: list) -> None:
     if items:
         with _LOCK:
             _PENDING[(run_id, tc_id)] = [*items, *_PENDING.get((run_id, tc_id), [])]
+            _trim()
 
 
 def drop_run(run_id: str) -> None:

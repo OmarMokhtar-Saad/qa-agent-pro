@@ -120,8 +120,9 @@ def left_app_detail(package: str, expected: str) -> str:
         + where
         + " and not to "
         + str(expected)[:80]
-        + ", so nothing further was replayed. Send `launch` to bring the app "
-        "under test back to the front, then continue the case. To keep working "
-        "in that other app on purpose, declare it with `app` or `expect_apps` "
-        "in the reply."
+        + ", so nothing further was replayed. If the case should continue "
+        "there (an installer or launcher that opens the app under test, say), "
+        "declare it with `app` or `expect_apps` in the reply and carry on. "
+        "If that screen is a mistake: Send `launch` to bring the app under "
+        "test back to the front."
     )

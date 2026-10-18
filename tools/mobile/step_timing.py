@@ -25,7 +25,7 @@ import time
 from contextvars import ContextVar
 from typing import Any, Awaitable, Optional
 
-from tools.mobile import step_ledger
+from tools.mobile import step_cover, step_ledger
 
 #: Distinct phase names one call may record. The instrumented sites name six;
 #: a name past this is dropped rather than grown into an unbounded dict that
@@ -57,6 +57,7 @@ def _record(name: str, seconds: float) -> None:
     if name not in phases and len(phases) >= MAX_TIMED_PHASES:
         return
     step_ledger.on_phase(state, name, int(seconds * 1000))
+    step_cover.span(state, seconds)
     total, count = phases.get(name, (0.0, 0))
     phases[name] = (total + seconds, count + 1)
 
@@ -170,7 +171,7 @@ def current_row(index: int) -> Optional[StepTiming]:
         wait_ms=int(wait.get("ms", 0)),
         source=str(st.get("source") or ""),
         marks=dict(st.get("marks") or {}),
-        ledger=list(st.get("ledger") or []),
+        ledger=step_cover.itemised(st, data["total_ms"]),
         trace=list(st.get("trace") or []),
     )
 

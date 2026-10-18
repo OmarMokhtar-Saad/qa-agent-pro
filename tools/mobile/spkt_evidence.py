@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 
 from tools.mobile import explore_stop, run_store
@@ -9,6 +10,28 @@ from tools.mobile.run_finalize import finalize_explore_cases
 from tools.mobile_evidence import capture
 
 logger = logging.getLogger("tools.mobile.session")
+
+
+class _NotClosed(Exception):
+    """A close that failed; lru_cache stores no exception, so it is retried."""
+
+
+@functools.lru_cache(maxsize=256)
+def _close_once(run_id: str) -> None:
+    if finalize_explore_cases(run_id) is False:
+        raise _NotClosed(run_id)
+
+
+def finalise_once(run_id: str) -> None:
+    """Close the run's explore cases on the first good call per run, not on every poll.
+
+    The bounded cache is the only memory: no module-level dict, so a restart
+    simply closes them once more (finalising is idempotent). A failed close
+    is not cached, so the next poll tries again."""
+    try:
+        _close_once(run_id)
+    except _NotClosed:
+        logger.warning("mobile.session: explore cases not closed for %s", run_id)
 
 
 def _merge_events(run_id: str, manifest: dict, pulled: object) -> None:
@@ -44,7 +67,7 @@ async def _finish_evidence(run_id: str, resolved: object) -> None:
         manifest = (run_store.read_manifest(run_id) or {}).get("content") or {}
         if isinstance(manifest, dict) and explore_stop.display_stop(manifest):
             # Every end path (deadline, budget, report-now) passes here.
-            finalize_explore_cases(run_id)
+            finalise_once(run_id)
         if not isinstance(manifest, dict) or manifest.get("events_source"):
             return
         pulled = await capture.pull_events(

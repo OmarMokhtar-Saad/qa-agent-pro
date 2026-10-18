@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 
 from config.settings_guard import never_raise
-from tools.mobile import locks, run_store, session_runs
+from tools.mobile import locks, run_lease_release, run_store, session_runs
 from tools.mobile.session_core import STATE_REPORT
 
 logger = logging.getLogger("tools.mobile.heartbeat")
@@ -102,3 +102,17 @@ def _run_is_finished(run_id: str, session_token: str = "") -> bool:
         body = resolved.get("content") or {}
         return str(body.get("state") or "") == STATE_REPORT
     return False
+
+
+def release_if_finished(run_id: str, session_token: str = "") -> bool:
+    """Free the device and stamp the lease NOW when *run_id* has reached its report.
+
+    The heartbeat does the same on its next beat, up to ``INTERVAL_S`` later
+    (30 s): a run that reported held the device that long for nothing. Called
+    by the submit that produced the report; ``False`` when the run is not over
+    or cannot be read, so a live run is never released. Idempotent.
+    """
+    if not _run_is_finished(run_id, session_token):
+        return False
+    _release_device_lock(run_id, session_token)
+    return run_lease_release.mark_released(run_id, session_token)

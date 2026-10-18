@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from tools.mobile import dump_reuse
+from tools.mobile import dump_reuse, step_timing
 from tools.mobile.adb_host import host
 from tools.process_runner import ArunOpts, arun
 
@@ -72,6 +72,15 @@ async def _spawn_noting(cmd: list[str], timeout: float, stdin: bytes | None):
         dump_reuse.note_command(cmd)
 
 
+async def _spawn_timed(cmd: list[str], timeout: float, stdin: bytes | None):
+    """``_spawn_noting``, its wall time ledgered as ``adb`` unless it is a dump
+    (the dump is timed, and named, by its own phase)."""
+    run = _spawn_noting(cmd, timeout, stdin)
+    if dump_reuse.body_of(cmd).startswith("uiautomator dump"):
+        return await run
+    return await step_timing.timed("adb", run)
+
+
 async def run_argv(
     cmd: list[str], timeout: float, stdin_data: bytes | None = None
 ) -> tuple[int, bytes, bytes]:
@@ -81,7 +90,7 @@ async def run_argv(
     ``asyncio.TimeoutError`` on overrun; both are converted by the callers
     below, so nothing raises past this module.
     """
-    r, clock = await _spawn_noting(cmd, timeout, stdin_data)
+    r, clock = await _spawn_timed(cmd, timeout, stdin_data)
     if r.timed_out:
         _warn_timed_out(cmd, timeout, stdin_data)
     if r.exc is not None:

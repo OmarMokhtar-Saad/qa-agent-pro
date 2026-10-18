@@ -8,7 +8,7 @@ import logging
 
 from config.settings_guard import never_raise
 from tools import tool_status
-from tools.mobile import a11y_events, step_timing
+from tools.mobile import a11y_events, a11y_reread, step_timing
 from tools.mobile.adb_consts import DUMP_REMOTE_PATH, FIRST_DUMP_TIMEOUT_S
 from tools.mobile.adb_host import host
 
@@ -195,6 +195,5 @@ async def _bounded_dump(serial: str) -> dict:
 async def uiautomator_dump(serial: str, *, use_provider: bool = True) -> dict:
     """The current screen's uiautomator XML, as a string."""
     fast = await _fast_dump(serial, use_provider)
-    if fast is not None:
-        return fast
-    return _dump_reply(await _bounded_dump(serial))
+    fast = fast or (a11y_reread.take(serial) if use_provider else None)
+    return fast or _dump_reply(await _bounded_dump(serial))

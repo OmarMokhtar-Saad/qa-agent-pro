@@ -48,11 +48,11 @@ def _with_caller(row: dict) -> dict:
 
 
 def on_phase(state: dict, name: str, ms: int) -> None:
-    """A timed phase ended: trace it, and ledger it when it was a dump."""
+    """A timed phase ended: trace it and ledger it (a dump is reason ``dump``)."""
     _push(state.setdefault("trace", []), name, MAX_TRACE_NAMES)
-    if name == "ui_dump":
-        row = _with_caller({"reason": "dump", "ms": int(ms), "skipped": False})
-        _push(state.setdefault("ledger", []), row, MAX_LEDGER_ROWS)
+    reason = "dump" if name == "ui_dump" else name
+    row = _with_caller({"reason": reason, "ms": int(ms), "skipped": False})
+    _push(state.setdefault("ledger", []), row, MAX_LEDGER_ROWS)
 
 
 def on_mark(state: dict, name: str) -> None:

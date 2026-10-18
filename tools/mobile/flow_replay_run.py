@@ -14,6 +14,7 @@ from typing import Any, NamedTuple
 from tools.mobile import (
     actions,
     flow_replay_batch,
+    flow_replay_dialog,
     flow_replay_match,
     flow_replay_stop,
     media,
@@ -140,7 +141,7 @@ def _gate(ctx: Any, plan: Plan, batch: flow_replay_batch.Batch) -> Any:
         landed, latest = await _land(ctx, screen, want)
         return latest, ("" if landed else WRONG_SCREEN)
 
-    return gate
+    return flow_replay_dialog.guarded(gate, plan.template, batch.origin)
 
 
 async def _finish(ctx: Any, plan: Plan, walk: Walk) -> Walk:
@@ -152,7 +153,8 @@ async def _finish(ctx: Any, plan: Plan, walk: Walk) -> Walk:
     meta = plan.template.get("meta") or {}
     after = (meta.get("after") or [""] * walk.pos)[walk.pos - 1]
     landed, screen = await _land(ctx, walk.screen, (after,) if after else ())
-    why = "" if landed else flow_replay_stop.UNRECORDED
+    ended = walk.pos >= len(plan.template.get("steps") or [])  # nothing to diverge from
+    why = "" if landed or ended else flow_replay_stop.UNRECORDED
     return Walk(screen, walk.pos, walk.trace, why)
 
 

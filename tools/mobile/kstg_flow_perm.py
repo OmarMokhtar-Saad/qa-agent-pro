@@ -12,7 +12,8 @@ from tools.mobile import dialog_permission
 _OPS = frozenset({"tap", "tap_text_if_present", "wait_until_gone"})
 
 
-def _label(act: dict) -> str:
+def label(act: dict) -> str:
+    """The visible text the step taps or waits on."""
     target = act.get("target")
     if isinstance(target, dict):
         return str(target.get("text") or target.get("label") or "")
@@ -21,7 +22,7 @@ def _label(act: dict) -> str:
 
 def kind(act: dict) -> str:
     """``"perm"`` for a permission answer, ``"other"``, or ``""`` for a neutral wait."""
-    if act.get("op") in _OPS and dialog_permission.is_permission_button(_label(act)):
+    if act.get("op") in _OPS and dialog_permission.is_permission_button(label(act)):
         return "perm"
     return "" if str(act.get("op")).startswith("wait_") else "other"
 

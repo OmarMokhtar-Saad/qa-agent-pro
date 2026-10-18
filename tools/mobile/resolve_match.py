@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable, NamedTuple, Optional, Sequence
 
+from tools.mobile.resolve_exact import tolerant_exact
 from tools.mobile.resolve_types import (
     _IGNORED_WORDS,
     ASK,
@@ -108,6 +109,17 @@ def _matches(text: str, pool: tuple, opts: PickOpts) -> tuple:
     return best if len(hits) > 1 and best else hits
 
 
+def _tolerant(text: str, pool: tuple, opts: PickOpts) -> Optional[Resolution]:
+    """The one candidate equal to the hint ignoring case, spaces and punctuation
+    (fuzzy matching only; ids such as serials stay exact)."""
+    if opts.match is not fuzzy_match:
+        return None
+    found = tolerant_exact(text, pool)
+    if len(found) != 1:
+        return None
+    return Resolution(RESOLVED, found[0].key, (found[0],), how="exact")
+
+
 def decide(
     text: str, candidates: Sequence[Candidate], opts: PickOpts = _DEFAULT
 ) -> Resolution:
@@ -119,6 +131,9 @@ def decide(
     exact = _exact(pool, wanted)
     if len(exact) == 1:
         return Resolution(RESOLVED, exact[0].key, (exact[0],), how="exact")
+    tolerant = _tolerant(text, pool, opts)
+    if tolerant is not None:
+        return tolerant
     hits = _matches(text, pool, opts)
     if len(hits) == 1:
         return Resolution(RESOLVED, hits[0].key, hits, how="single")

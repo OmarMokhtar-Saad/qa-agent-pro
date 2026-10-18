@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+from tools.mobile import flow_replay_dialog
+
 KEY_CHARS = 12
 MAX_LISTED = 8
 
@@ -83,6 +85,8 @@ def text(head: Head, pos: int, why: str) -> str:
     base = "auto-replayed flow `%s`: %s" % (head.name, _span(head, pos))
     ran = done_lines(head, pos)
     steps = "\nreplayed: " + "; ".join(ran) if ran else ""
+    for said in flow_replay_dialog.answers(head.template, head.start, pos):
+        steps += "\n" + said + "."
     if not why:
         return "%s, %s.%s" % (base, _landed(head, pos), steps)
     left = total - pos

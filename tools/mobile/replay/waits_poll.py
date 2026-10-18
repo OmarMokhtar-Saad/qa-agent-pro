@@ -8,6 +8,7 @@ from tools.mobile import dump_latency, latency_scale, watch
 from tools.mobile.replay.context import Context, _sleep
 from tools.mobile.replay.context_consts import (
     DEFAULT_WAIT_UNTIL_TEXT_S,
+    WAIT_POLL_MAX_S,
     WAIT_POLL_S,
 )
 from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
@@ -58,20 +59,22 @@ async def _next_read(ctx: Context, current: object, pace: Pace) -> tuple:
     return final, content, time.monotonic() - started
 
 
-def _pause_after(took: float) -> float:
+def _pause_after(took: float, quiet: int = 0) -> float:
     """The pause before the next read: a dump that already took a poll interval
-    or longer is itself the pause, so none is added."""
-    return 0.0 if took >= WAIT_POLL_S else WAIT_POLL_S
+    or longer is itself the pause, so none is added. After *quiet* unchanged
+    reads the interval doubles each time, up to ``WAIT_POLL_MAX_S``."""
+    interval = min(WAIT_POLL_S * (2 ** max(0, quiet)), WAIT_POLL_MAX_S)
+    return 0.0 if took >= interval else interval
 
 
 async def _poll(ctx: Context, current: object, poll: Poll) -> tuple:
     """One poll: ``(final, content, took, verdict)``. Verdict ``"calm"`` means
     the gate vouched for *current* and no dump was taken."""
-    gate, deadline, took = poll
+    gate, deadline, took, quiet = poll
     verdict = await gate.verdict(current, deadline) if gate else ""
     if verdict == "calm":
         return None, current, took, verdict
-    pause = 0.0 if verdict else _pause_after(took)
+    pause = 0.0 if verdict else _pause_after(took, quiet)
     final, content, took = await _next_read(ctx, current, Pace(deadline, pause))
     return final, content, took, verdict
 
@@ -105,21 +108,21 @@ async def _wait_for(ctx: Context, screen: object, probe: Probe) -> tuple:
 async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
     """The poll loop of :func:`_wait_for` for a condition not yet met."""
     deadline, ticker, gate, current = await _begin(ctx, screen, probe)
-    previous, took = None, 0.0
+    previous, took, quiet = None, 0.0, 0
     while True:
         if probe.met(previous, current):
             return True, current, False
         if _interrupted(ctx, current, screen):
             return False, current, False
         final, content, took, verdict = await _poll(
-            ctx, current, Poll(gate, deadline, took)
+            ctx, current, Poll(gate, deadline, took, quiet)
         )
         if verdict == "calm":
             previous = current
             continue
         if final:
             return final
-        previous, current = current, content
+        quiet, previous, current = (quiet + 1) * (content == current), current, content
         gate = await rebased(gate, content) if verdict in KEEPS_GATE else None
         await ticker.tick()
 

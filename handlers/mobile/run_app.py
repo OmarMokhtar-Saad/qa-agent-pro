@@ -5,6 +5,7 @@ from __future__ import annotations
 import tools.mobile.session_device as session_device
 from handlers import _common
 from handlers.mobile import run_skipped
+from handlers.mobile.run_app_tester import installed_tester
 from handlers.mobile.run_install import (
     _app_stage_not_installed,
     _app_stage_open_store,
@@ -127,6 +128,16 @@ def _inferred_source(call: _AppCall) -> str:
     return "" if from_goal in ("download_url", "local_apk") else from_goal
 
 
+async def _only_viable_source(call: _AppCall, target: str) -> str:
+    """``app_tester`` when App Tester is installed on the device and nothing else
+    names a source: the one route that needs no link, file or store login, so the
+    start does not stop to ask for it. ``""`` when it is not installed, or when no
+    app is named yet (the menu asks which app, so the device is not probed)."""
+    if not target:
+        return ""
+    return "app_tester" if await installed_tester(call.serial) else ""
+
+
 async def _app_stage_install(call: _AppCall, st: tuple, probe: tuple) -> tuple:
     """The install branches once the probe found no finished answer."""
 
@@ -134,6 +145,7 @@ async def _app_stage_install(call: _AppCall, st: tuple, probe: tuple) -> tuple:
     probed, suggestions = probe
     # An empty source is inferred from the app text; ask only if that is unclear.
     install_source = install_source or _inferred_source(call)
+    install_source = install_source or await _only_viable_source(call, target)
     if not install_source:
         return mobile_render.install_menu_markdown(target, probed=probed), target
     if not call.apply:

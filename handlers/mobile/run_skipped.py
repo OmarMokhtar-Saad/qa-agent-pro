@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tools.mobile import imes_upgrade
+from tools.untrusted import single_line
 
 _SKIPPED: dict[str, tuple[str, str]] = {}
 _TESTER: dict[str, tuple[str, bool]] = {}
@@ -47,7 +48,8 @@ async def _tester_note(serial: str, launched: bool) -> str:
     if not package:
         return ""
     version = await imes_upgrade.installed_version(serial, package)
-    have = "`" + package + "`" + (" v" + version if version else "")
+    have = "`" + single_line(package) + "`"
+    have += " v" + single_line(version, 40) if version else ""
     how = "installed just now" if fresh else "already the latest build"
     return (
         "> App Tester step done by this server: "
@@ -61,29 +63,46 @@ async def _tester_note(serial: str, launched: bool) -> str:
     )
 
 
-def _home_note(state: str) -> str:
-    if state != "home":
-        return ""
-    return (
-        "> Launch skipped: the goal starts from the home screen and no install "
-        "step ran, so the app was not opened. Open it the way the goal says.\n\n"
-    )
+_NOT_LAUNCHED = {
+    "home": "the goal starts from the home screen and no install step ran",
+    "off": "launch=false was passed",
+}
+
+
+def _launch_note(state: str) -> str:
+    """The reply line for a start where the server did not open the app, or must
+    still show the home screen the goal asked to confirm."""
+    if state == "launched+check":
+        return (
+            "> The goal asks to confirm the home screen. The app was launched first, "
+            'so the first packet shows the app: send {"op": "home"} first and '
+            "confirm the home screen in that result before the next step.\n\n"
+        )
+    if state in _NOT_LAUNCHED:
+        return (
+            "> App NOT opened ("
+            + _NOT_LAUNCHED[state]
+            + "): the app under test is not open and the first screen is whatever "
+            "the device shows. Open it the way the goal says, or re-call without "
+            "launch=false to have the server open it.\n\n"
+        )
+    return ""
 
 
 async def take_note(serial: str) -> str:
     """Markdown for the install steps done or skipped on *serial* (once), or ``""``."""
     state = _LAUNCH.pop(serial, "launched")
-    tester = await _tester_note(serial, state == "launched")
+    tester = await _tester_note(serial, state.startswith("launched"))
     target, asked = _SKIPPED.pop(serial, ("", ""))
     if not target:
-        return tester or _home_note(state)
+        return tester + _launch_note(state)
     version = await imes_upgrade.installed_version(serial, target)
     have = "already installed" + (" v" + version if version else "")
     return (
         "> Skipped: install of `"
-        + target
+        + single_line(target)
         + "` (source `"
-        + asked
+        + single_line(asked)
         + "`), "
         + have
         + ". Ask the user whether they want a reinstall or update; "

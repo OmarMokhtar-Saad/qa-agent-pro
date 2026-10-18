@@ -12,6 +12,7 @@ from tools.mobile.replay.screen import (
     system_dialog_detail,
     system_dialog_package,
 )
+from tools.mobile.replay.settle_mark import ScreenMark, _unchanged
 
 
 class CutView(NamedTuple):
@@ -70,3 +71,23 @@ def _cut_detail(cut: Cut, ctx: Context, entry: dict) -> str:
     )
     refused = str(entry.get("dialog_refused") or "")
     return (base + " " + refused).strip() if refused else base
+
+
+# A cut is about where an action TOOK the device. A screen identical to the one
+# the action started from was not reached by it: the app may still be on its way
+# (a tap on "Open" in an installer launches the app under test a moment later)
+# or the read is stale (a dialog the model just answered). Cutting on it stops a
+# turn mid-way on a screen the model already saw, so only a MOVED screen cuts.
+def moved_by_action(entry: dict) -> bool:
+    """Whether the entry's after-read differs from its before-read (unknown: yes)."""
+    before = ScreenMark(
+        str(entry.get("before_screen_hash") or ""),
+        str(entry.get("before_screen_id") or ""),
+    )
+    if not (before.content_hash or before.screen_id):
+        return True
+    after = ScreenMark(
+        str(entry.get("after_screen_hash") or ""),
+        str(entry.get("after_screen_id") or ""),
+    )
+    return not _unchanged(before, after)

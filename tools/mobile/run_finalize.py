@@ -85,8 +85,11 @@ def _finalized(body: dict) -> dict | None:
     return {**body, "status": "done", "updated": time.time()}
 
 
-def finalize_explore_cases(run_id: str) -> None:
-    """Close every turn still "needs_model" once the run has stopped. Never raises."""
+def finalize_explore_cases(run_id: str) -> bool:
+    """Close every turn still "needs_model" once the run has stopped. Never raises.
+
+    True when every case was read and closed; False when something failed."""
+    done = False
     with never_raise(
         logger,
         "mobile.session: could not finalize explore turns",
@@ -96,6 +99,8 @@ def finalize_explore_cases(run_id: str) -> None:
             closed = _finalized(body) if isinstance(body, dict) else None
             if closed is not None:
                 run_store.write_case(run_id, str(closed["tc_id"]), closed)
+        done = True
+    return done
 
 
 def finalize(run_id: str, verdict: object, *, stop: str = "") -> bool:

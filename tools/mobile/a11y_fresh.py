@@ -35,7 +35,7 @@ import hashlib
 import logging
 from typing import Any, Awaitable, Callable
 
-from tools.mobile import a11y_clock, adb, dump_reuse, step_timing
+from tools.mobile import a11y_clock, a11y_reread, adb, dump_reuse, step_timing
 from tools.mobile.a11y_confirm import uiautomator_aside
 from tools.mobile.a11y_parity import compare, node_digest
 
@@ -107,11 +107,13 @@ def _stale(serial: str, digest: str) -> dict:
 
 async def _judge(serial: str, xml: str) -> dict | None:
     """``None`` when uiautomator confirms *xml*, else the refusal to return."""
+    under = dump_reuse.token(serial)
     slow = await uiautomator_aside(serial, CONFIRM_SOURCE)
     if slow.get("error"):
         step_timing.note(UNCHECKED_NOTE)
         return {"error": UNCHECKED_REFUSAL, "content": None}
     if compare(xml, str(slow.get("content") or "")).get("error"):
+        a11y_reread.keep(serial, under, slow)
         return _stale(serial, _digest(xml))
     step_timing.note(CONFIRMED_NOTE)
     return None

@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.132.0] - 2026-10-18
+## [1.133.0] - 2026-10-18
 
 ### Added
 
@@ -100,6 +100,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - The fast screen reader's remembered start check is written safely,
   ignores corrupt or future-dated entries, and is reset when its
   screen-read rules change.
+- A turn is cut for leaving the app or for a system dialog only when
+  its own action moved the screen; an unchanged screen never cuts.
+- A replayed route that reaches its end is no longer counted as a
+  divergence; replay stops before a step that is not a dialog answer
+  while a dialog is open, and the replay note lists the dialog answers
+  it made.
+- A goal that checks the home screen opens the app only when it
+  should, and the start reply says whether the app was opened.
+- App names of two or more words match even when written loosely;
+  a run with no build source picks App Tester when it is the only one.
+- A finished run releases its device lease when the report is sent.
+- The step time table lists time not covered by any named part as
+  'unitemised', and device commands are timed as 'adb'.
+- Screen waits check less often while nothing changes (up to once a
+  second), so they use less device time.
+- When the fast screen reader is found stale, the slow screen read that
+  proved it is reused, so the screen is read once instead of twice.
 
 ### Known
 

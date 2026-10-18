@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import held_inputs
+from tools.mobile import heartbeat_beat, held_inputs
 from tools.mobile.replay.context import Context
 from tools.mobile.session_core import LANE_EXPLORE, STATE_REPORT
 from tools.mobile.session_runs import resolve
@@ -48,10 +48,22 @@ async def submit(call: SubmitCall) -> dict:
         prepared = prepare_submit(call, resolved)
         if isinstance(prepared, dict):
             return prepared
-        return await _submit_lane(call, prepared)
+        return _released_on_report(call, await _submit_lane(call, prepared))
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.submit failed")
         return {"error": str(exc), "content": None}
+
+
+def _released_on_report(call: SubmitCall, reply: dict) -> dict:
+    """*reply*, after the device is freed when it carries the run's report.
+
+    The report is written after this returns; the device is not needed for it,
+    so it is not held until the next heartbeat beat notices the run is over.
+    """
+    content = reply.get("content") if isinstance(reply, dict) else None
+    if isinstance(content, dict) and content.get("state") == STATE_REPORT:
+        heartbeat_beat.release_if_finished(call.run_id, call.session_token)
+    return reply
 
 
 async def _submit_lane(call: SubmitCall, prepared: tuple[Context, dict, str]) -> dict:

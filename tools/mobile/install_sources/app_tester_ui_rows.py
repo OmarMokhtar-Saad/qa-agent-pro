@@ -12,6 +12,7 @@ import re
 from typing import NamedTuple
 from xml.etree import ElementTree
 
+from tools.mobile.resolve_exact import squash
 from tools.safe_parse import parse_xml
 
 LIST_RID = ":id/appListRecyclerView"
@@ -95,11 +96,19 @@ def derive_label(package: str) -> str:
 
 
 def matching_rows(label: str, rows) -> list:
-    """Rows whose name and bundle words hold every word of *label*."""
+    """Rows whose name and bundle words hold every word of *label*; failing
+    that, rows whose name or bundle holds it ignoring case, spaces and
+    punctuation ("AcmeQA" finds "Acme QA")."""
     want = _words(label)
     if not want:
         return []
-    return [row for row in rows if want <= _words(row.name) | _words(row.bundle)]
+    found = [row for row in rows if want <= _words(row.name) | _words(row.bundle)]
+    return found or _squashed_rows(label, rows)
+
+
+def _squashed_rows(label: str, rows) -> list:
+    flat = squash(label)
+    return [r for r in rows if flat in squash(r.name) or flat in squash(r.bundle)]
 
 
 def _top_edge(node: ElementTree.Element) -> int | None:

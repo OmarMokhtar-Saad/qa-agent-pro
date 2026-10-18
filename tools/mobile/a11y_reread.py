@@ -1,0 +1,45 @@
+"""The uiautomator read a stale verdict already paid for, handed to the dump that follows.
+
+``a11y_fresh`` proves a repeated tree with one uiautomator dump. When that dump
+contradicts the a11y tree the provider refuses, and ``adb.uiautomator_dump`` used to
+read the same screen a SECOND time (measured: a 4.7 s step-1 dump, two uiautomator
+reads back to back). The first read IS the real screen, so it is kept here for that
+one call. It is served only if no device command that may move the screen ran since
+the read began (the :mod:`tools.mobile.dump_reuse` generation) and it is young; it is
+spent once. Anything else falls through to a fresh dump, so a screen read before an
+action is never treated as current.
+"""
+
+from __future__ import annotations
+
+import time
+
+from tools.mobile import dump_reuse
+
+#: Seconds a kept read may wait for the dump that follows its refusal.
+MAX_AGE_S = 2.0
+
+#: serial -> (generation the read began under, monotonic time, the dump envelope).
+_KEPT: dict[str, tuple[int, float, dict]] = {}
+
+
+def keep(serial: str, under: int, read: dict) -> None:
+    """Keep *read* (a clean uiautomator envelope) begun under generation *under*."""
+    if read.get("error") or not read.get("content"):
+        return
+    _KEPT[str(serial)] = (under, time.monotonic(), read)
+
+
+def take(serial: str) -> dict | None:
+    """The kept read when no actuation ran since it began and it is young, once."""
+    kept = _KEPT.pop(str(serial), None)
+    if kept is None:
+        return None
+    under, at, read = kept
+    fresh = time.monotonic() - at <= MAX_AGE_S
+    return read if fresh and under == dump_reuse.token(str(serial)) else None
+
+
+def reset() -> None:
+    """Forget every kept read. For tests."""
+    _KEPT.clear()

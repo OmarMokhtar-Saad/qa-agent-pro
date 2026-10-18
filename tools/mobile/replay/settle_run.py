@@ -20,7 +20,13 @@ from tools.mobile.replay.settle_auto import (
     _auto_settle_seen,
     _probe_skip,
 )
-from tools.mobile.replay.settle_cut import Cut, CutView, _cut_detail, _cut_of
+from tools.mobile.replay.settle_cut import (
+    Cut,
+    CutView,
+    _cut_detail,
+    _cut_of,
+    moved_by_action,
+)
 from tools.mobile.replay.settle_dialog import _answer_dialogs
 from tools.mobile.replay.settle_mark import (
     ScreenMark,
@@ -71,7 +77,7 @@ async def _settle(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
     screen, outcome = await _settle_unchanged(job, screen, opts)
     _record_outcome(job.entry, outcome)
     cut = _cut_of(job.ctx, view._replace(screen=screen))
-    if cut.kind:
+    if cut.kind and moved_by_action(job.entry):
         return screen, _cut_stop(job, screen, cut)
     return screen, None
 

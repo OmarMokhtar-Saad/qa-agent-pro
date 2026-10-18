@@ -44,6 +44,11 @@ STATUS_UNVERIFIED = "unverified"
 #: and asserts the ordering this reasoning rests on.
 WAIT_POLL_S = 0.25
 
+#: The longest pause a watched poll backs off to while the screen stays the
+#: same: the pause doubles per unchanged read from ``WAIT_POLL_S`` up to this,
+#: so a long wait on a static screen is not 13 dumps in 3 s. Any change resets it.
+WAIT_POLL_MAX_S = 1.0
+
 #: The longest :func:`_auto_settle` keeps reading after a screen-changing
 #: action whose first post-action read showed NO change (owner decision, batch
 #: 3). A slow app paints its next screen after the dump that followed the tap,

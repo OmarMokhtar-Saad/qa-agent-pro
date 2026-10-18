@@ -64,7 +64,7 @@ def _serial_of(cmd: list[str]) -> str:
     return cmd[cmd.index("-s") + 1] if "-s" in cmd[:-1] else ""
 
 
-def _body_of(cmd: list[str]) -> str:
+def body_of(cmd: list[str]) -> str:
     for verb in ("shell", "exec-out"):
         if verb in cmd:
             return " ".join(cmd[cmd.index(verb) + 1 :]).strip()
@@ -73,7 +73,7 @@ def _body_of(cmd: list[str]) -> str:
 
 def is_read_only(cmd: list[str]) -> bool:
     """True only for a command known not to change the screen."""
-    body = _body_of(cmd)
+    body = body_of(cmd)
     if body:
         return body.startswith(READ_ONLY_PREFIXES) or dump_neutral.neutral_body(body)
     return any(v in cmd[1:] for v in READ_ONLY_VERBS) or dump_neutral.neutral_pull(cmd)
@@ -97,7 +97,7 @@ def _keyboard_switch_is_neutral(serial: str, cmd: list[str]) -> bool:
     """A keyboard switch while no held dump shows a keyboard leaves them valid."""
     entries = (_HELD.get(serial), _LAST.get(serial))
     held = [e[0].get("content") for e in entries if e]
-    return dump_ime_neutral.keeps_held(serial, _body_of(cmd), held)
+    return dump_ime_neutral.keeps_held(serial, body_of(cmd), held)
 
 
 def bump(serial: str) -> None:

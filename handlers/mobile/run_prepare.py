@@ -12,7 +12,7 @@ from handlers.mobile.run_request import _MobileTestRequest
 from tools.mobile import adb as mobile_adb
 from tools.mobile import preflight as mobile_preflight
 from tools.mobile import render as mobile_render
-from tools.mobile.goal_home_start import goal_starts_at_home
+from tools.mobile.goal_home_start import goal_checks_home, goal_starts_at_home
 from tools.untrusted import single_line as _safe
 
 
@@ -39,7 +39,10 @@ async def _launch_for_start(req: _MobileTestRequest, serial: str, target: str) -
         and goal_starts_at_home(req.goal)
     )
     launch = req.launch and not home
-    run_skipped.mark_launch(serial, "home" if home else "launched" if launch else "off")
+    state = "home" if home else "off"
+    if launch:
+        state = "launched+check" if goal_checks_home(req.goal) else "launched"
+    run_skipped.mark_launch(serial, state)
     await _mobile_launch_target(serial, target if launch else "")
 
 
