@@ -31,6 +31,8 @@ BLANK_MAX_BYTES = 64
 #: Frame digests whose blank verdict is remembered (oldest dropped first).
 MAX_BLANK_VERDICTS = 256
 _BLANK: dict = {}
+#: The latest framed reading per serial: a frame equal (or static) to it keeps its focus.
+_LAST: dict = {}
 _HEX32 = re.compile(r"\b[0-9a-f]{32}\b")
 
 
@@ -83,9 +85,29 @@ async def _read_frame(serial: str, budget: float) -> Reading | None:
     frame = await screen_frame.fetch(serial, budget)
     if frame is None:
         return None
+    named = _kept_focus(serial, frame) or await focus(serial, budget)
+    reading = Reading(named, frame.digest, frame.words, frame.flat)
+    _LAST[str(serial)] = reading
+    return reading
+
+
+def _kept_focus(serial: str, frame: object) -> str:
+    """The focus of the last reading when *frame* shows the same pixels, else ``""``.
+
+    One ``dumpsys window`` per poll was 52 calls in one step; a window cannot
+    change under pixels that did not move (a flat frame proves nothing).
+    """
+    last = _LAST.get(str(serial))
+    if last is None or not last.focus or frame.flat or not last.frame:
+        return ""
+    same = last.digest == frame.digest or screen_frame.static(last.frame, frame.words)
+    return last.focus if same else ""
+
+
+async def focus(serial: str, budget: float) -> str:
+    """The focused ``package/Activity`` alone (no screencap), or ``""`` when unknown."""
     out = await _shell(serial, FOCUS_CMD, budget)
-    focus = adb_facts.focused_component(out or "")
-    return Reading(focus, frame.digest, frame.words, frame.flat)
+    return adb_facts.focused_component(out or "")
 
 
 async def read(serial: str, budget: float) -> Reading | None:

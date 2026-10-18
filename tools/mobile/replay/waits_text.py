@@ -31,7 +31,7 @@ async def _wait_until_text(ctx: Context, screen: object, want: TextWait) -> tupl
         has = _screen_has(current, text)
         return absent_from(current, has) if gone else has
 
-    return await _wait_for(ctx, screen, Probe(ms, met, label, TEXT))
+    return await _wait_for(ctx, screen, Probe(ms, met, label, TEXT, not gone))
 
 
 async def _wait_until_idle(ctx: Context, screen: object, ms: int) -> tuple:

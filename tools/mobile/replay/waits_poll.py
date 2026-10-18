@@ -14,8 +14,9 @@ from tools.mobile.replay.context_consts import (
 from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
 from tools.mobile.replay.probe_gate import KEEPS_GATE, TEXT, open_gate, rebased
 from tools.mobile.replay.screen import _screen_has_element, absent_from
-from tools.mobile.replay.waits_early import gate_is_noise, rest_pause
+from tools.mobile.replay.waits_early import gate_is_noise, quiet_exit, rest_pause
 from tools.mobile.replay.waits_interrupt import _interruption_of
+from tools.mobile.replay.waits_prior import _spinning
 from tools.mobile.replay.waits_quiet import settled
 from tools.mobile.replay.waits_types import Pace, Poll, Probe
 
@@ -146,8 +147,16 @@ async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
         if final:
             return final
         quiet, previous, current = (quiet + 1) * (content == current), current, content
+        if _early_exit(ctx, probe, (quiet, current)):
+            return False, current, True
         gate = await _keep_gate(gate, content, (verdict, quiet))
         await ticker.tick()
+
+
+def _early_exit(ctx: Context, probe: Probe, seen: tuple) -> bool:
+    """True when a wait for text may give up: a quiet, non-loading screen."""
+    quiet, current = seen
+    return probe.early and not _spinning(current) and quiet_exit(ctx.serial, quiet)
 
 
 def _element_met(rid: str, text: str, gone: bool):

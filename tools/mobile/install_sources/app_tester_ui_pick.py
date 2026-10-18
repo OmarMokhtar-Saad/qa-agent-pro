@@ -110,11 +110,20 @@ async def _code_and_latest(read: Any, serial: str, package: str) -> tuple:
     return code, memory.known_latest(memory.Installed(serial, package, code))
 
 
+async def _why_no_code(read: Any, serial: str, package: str) -> str:
+    """Two different reasons, told apart: the app is not on the device, or it is
+    there and its version could not be read (the UI is needed either way)."""
+    have = await read(serial, package)
+    if have is None:
+        return "app missing on the device: the UI is needed"
+    return "version unreadable (app present): the UI is needed"
+
+
 async def latest_verdict(read: Any, serial: str, package: str) -> tuple:
     """``(is_latest, reason)``: one cheap version read, no UI; says why."""
     code, latest = await _code_and_latest(read, serial, package)
     if code is None:
-        return False, "version unreadable or app missing: the UI is needed"
+        return False, await _why_no_code(read, serial, package)
     if latest is None:
         return True, "installed code %s, no listing remembered: kept" % code
     if code >= latest:

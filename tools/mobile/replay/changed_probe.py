@@ -21,6 +21,7 @@ from tools.mobile.replay.dump import _dump
 from tools.mobile.replay.fresh_read import dump_known_fresh, fresh_read
 from tools.mobile.replay.probe_gate import PROBE_BUDGET_S, wait_moved
 from tools.mobile.replay.screen import _screen_hash, system_dialog_package
+from tools.mobile.replay.waits_early import check_horizon
 from tools.mobile.replay.waits_prior import _spinning
 
 
@@ -39,8 +40,8 @@ async def _reusable(ctx: Context, screen: object, base: screen_probe.Reading) ->
     """True when the changed screen is no spinner and focus still equals the baseline's."""
     if not base.focus or _spinning(screen):
         return False
-    now = await screen_probe.read(ctx.serial, PROBE_BUDGET_S)
-    return now is not None and now.focus == base.focus
+    # Focus only: the frame is not needed to know the window did not move.
+    return await screen_probe.focus(ctx.serial, PROBE_BUDGET_S) == base.focus
 
 
 async def _still_shown(ctx: Context, screen: object) -> bool:
@@ -104,23 +105,70 @@ async def _on_move(ctx: Context, plan: Plan, now: object) -> tuple:
     return dumped.get("content"), None
 
 
-async def probed_changed(ctx: Context, screen: object, plan: Plan) -> tuple:
-    """``(screen, changed, reusable)`` like ``_wait_until_changed``, probe-driven."""
-    before, base = _screen_hash(screen), plan.base
-    until = plan.deadline - (dump_latency.p90_ms(ctx.serial) or 0) / 1000.0
-    current, fresh = screen, False
-    while time.monotonic() < until and (moved := await wait_moved(ctx, base, until)):
-        got, outcome = await _on_move(ctx, Plan(base, plan.deadline), moved)
-        if got is None:
-            return (current, *outcome)
-        current, fresh = got, True
-        if _screen_hash(current) != before:
-            return current, True, await _reusable(ctx, current, base)
-        if system_dialog_package(current):  # unchanged AND covered: stop polling
-            return current, False, False
-        base, fresh = await _rebaseline(ctx, current)
-        if base is None:
-            break
-    if fresh and base:
+async def _recheck(ctx: Context, plan: Plan) -> object:
+    """A real dump taken while the probe stayed quiet: its screen, or ``None`` (retry).
+
+    A failed or cut dump is no evidence of "no change": the wait goes on and
+    asks again, it never ends on it.
+    """
+    dumped = await _dump(ctx, deadline=plan.deadline)
+    return None if dumped.get("error") else dumped.get("content")
+
+
+async def _next_screen(ctx: Context, plan: Plan, until: float) -> tuple:
+    """``(screen, outcome, kind)``: the next screen to judge, kind ``move``,
+    ``check`` or ``over``.
+
+    *screen* is a dump when the frame moved, or (qa-ime a11y reader, cheap
+    dumps) when ``CHANGED_CHECK_S`` of quiet passed: a change the frame probe
+    cannot see (text under the pixel tolerance) ends the wait at the next check
+    instead of at the cap. *outcome* is ``None`` to keep waiting.
+    """
+    horizon = check_horizon(ctx.serial, until)
+    moved = await wait_moved(ctx, plan.base, horizon)
+    if moved is None and horizon >= until:
+        return None, None, "over"
+    if moved is None:
+        return await _recheck(ctx, plan), None, "check"
+    got, outcome = await _on_move(ctx, plan, moved)
+    return got, outcome, "move"
+
+
+async def _verdict(ctx: Context, current: object, seen: tuple) -> object:
+    """``(screen, changed, reusable)`` when *current* ends the wait, else ``None``."""
+    before, base = seen
+    if _screen_hash(current) != before:
+        return current, True, await _reusable(ctx, current, base)
+    if system_dialog_package(current):
+        return current, False, False
+    return None
+
+
+async def _finish(ctx: Context, current: object, held: tuple) -> tuple:
+    """The answer once the loop ended: agreed on a bracketed baseline, else confirmed."""
+    bracketed, plan = held
+    if bracketed:
         return await _agreed(ctx, current, plan)
     return await _confirm(ctx, current, plan)
+
+
+async def probed_changed(ctx: Context, screen: object, plan: Plan) -> tuple:
+    """``(screen, changed, reusable)`` like ``_wait_until_changed``, probe-driven."""
+    before, base, current, fresh = _screen_hash(screen), plan.base, screen, False
+    until = plan.deadline - (dump_latency.p90_ms(ctx.serial) or 0) / 1000.0
+    while time.monotonic() < until:
+        got, outcome, kind = await _next_screen(ctx, Plan(base, plan.deadline), until)
+        if kind == "over":
+            break
+        if got is None and kind == "move":
+            return (current, *outcome)
+        if got is None:
+            continue
+        current, fresh = got, True
+        if ended := await _verdict(ctx, current, (before, base)):
+            return ended
+        if kind == "move":
+            base, fresh = await _rebaseline(ctx, current)
+        if base is None:
+            break
+    return await _finish(ctx, current, (fresh and base, plan))

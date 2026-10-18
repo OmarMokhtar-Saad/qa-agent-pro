@@ -125,8 +125,9 @@ async def _mobile_finish_pre_run(owner: str) -> None:
     # cannot be released here. `as_holder` is stated because the
     # placeholder has no lease to present -- this call minted the
     # label and is unambiguously its owner.
-    # The pre-run placeholder never typed, so the restore
-    # inside this is a reported no-op. It goes through the
+    # The pre-run placeholder never typed, but it may own the
+    # early a11y reader: the restore inside this gives that back
+    # (a no-op without a record). It goes through the
     # same door anyway, so the "no direct release in this
     # file" pin can be absolute rather than a list of
     # exceptions somebody has to keep correct.

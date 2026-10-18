@@ -5,10 +5,16 @@ from __future__ import annotations
 import logging
 
 from tools.mobile.act_notes import _action_notes, _budget_notes, _wait_notes
+from tools.mobile.act_schema_trim import trim_keeping
 from tools.mobile.action_consts import MAX_MODEL_ACTIONS
 from tools.mobile.action_schema import OPS, Script
 
 logger = logging.getLogger("tools.mobile.actions")
+
+#: ``$defs`` whose docstring is the model's only statement of what the validator
+#: accepts (``test_the_response_schema_documents_both_operand_shapes`` pins it),
+#: or of what a field means (ScrollAction: "down" reveals what is below).
+KEEP_DOCS = ("AssertAction", "ScrollAction")
 
 
 def describe_vocabulary() -> dict:
@@ -42,7 +48,7 @@ def response_schema() -> dict:
     try:
         schema = Script.model_json_schema()
         schema["properties"]["actions"]["maxItems"] = MAX_MODEL_ACTIONS
-        return schema
+        return trim_keeping(schema, KEEP_DOCS)
     except Exception:  # pragma: no cover - defensive
         logger.exception("mobile.actions.response_schema failed")
         return {"type": "object"}

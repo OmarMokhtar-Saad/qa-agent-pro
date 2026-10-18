@@ -41,6 +41,8 @@ _INSTALLING = (
     "system installer."
 )
 
+_SCANNING = "Reading the App Tester list to find the app."
+
 _ALREADY_LATEST = (
     "The installed app already is the latest build App Tester listed: nothing to "
     "download."
@@ -82,6 +84,7 @@ async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
     if not want.package:
         logger.info("app_tester: no known package for the label: scanning the list")
     ask = _mobile_ask(call.choose)
+    await _common.emit(call.progress, _SCANNING)
     bundle = await source.find_listed_app(want, ask)
     if isinstance(bundle, InstallOutcome):
         return _failed(bundle), ""

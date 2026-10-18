@@ -6,12 +6,17 @@ from typing import Any, NamedTuple
 
 
 class Probe(NamedTuple):
-    """One watched poll: the ms budget, ``met(previous, current)``, the ticker label."""
+    """One watched poll: the ms budget, ``met(previous, current)``, the ticker label.
+
+    *early* lets a wait for something to APPEAR end before its budget once the
+    screen is proven quiet (``waits_early.quiet_exit``).
+    """
 
     ms: int
     met: Any
     label: str
     gate: str = ""
+    early: bool = False
 
 
 class Pace(NamedTuple):

@@ -26,6 +26,7 @@ from handlers.mobile.run_device_prefs import (
 from handlers.mobile.run_device_prefs import (
     _mobile_keyboard_stage as mobile_keyboard_stage,  # noqa: F401
 )
+from handlers.mobile.run_early_a11y import early_a11y
 from handlers.mobile.run_handoff import (
     _mobile_hand_off as mobile_hand_off,  # noqa: F401
 )
@@ -135,6 +136,8 @@ async def _mobile_prepare_app(
     if capture_stage:
         return capture_stage, None
     await _mobile_offer_u2(req, serial)
+    if req.apply:  # the fast reader first: App Tester reads the list through it
+        await early_a11y(serial, owner, req.progress)
     stage, target = await mobile_app_stage(_app_call(req, serial))
     if stage:
         return stage, None

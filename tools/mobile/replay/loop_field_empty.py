@@ -21,8 +21,9 @@ if TYPE_CHECKING:
     from tools.mobile.replay.context import _ReplayRun
 
 ADVANCED_NOTE = (
-    "Typed, but the field read EMPTY afterwards (not confirmed as landed); the "
-    "screen then advanced, so the app most likely took it and submitted itself."
+    "Typed, but the field read EMPTY afterwards (not confirmed as landed; "
+    "read-back is unknown); the screen then advanced, so the app may have "
+    "taken it and submitted itself. Counted as unconfirmed, not verified."
 )
 
 

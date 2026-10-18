@@ -16,6 +16,7 @@ from typing import Optional
 
 from tools.mobile.install_sources import app_tester_ui_memory as memory
 from tools.mobile.install_sources.app_tester_ui_consts import (
+    CHEAP_EMPTY_READ_S,
     LISTING_DEADLINE_S,
     MAX_LISTING_SCROLLS,
     _Run,
@@ -73,7 +74,13 @@ class _Scan:
     async def _scroll(self, down: bool) -> list:
         """One scroll and the rows it shows ([] when none could be read)."""
         await (self.run.ui.scroll_down() if down else self.run.ui.scroll_up())
-        return await read_rows(self.run.ui)
+        started = time.monotonic()
+        rows = await read_rows(self.run.ui)
+        if not rows and time.monotonic() - started < CHEAP_EMPTY_READ_S:
+            # an empty read is "unknown", not the end of the list: a fast one is
+            # a screen caught mid-scroll, so one more read, not an aborted scan
+            rows = await read_rows(self.run.ui)
+        return rows
 
     async def down(self) -> None:
         """Scroll down until the package shows, the end is proven, a screen

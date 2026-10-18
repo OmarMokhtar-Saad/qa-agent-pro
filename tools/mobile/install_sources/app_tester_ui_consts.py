@@ -23,6 +23,8 @@ LISTING_DEADLINE_S = 90.0
 #: One: each is a ~11 s dump; the reread first waits (cheap foreground poll)
 #: for App Tester to be in front, so it reads a settled screen.
 MAX_EMPTY_REREADS = 1
+# an empty scroll read faster than this was a screen caught moving: read once more
+CHEAP_EMPTY_READ_S = 3.0
 
 #: Longest wait for App Tester to be the foreground app before that reread.
 FOREGROUND_WAIT_S = 3.0

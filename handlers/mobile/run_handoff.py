@@ -8,6 +8,7 @@ import logging
 import tools.mobile.device_lock as device_lock
 import tools.mobile.session_core as session_core
 from handlers import _common
+from handlers.mobile import run_early_a11y
 from handlers.mobile import step as mobile_step
 from handlers.mobile.run_device_prefs import _mobile_a11y_stage
 from handlers.mobile.run_hooks import mobile_run
@@ -52,6 +53,7 @@ async def _mobile_hand_off(
     if refused:
         return refused, False
     mobile_step.mobile_start_heartbeat(run_id, token)
+    await run_early_a11y.hand_over(pre_run_owner, run_id, progress)
     notes = await _mobile_first_stage_notes(run_id)
     rendered = await mobile_step.mobile_next(
         run_id, token, mobile_step.NextOpts(progress=progress, first_packet=True)

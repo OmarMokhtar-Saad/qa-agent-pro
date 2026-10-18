@@ -27,6 +27,14 @@ async def read_rows(ui: DeviceUi, xml: str | None = None) -> list:
     ``[]`` after that. It is never answered with the rows of an earlier screen."""
     if xml is None:  # no screen in hand: the first read is not a re-read
         xml = await _xml(ui)
+    rows, xml = await _reread(ui, xml)
+    if not rows:
+        await _log_empty(ui, xml)
+    return rows
+
+
+async def _reread(ui: DeviceUi, xml: str) -> tuple:
+    """``(rows, xml)`` after the re-reads of an empty screen."""
     rows = parse_rows(xml)
     deadline = time.monotonic() + LIST_LOAD_WAIT_S
     misses = 0
@@ -39,7 +47,20 @@ async def read_rows(ui: DeviceUi, xml: str | None = None) -> list:
         shot = await ui.screen()
         xml = shot.xml if shot else ""
         rows = parse_rows(xml)
-    return rows
+    return rows, xml
+
+
+async def _log_empty(ui: DeviceUi, xml: str) -> None:
+    """Say why a read came back empty (nothing else records it): xml size, whether
+    it looks like a screen at all, the loading spinner, the foreground app."""
+    fg = await ui.foreground()
+    log.info(
+        "app_tester empty read: xml_len=%d hierarchy=%s loading=%s foreground=%s",
+        len(xml or ""),
+        "<hierarchy" in (xml or ""),
+        is_loading(xml or ""),
+        fg,
+    )
 
 
 async def _foreground_settled(ui: DeviceUi) -> None:

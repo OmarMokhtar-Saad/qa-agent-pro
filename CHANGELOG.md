@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.137.0] - 2026-10-18
+## [1.138.0] - 2026-10-19
 
 ### Added
 
@@ -33,31 +33,28 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Updates: the keyboard (qa-ime) release no longer hides a newer
-  server release; the updater picks the highest version tag.
-- After an update the reply is flushed before the restart, so the
-  client sees it.
-- A fill step now shows its proof ("field 'X': N/N chars") in the
-  step and case detail.
-- Dialog notes name only the button actually tapped; skipped dialog
-  steps no longer add a note.
-- Case titles use the sub-goal submitted in the same turn.
-- A wait that comes after an action no longer resets the "new text"
-  baseline.
-- OTP notes are clearer when the field reads empty but the screen
-  moved on.
-- A blank screen read no longer counts as "text is gone".
-- Waits for text to appear end early on a still screen.
-- Step timings no longer add up to more than the step itself.
-- The run manifest records the qa-ime version.
-- Saved routes that only wait or tap optional buttons are no longer
-  saved, offered or replayed; routes are ranked by how well they fit
-  the run's goal.
-- Fills into ID or password fields are saved as secret steps.
-- A replay skips a first wait for text that is not on the screen.
-- App Tester skips the reinstall when the device already has the
-  newest build, and its slow screen reads no longer count toward
-  the run's timing.
+- App Tester now reads the screen with the fast accessibility reader:
+  it is switched on before App Tester starts and handed to the run,
+  and switched off again if the run stops before it begins.
+- "App missing" and "app present but its version is unreadable" are
+  now two separate reasons.
+- An empty screen read is logged with details and tried once more
+  when the read was quick.
+- Start-up shows progress notes (accessibility on, App Tester scan,
+  hand-off).
+- A wait for the screen to change checks the fast reader against a
+  full screen read every few seconds.
+- A wait for text to appear now gives up early (not found) after 10 s
+  of a quiet screen, unless a loading spinner shows; a wait for text to
+  go away never ends early.
+- Fewer slow device calls while the screen stays the same.
+- A case whose only checks were "X is gone" now says so instead of
+  "asserted nothing".
+- A field that read back empty before the screen moved on counts as
+  unconfirmed, not verified, in the header tally.
+- Step labels no longer name the MCP middleware.
+- Later case packets are about a third smaller: the action schema
+  no longer carries internal docs and titles.
 
 ### Known
 
@@ -74,8 +71,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - The permission step has not yet been checked on a real fresh
   install. A route that only taps through a permission pop-up is no
   longer saved; the pop-up is answered by the dialog handler on replay.
-- App Tester still reads the screen through the slower uiautomator
-  dump; it is skipped when the build is already current.
+- On a device without the QA keyboard, the first run's App Tester
+  scan still uses the slower uiautomator dump.
+- A loading screen with no standard progress bar (custom animation
+  or splash image) can still end a wait for text early after 10 s.
 - Old saved routes that do nothing are cleaned up only when a new
   route is saved.
 - The fallback keyboard cannot read the field back, so its fill proof

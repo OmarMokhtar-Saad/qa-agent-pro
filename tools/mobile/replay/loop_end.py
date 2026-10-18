@@ -22,6 +22,12 @@ _REASON_UNASSERTED = (
     "asserted anything, so there is no evidence this case passed "
     "-- a screen that moved is activity, not verification."
 )
+_REASON_ABSENCE_ONLY = (
+    "No verdict for this turn: it ended without a done() action and its only "
+    "passed asserts were absence checks (%s), which a blank or wrong screen "
+    "also satisfies. Add an assert that something expected IS on screen, then "
+    "call done() with a verdict."
+)
 _REASON_EXPLORATORY = (
     "No verdict for this turn: it ended without a done() action and asserted "
     "nothing, which is ordinary for an exploratory turn -- it only recorded "
@@ -49,6 +55,8 @@ def _no_done_reason(ended_verified: bool, summary: str, asserts_expected: bool) 
     """The reason a script that never called done() ends with (why: above)."""
     if ended_verified and summary:
         return "Verified: " + summary + _REASON_VERIFIED_TAIL
+    if summary:  # asserts passed, but none was a positive check
+        return _REASON_ABSENCE_ONLY % summary[:200]
     if asserts_expected:
         return _REASON_UNASSERTED
     return _REASON_EXPLORATORY
