@@ -6,7 +6,13 @@ import logging
 from typing import Any
 
 from handlers.mobile.step_support import _mobile_learn_after
-from tools.mobile import media, session_finish, session_records, session_runs
+from tools.mobile import (
+    media,
+    session_finish,
+    session_records,
+    session_runs,
+    step_timing,
+)
 from tools.mobile import open_report as mobile_open
 from tools.mobile import render as mobile_render
 from tools.mobile import report as mobile_report
@@ -51,10 +57,12 @@ RUN_OVER_NOTE = (
 async def _finish_run(run_id: str, session_token: str, body: dict) -> tuple:
     """``(resolved, rows, coverage)`` once the device is given back."""
 
-    await media.flush(run_id)  # deferred clips need the device: store them first
-    await session_finish.finish_device(run_id, lease=str(session_token or ""))
+    # deferred clips need the device: store them first
+    await step_timing.timed("media_flush", media.flush(run_id))
+    finishing = session_finish.finish_device(run_id, lease=str(session_token or ""))
+    await step_timing.timed("finish_device", finishing)
     _mobile_learn_after(run_id)
-    listed = session_runs.summary(run_id)
+    listed = step_timing.timed_call("run_summary", session_runs.summary, run_id)
     resolved = body.get("resolved")
     rows_for_relay = listed.get("content") or []
     coverage = session_runs.coverage_line(
@@ -77,7 +85,9 @@ def _relay_kwargs(resolved: Any, rows_for_relay: list) -> dict[str, Any]:
 # heading and claims nothing about verdicts (the coverage line does).
 def _summary_kwargs(run_id: str, coverage: str) -> dict[str, Any]:
     """The summary block arguments; renders and opens the report file."""
-    report_path, report_opened, report_failed = _mobile_render_report_file(run_id)
+    report_path, report_opened, report_failed = step_timing.timed_call(
+        "report_render", _mobile_render_report_file, run_id
+    )
     return {
         "coverage_line": coverage,
         "run_id": run_id,

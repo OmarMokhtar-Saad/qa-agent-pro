@@ -62,16 +62,17 @@ def _rank(got: list) -> tuple:
     first = got[0]
     return (
         bool(first.get("reached")),
+        int(first.get("ok") or 0),
         float(first.get("score") or 0),
         sum(int(r.get("steps") or 0) for r in got),
     )
 
 
 def _best_per_goal(groups: dict) -> dict:
-    """Keep one group per goal (a legacy flow without one is its own goal)."""
+    """Keep one group per route shape (else per goal; a legacy flow is its own)."""
     best: dict = {}
     for base, got in groups.items():
-        goal = str(got[0].get("goal") or "") or "base:" + base
+        goal = str(got[0].get("shape") or got[0].get("goal") or "") or "base:" + base
         if goal not in best or _rank(got) > _rank(best[goal][1]):
             best[goal] = (base, got)
     return dict(best.values())

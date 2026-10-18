@@ -92,9 +92,26 @@ def _packages(xml: str) -> frozenset:
     return frozenset(re.findall(r'package="([^"]*)"', xml))
 
 
+#: Substrings of an input-method window's package (its keyboard is not a screen).
+#: "qaagents.ime" is the QA keyboard; ime_manifest is the lane sentinel, so it
+#: is not imported here.
+_IME_MARKS = ("qaagents.ime", "inputmethod", "keyboard", "honeyboard")
+
+
+def _is_ime(package: str) -> bool:
+    """True for the package of a keyboard window (the QA keyboard or any other)."""
+    low = package.lower()
+    return any(mark in low for mark in _IME_MARKS)
+
+
 def _other_screen(serial: str, xml: str) -> bool:
-    """True when *xml* belongs to other packages than the tree judged stale."""
-    now, was = _packages(xml), _PKGS.get(serial)
+    """True when *xml* belongs to other apps than the tree judged stale.
+
+    A keyboard window is shown over any screen, so its package is ignored on
+    both sides: it appearing or going is not another screen.
+    """
+    now = {p for p in _packages(xml) if not _is_ime(p)}
+    was = {p for p in _PKGS.get(serial, frozenset()) if not _is_ime(p)}
     return bool(now and was and now != was)
 
 

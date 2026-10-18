@@ -44,7 +44,19 @@ def _judge_landed(result: object, field: str) -> dict:
     typed = content.get("typed", 0)
     if landed == ime.LANDED_NO:
         return _landed_no_with_fallback(content, field)
-    return _unconfirmed_type_reply(bool(content.get("secret")), typed, field)
+    return _unknown_with_advance(bool(content.get("secret")), typed, field)
+
+
+def _unknown_with_advance(secret: bool, typed: object, field: str) -> dict:
+    """The unconfirmed reply; the replay downgrades it to landed when the screen moved on.
+
+    An auto-submitting field (OTP) leaves the keyboard unable to say; whether the
+    screen advanced is checked by the replay, for any app.
+    """
+    reply = _unconfirmed_type_reply(secret, typed, field)
+    reply["if_screen_changed"] = _unconfirmed_type_reply(secret, typed, field)
+    reply["masked"] = secret
+    return reply
 
 
 def _landed_no_with_fallback(content: dict, field: str) -> dict:

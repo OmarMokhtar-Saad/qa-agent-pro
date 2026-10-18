@@ -11,6 +11,7 @@ from handlers.mobile.run_app_tester import app_tester_stage
 from handlers.mobile.run_request import _AppCall
 from tools import device_manager as _device_manager
 from tools.mobile import adb as mobile_adb
+from tools.mobile import prerun_timing
 from tools.mobile import run_store as _run_store
 
 logger = logging.getLogger("tools.mcp_handlers")
@@ -121,7 +122,9 @@ async def _app_stage_open_store(
     """Open the Play Store page, or drive Firebase App Tester, in the emulator."""
 
     if install_source == "app_tester":
-        return await app_tester_stage(call, target)
+        return await prerun_timing.timed(
+            call.serial, "app_tester", app_tester_stage(call, target)
+        )
     url = _store_url(install_source, call.value, target)
     opened = await mobile_adb.open_url(call.serial, url)
     if opened.get("error"):

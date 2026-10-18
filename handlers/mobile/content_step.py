@@ -17,7 +17,7 @@ from handlers.mobile.content_args import (
 from handlers.mobile.content_finding import _mobile_fold_finding
 from handlers.mobile.content_flow import _mobile_flow_finish, _mobile_flow_prepare
 from handlers.mobile.content_route import _mobile_route_finish, _mobile_route_prepare
-from tools.mobile import flow_replay_state
+from tools.mobile import flow_replay_state, step_arm
 
 
 class _NoteCtx(NamedTuple):
@@ -173,6 +173,14 @@ async def _planned(args: tuple, kwargs: dict) -> tuple:
 # the step, so a refused flow call never reaches the device.
 async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
     """``handle_submit_mobile_step``'s text plus its screens."""
+    step_arm.begin_outer()  # the whole submit, planning and note included
+    try:
+        return await _submit_content(args, kwargs)
+    finally:
+        step_arm.end_outer()
+
+
+async def _submit_content(args: tuple, kwargs: dict) -> tuple:
     early, plans, call, finding_note = await _planned(args, kwargs)
     if early is not None:
         return early

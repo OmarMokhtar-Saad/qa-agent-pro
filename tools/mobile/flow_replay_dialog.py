@@ -20,7 +20,7 @@ ANSWERED = "answered a system dialog by tapping `%s`"
 
 def answers_dialog(step: dict) -> bool:
     """Whether *step* taps an allow or a decline button of a permission dialog."""
-    if step.get("op") not in ("tap", "tap_text_if_present"):
+    if step.get("op") not in ("tap", "tap_text", "tap_text_if_present"):
         return False
     decline = kstg_popup_permission.is_permission_decline(kstg_flow_perm.label(step))
     return decline or kstg_flow_perm.kind(step) == "perm"
@@ -33,7 +33,7 @@ def mismatch(step: dict, screen: Any) -> str:
     opened = bool(system_dialog_package(screen))
     if opened and not answering and not op.startswith("wait_"):
         return DIALOG_OVER
-    if answering and not opened and op == "tap":
+    if answering and not opened and op in ("tap", "tap_text"):
         return NO_DIALOG
     return ""
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from tools.mobile import dump_reuse, step_timing
 from tools.mobile.adb_host import host
@@ -78,7 +79,10 @@ async def _spawn_timed(cmd: list[str], timeout: float, stdin: bytes | None):
     run = _spawn_noting(cmd, timeout, stdin)
     if dump_reuse.body_of(cmd).startswith("uiautomator dump"):
         return await run
-    return await step_timing.timed("adb", run)
+    start = time.monotonic()
+    out = await step_timing.timed("adb", run)
+    step_timing.adb_cost(dump_reuse.body_of(cmd), time.monotonic() - start)
+    return out
 
 
 async def run_argv(

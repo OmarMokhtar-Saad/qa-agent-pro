@@ -1,21 +1,14 @@
 """Where one ``qa_submit_mobile_step`` call spent its time, phase by phase.
 
 The audit row has one ``duration_ms`` per call; this module is the breakdown.
-A CONTEXTVAR, for the reason ``_MOBILE_IMAGE_SPECS`` in ``mcp_handlers`` is
-one: the handler has many return points and the timed work happens several
-calls down (``executor._dump``, ``executor._sleep``, ``media.finish_step``), so
-threading a timer through every signature would touch dozens of lines to
-carry one number. ``begin()`` arms it for the current task; every ``timed``
-call with nothing armed is a plain ``await`` -- the explore lane, the run
-start and every test that never calls ``begin()`` pay nothing and record
-nothing.
+A CONTEXTVAR, because the timed work happens several calls down and threading a
+timer through every signature would touch dozens of lines. ``begin()`` arms it
+for the current task; with nothing armed every ``timed`` is a plain ``await``
+and records nothing.
 
-PHASES NEST. ``replay`` is the whole ``session.submit`` call, and ``ui_dump``,
-``wait``, ``ime_check`` and ``evidence`` are timed INSIDE it, so the phases do
-not add up to the total and are not meant to: ``replay`` answers "how long did
-the script take", the inner ones answer "on what".
-
-A phase whose awaitable raises is not recorded. Timing is a report only.
+PHASES NEST: ``replay`` is the whole ``session.submit`` call and ``ui_dump``,
+``wait``, ``evidence`` ... are timed INSIDE it, so they do not add up to the
+total. A phase whose awaitable raises is not recorded. Report only.
 """
 
 from __future__ import annotations
@@ -25,7 +18,7 @@ import time
 from contextvars import ContextVar
 from typing import Any, Awaitable, Optional
 
-from tools.mobile import step_cover, step_ledger
+from tools.mobile import step_cover, step_detail, step_ledger
 
 #: Distinct phase names one call may record. The instrumented sites name six;
 #: a name past this is dropped rather than grown into an unbounded dict that
@@ -40,7 +33,6 @@ MAX_STEP_TIMING_ROWS = 200
 
 #: Characters of a tree-source name kept in a row.
 MAX_SOURCE_CHARS = 40
-
 _PHASES: ContextVar = ContextVar("_STEP_PHASES", default=None)
 
 
@@ -72,13 +64,16 @@ async def timed(name: str, awaitable: Awaitable[Any]) -> Any:
     return result
 
 
-def mark(name: str) -> None:
-    """Count one EVENT under *name* -- a dump reused, skipped or cut.
+def timed_call(name: str, fn, *args):
+    """Call sync *fn*, adding its wall time to phase *name* when armed."""
+    start = time.monotonic()
+    result = fn(*args)
+    _record(name, time.monotonic() - start)
+    return result
 
-    Not a phase: nothing was awaited, so there is no time to add. It shares
-    :data:`MAX_TIMED_PHASES` with the phases because both end up in the one
-    line :func:`line` renders. Unarmed, it records nothing.
-    """
+
+def mark(name: str) -> None:
+    """Count one EVENT under *name* (a dump reused, skipped or cut); no time."""
     state = _PHASES.get()
     if state is None:
         return
@@ -87,6 +82,11 @@ def mark(name: str) -> None:
         return
     marks[name] = marks.get(name, 0) + 1
     step_ledger.on_mark(state, name)
+
+
+def adb_cost(body: str, seconds: float) -> None:
+    """Add one adb call to the step's per-command table. Unarmed: nothing."""
+    step_detail.note_adb(_PHASES.get(), body, seconds)
 
 
 def note(reason: str, ms: int = 0) -> None:

@@ -12,7 +12,13 @@ from handlers.mobile.run_install import (
     _local_apk_stage,
 )
 from handlers.mobile.run_request import _AppCall, _mobile_ask
-from tools.mobile import app_alias, app_stage_pick, resolve_cache, run_store
+from tools.mobile import (
+    app_alias,
+    app_stage_pick,
+    prerun_timing,
+    resolve_cache,
+    run_store,
+)
 from tools.mobile import render as mobile_render
 from tools.mobile.install_source_infer import infer_install_source
 
@@ -173,8 +179,7 @@ async def _app_stage_install(call: _AppCall, st: tuple, probe: tuple) -> tuple:
 async def _mobile_app_stage(call: _AppCall) -> tuple:
     """Get the app under test onto the device. ``(markdown_or_empty, package)``."""
 
-    run_skipped.forget_run(call.serial)
-    await run_home.check_first(call.serial, call.goal)
+    await run_home.begin_stage(call.serial, call.goal)
     label = str(call.source or "").strip()
     install_source = mobile_render.install_source_for_label(label)
     target = call.typed_package
@@ -185,6 +190,5 @@ async def _mobile_app_stage(call: _AppCall) -> tuple:
     done, probed, suggestions = await _app_stage_probe(call, target)
     if done is not None:
         return done
-    return await _app_stage_install(
-        call, (install_source, target), (probed, suggestions)
-    )
+    stage = _app_stage_install(call, (install_source, target), (probed, suggestions))
+    return await prerun_timing.timed(call.serial, "install", stage)

@@ -7,7 +7,12 @@ from typing import Optional
 from tools.device_manager import valid_package_name
 from tools.mobile.app_info import AppVersion
 from tools.mobile.install_errors import code_from_dialog_text, explain, to_outcome
-from tools.mobile.install_source import InstallOutcome, InstallRequest, Release
+from tools.mobile.install_source import (
+    ALREADY_LATEST,
+    InstallOutcome,
+    InstallRequest,
+    Release,
+)
 from tools.mobile.install_sources.app_tester_ui_consts import (
     _PROGRESS_STARTS,
     _VERSION_RE,
@@ -57,7 +62,7 @@ def _already_current(
     if target is None or code is None or code < target:
         return None
     message = "Already at versionCode " + str(code) + " (target " + str(target) + ")."
-    return InstallOutcome(True, "", message + " Nothing to install.", code)
+    return InstallOutcome(True, ALREADY_LATEST, message + " Nothing to install.", code)
 
 
 def _refuse_request(request: InstallRequest) -> Optional[InstallOutcome]:

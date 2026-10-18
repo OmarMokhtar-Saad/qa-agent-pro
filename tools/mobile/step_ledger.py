@@ -60,6 +60,8 @@ def on_phase(state: dict, name: str, ms: int) -> None:
     _push(state.setdefault("trace", []), name, MAX_TRACE_NAMES)
     reason = "dump" if name == "ui_dump" else name
     row = _with_caller({"reason": reason, "ms": int(ms), "skipped": False})
+    if name == "ui_dump" and state.get("source"):
+        row["source"] = str(state["source"])[:40]
     _push_row(state, row)
 
 
@@ -86,6 +88,8 @@ def _clean_row(item: dict) -> dict:
     }
     if item.get("caller"):
         row["caller"] = str(item["caller"])[:40]
+    if item.get("source"):
+        row["source"] = str(item["source"])[:40]
     if int(item.get("n") or 0) > 1:
         row["n"] = int(item["n"])
     return row

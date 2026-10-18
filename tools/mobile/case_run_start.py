@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 
-from tools.mobile import adb, run_store, step_timing
+from tools.mobile import adb, prerun_timing, run_store, step_timing
 from tools.mobile import run_packets as mobile_run
 from tools.mobile.case_run_counts import case_view, escapes_used
 from tools.mobile.case_run_evidence import _abandon, _begin_evidence
@@ -42,6 +42,7 @@ def _now() -> float:
 async def start_case(run_id: str, case: object, ctx: Context) -> dict:
     """Clean-launch the app, dump the first screen, build the planning packet."""
     step_timing.begin()
+    prerun_timing.replay_into_ledger(ctx.serial)
     try:
         return await _start(run_id, case, ctx)
     except Exception as exc:  # pragma: no cover - defensive

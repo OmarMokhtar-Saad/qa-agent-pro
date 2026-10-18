@@ -53,3 +53,24 @@ def of_records(recs: list) -> str:
     """The signature of the step records a learn run is about to save."""
     steps = [r.get("flow_action") or {} for r in recs]
     return signature(steps, [str(r.get("screen_key") or "") for r in recs])
+
+
+def _label(step: dict) -> str:
+    return "|".join(v for _k, v in sorted(_target(step).items()))
+
+
+def _counts(step: dict) -> bool:
+    op = str(step.get("op") or "")
+    return not (op.startswith("wait_") or op == "tap_text_if_present")
+
+
+def shape(template: dict) -> str:
+    """Short hash of the ordered ``(op, label)`` of the steps that decide the route.
+
+    Waits and optional popup taps do not count, nor do screen keys, so two flows that
+    differ only in those (the same route learned twice) share a shape.
+    """
+    steps = [s for s in template.get("steps") or [] if isinstance(s, dict)]
+    ids = [[str(s.get("op") or ""), _label(s)] for s in steps if _counts(s)]
+    raw = json.dumps(ids, ensure_ascii=False)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:SIG_CHARS]

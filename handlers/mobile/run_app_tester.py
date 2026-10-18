@@ -8,7 +8,11 @@ from handlers.mobile.run_request import _AppCall, _mobile_ask
 from tools.mobile import adb as mobile_adb
 from tools.mobile import app_alias, app_stage_pick, resolve_cache, run_store
 from tools.mobile.app_label_from_goal import goal_app_label
-from tools.mobile.install_source import InstallOutcome, InstallRequest
+from tools.mobile.install_source import (
+    ALREADY_LATEST,
+    InstallOutcome,
+    InstallRequest,
+)
 from tools.mobile.install_sources.app_tester_ui import AppTesterUiSource
 from tools.mobile.install_sources.app_tester_ui_funcs import _label_required
 from tools.mobile.install_sources.app_tester_ui_memory import (
@@ -75,7 +79,7 @@ async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
     if not outcome.ok:
         return _failed(outcome), bundle
     app_alias.remember_alias(call.serial, want.label, bundle)
-    run_skipped.mark_tester_install(call.serial, bundle, True)
+    run_skipped.mark_tester_install(call.serial, bundle, outcome.code != ALREADY_LATEST)
     return "", bundle
 
 

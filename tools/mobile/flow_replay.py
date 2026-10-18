@@ -16,6 +16,7 @@ from typing import Any, NamedTuple
 from tools.mobile import (
     flow_replay_match,
     flow_replay_note,
+    flow_replay_record,
     flow_replay_run,
     flow_replay_state,
     flow_replay_stop,
@@ -121,7 +122,9 @@ async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
         flow_replay_run.run(ctx, plan, flow_replay_run.Walk(auto.screen, pos, [])),
     )
     live = flow_replay_match.live_key(auto.screen, ctx)
-    _record(auto.body, flow_replay_note.Head(name, template, pos, live), walk)
+    said = tuple(flow_replay_record.said(walk.trace))
+    head = flow_replay_note.Head(name, template, pos, live, said)
+    _record(auto.body, head, walk)
     _count(str(getattr(ctx, "package", "") or ""), name, walk)
     detour = flow_replay_switch.detour(auto.body, (name, walk.pos), walk.why)
     return Auto(walk.screen, auto.body, True), bool(walk.why) and not detour

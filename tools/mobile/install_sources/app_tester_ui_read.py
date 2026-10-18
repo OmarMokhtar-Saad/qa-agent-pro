@@ -8,7 +8,9 @@ import time
 
 from tools.mobile.install_source import DeviceUi
 from tools.mobile.install_sources.app_tester_ui_consts import (
+    APP_TESTER_PACKAGE,
     APP_TESTER_POLL_S,
+    FOREGROUND_WAIT_S,
     LIST_LOAD_WAIT_S,
     MAX_EMPTY_REREADS,
     _Run,
@@ -18,11 +20,13 @@ from tools.mobile.install_sources.app_tester_ui_rows import is_loading, parse_ro
 log = logging.getLogger(__name__)
 
 
-async def read_rows(ui: DeviceUi, xml: str = "") -> list:
+async def read_rows(ui: DeviceUi, xml: str | None = None) -> list:
     """The rows on the screen. A screen that shows none is read again: while it
     shows the list's loading spinner, until rows appear or LIST_LOAD_WAIT_S
     passes; otherwise (a dump that failed) at most MAX_EMPTY_REREADS times.
     ``[]`` after that. It is never answered with the rows of an earlier screen."""
+    if xml is None:  # no screen in hand: the first read is not a re-read
+        xml = await _xml(ui)
     rows = parse_rows(xml)
     deadline = time.monotonic() + LIST_LOAD_WAIT_S
     misses = 0
@@ -31,10 +35,21 @@ async def read_rows(ui: DeviceUi, xml: str = "") -> list:
             await asyncio.sleep(APP_TESTER_POLL_S)
         else:
             misses += 1
+            await _foreground_settled(ui)
         shot = await ui.screen()
         xml = shot.xml if shot else ""
         rows = parse_rows(xml)
     return rows
+
+
+async def _foreground_settled(ui: DeviceUi) -> None:
+    """Return once App Tester is the foreground app (a cheap read, no dump) or
+    FOREGROUND_WAIT_S passes: the reread then sees a settled screen."""
+    deadline = time.monotonic() + FOREGROUND_WAIT_S
+    while await ui.foreground() != APP_TESTER_PACKAGE:
+        if time.monotonic() >= deadline:
+            return
+        await asyncio.sleep(APP_TESTER_POLL_S)
 
 
 async def settled_rows(ui: DeviceUi) -> list:

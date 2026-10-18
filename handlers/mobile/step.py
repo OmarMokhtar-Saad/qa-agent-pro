@@ -74,7 +74,7 @@ from handlers.mobile.step_support import (  # noqa: F401
 from handlers.mobile.step_support import (
     _mobile_start_heartbeat as mobile_start_heartbeat,  # noqa: F401
 )
-from tools.mobile import step_timing
+from tools.mobile import step_arm
 from tools.mobile.session_core import new_budget
 from tools.untrusted import single_line as safe
 
@@ -159,7 +159,7 @@ async def _mobile_step_timed(turn: StepTurn) -> str:
     # budget the NEXT packet is produced under.
     budget = new_budget()
     # Fix round 2, item 4: arm the per-phase breakdown for this call.
-    step_timing.begin()
+    step_arm.begin_inner()
     early, token = await mobile_step_acquire(turn.run_id, turn.token)
     if early is not None:
         return early

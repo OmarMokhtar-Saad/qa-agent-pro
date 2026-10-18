@@ -19,8 +19,13 @@ MAX_LISTING_SCROLLS = 40
 #: Wall-clock budget of one list scan (every scroll is a swipe plus a dump).
 LISTING_DEADLINE_S = 90.0
 
-#: Re-reads of a screen that parsed to no rows (a spinner) before giving up.
-MAX_EMPTY_REREADS = 3
+#: Re-reads of a screen that parsed to no rows (not loading) before giving up.
+#: One: each is a ~11 s dump; the reread first waits (cheap foreground poll)
+#: for App Tester to be in front, so it reads a settled screen.
+MAX_EMPTY_REREADS = 1
+
+#: Longest wait for App Tester to be the foreground app before that reread.
+FOREGROUND_WAIT_S = 3.0
 
 #: Longest wait for a list that shows its loading spinner to show rows.
 LIST_LOAD_WAIT_S = 20.0

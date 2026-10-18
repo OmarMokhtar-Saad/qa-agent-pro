@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tools.mobile import flow_stats
+from tools.mobile import flow_stats, goal_scrub
 
 MAX_KEY_CHARS = 64
 MAX_GOAL_CHARS = 120
@@ -37,7 +37,7 @@ def clean(meta: Any, count: int) -> dict:
 
 def _extras(meta: dict) -> dict:
     """The optional record: the goal a flow reached and its replay counters."""
-    goal = " ".join(str(meta.get("goal") or "").split())[:MAX_GOAL_CHARS]
+    goal = goal_scrub.scrub(str(meta.get("goal") or ""))[:MAX_GOAL_CHARS]
     stats = flow_stats.clean(meta.get("stats"))
     return {**({"goal": goal} if goal else {}), **({"stats": stats} if stats else {})}
 

@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.134.0] - 2026-10-18
+## [1.135.0] - 2026-10-18
 
 ### Added
 
@@ -132,6 +132,27 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - The start check waits for the screen to go quiet before a slow screen
   read, and slow reads no longer stretch later wait deadlines.
 - The step time table folds older rows and names replay time.
+- A wait that ran to its cap is no longer reported as ending early; a
+  screen that changed just after the cap counts as changed.
+- A code field that submits itself as soon as it is filled is reported
+  as typed, not refused.
+- The keyboard is no longer mistaken for another screen.
+- App Tester: an empty list is read again once, after App Tester is in
+  front, instead of three slow screen reads; 'installed just now' is said
+  only when an install happened.
+- A goal naming the app ('the app named X') finds it by that name.
+- Replayed steps get their own record with the popup text and the
+  button tapped.
+- Saved routes: secret names such as pwd or code match their fields, the
+  device serial is removed from saved goals, popup taps are kept as
+  optional steps, a replaced route keeps its run counts, and routes with
+  the same steps collapse to the best one.
+- A saved route cannot fill a password or code field from a plain value.
+- The step time table now covers the start stage (install, App Tester,
+  launch), the whole step, the report finish phases, each device command
+  and failed fast reads.
+- The run's manifest records whether the keyboard, animations and the
+  screen reader were restored at the end of the run.
 
 ### Known
 

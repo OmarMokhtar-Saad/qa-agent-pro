@@ -17,6 +17,7 @@ from tools.mobile import (
     flow_replay_batch,
     flow_replay_dialog,
     flow_replay_match,
+    flow_replay_record,
     flow_replay_stop,
     media,
 )
@@ -142,7 +143,8 @@ def _gate(ctx: Any, plan: Plan, batch: flow_replay_batch.Batch) -> Any:
         landed, latest = await _land(ctx, screen, want)
         return latest, ("" if landed else WRONG_SCREEN)
 
-    return flow_replay_dialog.guarded(gate, plan.template, batch.origin)
+    guarded = flow_replay_dialog.guarded(gate, plan.template, batch.origin)
+    return flow_replay_record.watch(guarded)
 
 
 async def _finish(ctx: Any, plan: Plan, walk: Walk) -> Walk:
@@ -176,9 +178,11 @@ async def _batch(ctx: Any, plan: Plan, walk: Walk) -> Walk:
     batch = flow_replay_batch.build(plan.template, plan.inputs, walk.pos)
     if not batch.steps:
         return _idle(plan, walk, batch)
-    with flow_replay_batch.armed(ctx, _gate(ctx, plan, batch), walk.screen):
+    gate = _gate(ctx, plan, batch)
+    with flow_replay_batch.armed(ctx, gate, walk.screen):
         content = await run_batch(ctx, plan.ref, batch.steps)
-    trace = walk.trace + list(content.get("trace") or [])
+    done = content.get("trace") or []
+    trace = walk.trace + flow_replay_record.mark(done, batch.steps, gate.seen)
     screen = content.get("screen") or walk.screen
     if not _ok(content):
         why = flow_replay_stop.failed_why(content)

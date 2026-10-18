@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from tools.mobile import dialog_permission
 
-_OPS = frozenset({"tap", "tap_text_if_present", "wait_until_gone"})
+_OPS = frozenset({"tap", "tap_text", "tap_text_if_present", "wait_until_gone"})
 
 
 def label(act: dict) -> str:

@@ -24,6 +24,22 @@ def stored_stats(package: str, name: str) -> dict:
         return {}
 
 
+def with_replaced(package: str, replaces: list, meta: dict) -> dict:
+    """*meta* plus the counters of the flows *replaces* its flow takes over.
+
+    A replaced flow is deleted, so the replays it earned (``runs``, ``ok``) move to the
+    flow that replaces it: the stats stay on the flow that is still saved.
+    """
+    got = [stored_stats(package, name) for name in replaces]
+    stats = flow_stats.clean(meta.get("stats")) or {}
+    for one in got:
+        for key in ("runs", "ok", "seen"):
+            stats[key] = stats.get(key, 0) + one.get(key, 0)
+        stats["last"] = max(stats.get("last", 0.0), one.get("last", 0.0))
+    stats = flow_stats.clean(stats)
+    return dict(meta, stats=stats) if stats else meta
+
+
 def merged_meta(package: str, name: str, meta: dict) -> dict:
     """*meta* for a flow about to be saved as *name*, with the counters it earned."""
     old = stored_stats(package, name)

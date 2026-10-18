@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from config.settings_guard import never_raise
 from tools import tool_status
@@ -21,7 +22,6 @@ logger = logging.getLogger("tools.mobile.adb")
 #: 2564ms and a `wait 3000` took 5086ms. A wait sends no input at all, so the
 #: ~2.06s both overshoot by is fixed overhead, and it was being paid once per
 #: action.
-#:
 #: The dumper's STDOUT goes to /dev/null because it prints "UI hierchary dumped
 #: to: <path>" and adb interleaves that line with the XML -- which is the whole
 #: reason `uiautomator dump /dev/tty` was tried and REVERTED. That path is not
@@ -66,34 +66,34 @@ SOURCE_NO_PROVIDER = "uiautomator-dump (no a11y)"
 SOURCE_PROVIDER_FAILED = "uiautomator-dump (a11y failed)"
 
 
+def _clean(fast: dict) -> str | None:
+    """The provider's XML when it is clean, capped and ``<``-led, else None."""
+    fast_xml = str(fast.get("content") or "")
+    capped = len(fast_xml.encode("utf-8", errors="replace")) <= host().MAX_DUMP_BYTES
+    if not fast.get("error") and fast_xml.lstrip().startswith("<") and capped:
+        return fast_xml
+    logger.warning("mobile.adb: a11y dump refused: %s", str(fast.get("error"))[:200])
+    return None
+
+
 async def _provider_dump(serial: str, provider) -> str | None:
-    """The fast provider's XML when it is clean, capped and ``<``-led, else
-    ``None`` (including when the provider raises) so the caller falls through
-    to uiautomator."""
+    """The fast provider's XML when it is clean, else ``None`` (also when the
+    provider raises) so the caller falls through to uiautomator. A failure's
+    time is ledgered as ``provider_failed``: it is lost before the fallback."""
+    start = time.monotonic()
+    xml = None
     with never_raise(
         logger, "mobile.adb: dump provider failed; using uiautomator", exc_info=True
     ):
-        fast = await provider(serial) or {}
-        fast_xml = str(fast.get("content") or "")
-        if (
-            not fast.get("error")
-            and fast_xml.lstrip().startswith("<")
-            and len(fast_xml.encode("utf-8", errors="replace")) <= host().MAX_DUMP_BYTES
-        ):
-            return fast_xml
-        logger.warning(
-            "mobile.adb: a11y dump refused: %s", str(fast.get("error"))[:200]
-        )
-    return None
+        xml = _clean(await provider(serial) or {})
+    if xml is None:
+        step_timing.note("provider_failed", int((time.monotonic() - start) * 1000))
+    return xml
 
 
 def _device_said(said: str) -> dict:
     """The refusal that quotes the device's own words first."""
-    # The device SPOKE, so its words LEAD. `cat: ...: No such file` means
-    # the dumper never wrote a file, and a reply that opens with "a secure
-    # window blocks the dump" sends the tester's model to change screens
-    # when the cause is elsewhere -- it reads the first sentence. The
-    # secure window is named after, as one cause.
+    # The device SPOKE, so its words LEAD (the first sentence is what the model reads).
     return {
         "error": (
             "The device said: "

@@ -10,7 +10,13 @@ import hashlib
 import re
 from typing import Any
 
-from tools.mobile import flow_nochange, kstg_foreign, run_store
+from tools.mobile import (
+    flow_nochange,
+    goal_scrub,
+    kstg_flow_popup,
+    kstg_foreign,
+    run_store,
+)
 from tools.mobile.app_flows_consts import MAX_FLOW_NAME_CHARS, OK_OUTCOMES
 
 MIN_STEPS = 2
@@ -35,7 +41,7 @@ def reached(run_id: str) -> str:
     if explore.get("stop") != "goal_reached" and not passed:
         return ""
     goal = explore.get("goal") or _dict(explore.get("charter")).get("goal")
-    return " ".join(str(goal or "").split())
+    return goal_scrub.scrub(str(goal or ""), str(body.get("serial") or ""))
 
 
 def normalise(goal: str) -> str:
@@ -69,20 +75,30 @@ def _saw_no_change(rec: dict) -> bool:
     )
 
 
+def _ran(rec: dict) -> bool:
+    return (
+        bool(rec.get("flow_action"))
+        and str(rec.get("outcome") or "") in OK_OUTCOMES
+        and rec.get("landed") is not False
+        and not _saw_no_change(rec)
+    )
+
+
+def _in_route(rec: dict, package: str) -> bool:
+    return kstg_foreign.own(rec, package) or kstg_flow_popup.is_popup_tap(rec, package)
+
+
 def app_recs(steps: list, package: str) -> list:
     """The replayable step records of *package* that ran as planned and landed.
 
     A step that errored, found no element, needed the model, or whose screen never
     changed as expected (``landed`` False) is not part of the route, so it is left out.
+    A tap on an OS permission dialog stays, as an optional step (``kstg_flow_popup``).
     """
     return [
-        rec
+        kstg_flow_popup.as_optional(rec, package)
         for rec in steps
-        if rec.get("flow_action")
-        and kstg_foreign.own(rec, package)
-        and str(rec.get("outcome") or "") in OK_OUTCOMES
-        and rec.get("landed") is not False
-        and not _saw_no_change(rec)
+        if _ran(rec) and _in_route(rec, package)
     ]
 
 

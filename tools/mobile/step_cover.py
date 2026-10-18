@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import time
 
+from tools.mobile import step_detail
+
 #: Spans kept per step; past it the oldest are dropped (a step has a handful).
 MAX_SPANS = 400
 
@@ -44,6 +46,7 @@ def covered_ms(state: dict) -> int:
 
 def itemised(state: dict, total_ms: int) -> list:
     """The ledger rows plus one ``unitemised`` row for the uncovered time."""
-    rows = list(state.get("ledger") or [])[-KEEP_ROWS:]
+    detail = step_detail.rows(state)
+    rows = list(state.get("ledger") or [])[-(KEEP_ROWS - len(detail)) :]
     gap = max(0, int(total_ms) - covered_ms(state))
-    return rows + [{"reason": UNITEMISED, "ms": gap, "skipped": False}]
+    return rows + detail + [{"reason": UNITEMISED, "ms": gap, "skipped": False}]

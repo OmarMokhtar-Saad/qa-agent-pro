@@ -17,6 +17,7 @@ from tools.mobile.app_flows_consts import (
     REFUSED_WHY,
     err,
 )
+from tools.mobile.flow_roles import role_problem
 
 logger = logging.getLogger("tools.mobile.app_flows")
 
@@ -60,7 +61,7 @@ def _check_placeholder(index: int, step: dict, params: list) -> str:
             "a flow never stores a typed value" % index
         )
     name = found.group(1)
-    problem = _credential_problem(index, name)
+    problem = _credential_problem(index, name) or role_problem(index, step, name)
     if not problem and name not in params:
         params.append(name)
     return problem

@@ -11,11 +11,14 @@ from tools.mobile.replay.screen import _stamp_after
 from tools.mobile.replay.settle_mark import SettleJob, SettleOpts
 from tools.mobile.replay.settle_run import _settle
 from tools.mobile.replay.waits_changed import (
+    _capped_ms,
     _changed_detail,
     _wait_until_changed,
     _watch_after_wait,
 )
-from tools.mobile.replay.waits_spec import _unchanged_detail, stamp_early
+from tools.mobile.replay.waits_interrupt import _interruption_of
+from tools.mobile.replay.waits_late import CHANGED, SAME, late_detail, late_verdict
+from tools.mobile.replay.waits_spec import _secs, _unchanged_detail, stamp_early
 from tools.mobile.replay.waits_types import AfterWait, ChangedStep, StopView
 
 
@@ -58,8 +61,9 @@ async def _poll_changed(run: _ReplayRun, step: ChangedStep, screen: object) -> t
     step.entry["outcome"] = "ok"
     step.entry["detail"] = _changed_detail(step.op, step.wait_ms, changed)
     if step.op != "wait" and not changed:
-        step.entry["detail"] = _unchanged_detail(step.wait_ms, elapsed_ms)
-        stamp_early(step.entry, elapsed_ms, step.wait_ms)
+        ran_ms = _capped_ms(run.ctx, step.wait_ms)  # the limit the wait really had
+        step.entry["detail"] = _unchanged_detail(ran_ms, elapsed_ms)
+        stamp_early(step.entry, elapsed_ms, ran_ms)
     after = AfterWait(before_wait, changed, reusable)
     screen, reusable, interruption = await _watch_after_wait(run.ctx, screen, after)
     return screen, changed, reusable, interruption
@@ -75,6 +79,39 @@ def _changed_finish(run: _ReplayRun, view: StopView, timed_out: bool) -> tuple:
     return screen, None
 
 
+def _after_read(run: _ReplayRun, step: ChangedStep, seen: tuple) -> bool:
+    """True when the wait still timed out after the fresh read; else words the entry.
+
+    *seen* is ``(screen before the wait, fresh screen after it)``. A change the
+    wait missed is reported as a late change, not a timeout; an unreadable
+    screen is "unknown", never "did not change".
+    """
+    verdict = late_verdict(*seen)
+    if verdict == SAME:
+        return True
+    ran = _secs(_capped_ms(run.ctx, step.wait_ms))
+    step.entry["detail"] = late_detail(verdict, ran)
+    step.entry.pop("wait_early", None)
+    return verdict != CHANGED
+
+
+def _late_interruption(run: _ReplayRun, seen: tuple, timed_out: bool) -> str:
+    """What took the screen when the wait changed only after its cap; else ``""``."""
+    if timed_out:
+        return ""
+    return _interruption_of(run.ctx, seen[1], seen[0])
+
+
+def _unchanged_verdict(run: _ReplayRun, step: ChangedStep, seen: tuple) -> tuple:
+    """Judge a non-`wait` op whose wait saw no change: ``(screen, reply)``."""
+    timed_out = _after_read(run, step, seen)
+    late = _late_interruption(run, seen, timed_out)
+    view = StopView(step.entry, seen[1])
+    if late:
+        return seen[1], _interrupted_stop(run, view, late)
+    return _changed_finish(run, view, timed_out)
+
+
 # `redump=not reusable`: only a wait whose LAST poll dumped the unchanged
 # screen hands back a post-wait screen (`_wait_until_changed` says when).
 # Every other path holds a screen from before the wait ended, and skipping
@@ -85,7 +122,7 @@ async def _changed_wait(run: _ReplayRun, step: ChangedStep, screen: object) -> t
 
     ``reply`` is ``None`` when the replay goes on to the next action.
     """
-    entry = step.entry
+    entry, before_wait = step.entry, screen
     screen, changed, reusable, interruption = await _poll_changed(run, step, screen)
     if interruption:
         return screen, _interrupted_stop(run, StopView(entry, screen), interruption)
@@ -96,5 +133,6 @@ async def _changed_wait(run: _ReplayRun, step: ChangedStep, screen: object) -> t
     screen, stop = await _settle(job, screen, opts)
     if stop is not None:
         return screen, {"error": None, "content": stop}
-    timed_out = step.op != "wait" and not changed
-    return _changed_finish(run, StopView(entry, screen), timed_out)
+    if step.op == "wait" or changed:
+        return _changed_finish(run, StopView(entry, screen), False)
+    return _unchanged_verdict(run, step, (before_wait, screen))

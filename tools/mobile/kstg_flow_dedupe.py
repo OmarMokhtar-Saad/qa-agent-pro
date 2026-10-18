@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import NamedTuple
 
-from tools.mobile import app_flows, app_flows_meta, kstg_flow_rules
+from tools.mobile import app_flows, app_flows_meta, kstg_flow_packets, kstg_flow_rules
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,11 @@ def _label(step: dict) -> str:
 def normalized(template: dict) -> list:
     """The comparable form of a template's steps: ``op|label`` per step."""
     steps = template.get("steps") or []
-    return ["%s|%s" % (s.get("op"), _label(s)) for s in steps if isinstance(s, dict)]
+    return [
+        "%s|%s" % (s.get("op"), _label(s))
+        for s in steps
+        if isinstance(s, dict) and not str(s.get("op") or "").startswith("wait_")
+    ]
 
 
 def _others(package: str, name: str) -> list:
@@ -60,6 +64,24 @@ def judge(package: str, name: str, template: dict) -> Verdict:
     return Verdict(covered, [] if covered else replaces)
 
 
-def drop(package: str, names: list) -> list:
-    """Delete the flows *names*; the ones removed."""
-    return [n for n in names if not app_flows.delete_flow(package, n).get("error")]
+def _base(name: str) -> str:
+    hit = kstg_flow_packets.PACKET_RE.match(name)
+    return hit.group("base") if hit else name
+
+
+def _chain(package: str, names: list) -> list:
+    """*names* plus the other packets of each one's chain (a chain goes as a unit)."""
+    bases = {_base(n) for n in names}
+    rows = app_flows.list_flows(package).get("content") or []
+    mates = [r["name"] for r in rows if _base(r["name"]) in bases]
+    return list(dict.fromkeys(list(names) + mates))
+
+
+def drop(package: str, names: list, keep: str = "") -> list:
+    """Delete the flows *names* with their packet chains, never *keep*; those removed."""
+    every = _chain(package, names) if names else []
+    return [
+        n
+        for n in every
+        if n != keep and not app_flows.delete_flow(package, n).get("error")
+    ]

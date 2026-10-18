@@ -54,13 +54,15 @@ def _save(package: str, packet: _Packet) -> _Outcome:
     meta = kstg_flow_merge.merged_meta(package, packet.name, packet.meta)
     template = dict(got["content"], meta=meta)
     verdict = kstg_flow_dedupe.judge(package, packet.name, template)
+    meta = kstg_flow_merge.with_replaced(package, verdict.replaces, meta)
+    template = dict(template, meta=meta)
     if verdict.covered_by:
         note = "skipped %s, already covered by %s" % (packet.name, verdict.covered_by)
         return _Outcome("", note, verdict.covered_by)
     error = str(app_flows.save_flow(package, packet.name, template).get("error") or "")
     if error:  # the replaced flows stay when the new one could not be saved
         return _Outcome(error[:120], "", "")
-    gone = kstg_flow_dedupe.drop(package, verdict.replaces)
+    gone = kstg_flow_dedupe.drop(package, verdict.replaces, packet.name)
     note = "saved " + packet.name + (" (replaced %s)" % ", ".join(gone) if gone else "")
     return _Outcome("", note, packet.name)
 

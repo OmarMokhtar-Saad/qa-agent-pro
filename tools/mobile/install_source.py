@@ -44,6 +44,10 @@ class InstallRequest:
     latest: bool = False
 
 
+#: ``InstallOutcome.code`` of an ok outcome where nothing was installed.
+ALREADY_LATEST = "already_latest"
+
+
 @dataclass(frozen=True)
 class InstallOutcome:
     """``code`` is a machine reason (``INSTALL_FAILED_*``, ``not_found`` ...);

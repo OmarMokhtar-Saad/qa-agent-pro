@@ -7,20 +7,23 @@ holds the other's (``otp`` in ``login_otp``), and only when exactly one input fi
 
 from __future__ import annotations
 
-import re
-
 from tools.mobile.app_flows_check import secret_fields
-
-_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
-
-
-def tokens(name: str) -> frozenset:
-    """The lowercase words of *name* (split on non-alphanumerics and camelCase)."""
-    return frozenset(w.lower() for w in _WORDS.findall(str(name)))
+from tools.mobile.flow_roles import role, tokens
 
 
 def _fits(want: frozenset, have: frozenset) -> bool:
     return bool(want) and bool(have) and (want <= have or have <= want)
+
+
+def _hits(need: str, spare: list) -> list:
+    """The spare inputs that stand in for *need*: by words, narrowed by role if many."""
+    hits = [
+        k
+        for k in spare
+        if _fits(tokens(need), tokens(k)) or (role(need) and role(need) == role(k))
+    ]
+    same = [k for k in hits if role(k) == role(need)]
+    return same if len(hits) > 1 and same else hits
 
 
 def wanted(template: dict) -> list:
@@ -37,11 +40,7 @@ def aliases(template: dict, inputs: dict) -> dict:
     """
     needs = wanted(template)
     spare = [k for k in inputs if k not in needs]
-    fit = {
-        n: [k for k in spare if _fits(tokens(n), tokens(k))]
-        for n in needs
-        if n not in inputs
-    }
+    fit = {n: _hits(n, spare) for n in needs if n not in inputs}
     uses = [k for hits in fit.values() for k in hits]
     return {n: h[0] for n, h in fit.items() if len(h) == 1 and uses.count(h[0]) == 1}
 

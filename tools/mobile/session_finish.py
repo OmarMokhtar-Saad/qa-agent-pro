@@ -15,6 +15,7 @@ from tools.mobile import (
     lock_reaper,
     locks,
     preflight,
+    restore_outcomes,
     run_finalize,
     run_lease_release,
     stop_goal,
@@ -116,49 +117,22 @@ async def release_restoring(serial: str, run_id: str) -> dict:
         with never_raise(
             logger, "mobile.session.release: restore skipped", exc_info=True
         ):
-            await _restore_run_state(run_id)
+            restore_outcomes.record(run_id, await _restore_run_state(run_id))
     return release_if_held(serial, run_id)
 
 
-# **The one chokepoint for ending a run's hold on a device.** Every
-# run-teardown path in ``handlers`` calls this rather than
-# :func:`release_device_lock` directly, and a test pins that there is no direct
-# call left in that file -- so a fifth teardown path added later cannot skip
-# the restore by reaching for the lock function.
-#
-# **Why this exists instead of putting the restore inside
-# :func:`release_device_lock`.** That function is synchronous and takes no
-# serial, deliberately: its own comment says "BY OWNER, NOT BY NAME. The caller
-# does not always know the serial". ``ime.restore_previous`` is async and needs
-# one. Putting the restore inside it would have meant changing the signature of
-# a function with eight callers, or driving an event loop from a sync function
-# that several callers already invoke from inside one. So the lock function is
-# untouched and this wraps it.
-#
-# The restore is a no-op for a run that never typed -- which is most of them,
-# and all of the pre-run placeholder releases -- because
-# ``ime_session.restore`` reads a record that only ``ensure_ready`` writes.
-#
-# **Not called by the capture lane or the heartbeat.** Those take the device
-# lock for a certificate install, a proxy or a lease sweep; they never touched
-# an input method and have nothing to give back, so they keep calling the
-# synchronous function directly.
-#
-# **What this does NOT cover:** a hard crash or a killed process calls nothing
-# at all -- :func:`release_device_lock` says it, and it is true here too. There
-# is no reaper in this lane, so a run killed outright leaves the QA keyboard
-# selected until something else runs. The doctor's per-device "selected" row is
-# what surfaces that afterwards.
-#
-# **Keywords are forwarded verbatim, not restated.** ``**release_kwargs`` goes
-# straight to :func:`release_device_lock`, so this wrapper holds no copy of
-# that function's defaults -- a copy would pin today's values and drift the
-# day one of them changed. It also means a caller that passes only ``lease=``
-# still calls a one-keyword function, which is what every existing caller and
-# every existing test double expects.
+# **The one chokepoint for ending a run's hold on a device.** Every teardown
+# path in ``handlers`` calls this rather than :func:`release_device_lock`; a
+# test pins that no direct call is left. The restore is async and needs a serial,
+# so it wraps the sync lock function instead of living inside it. It is a no-op
+# for a run that never typed. The capture lane and heartbeat keep calling the
+# sync function (they touch no input method). A hard crash calls nothing: the
+# doctor's per-device "selected" row surfaces that. ``**release_kwargs`` is
+# forwarded verbatim so no copy of the lock function's defaults can drift.
 async def finish_device(owner: str, **release_kwargs) -> dict:
     """Give the tester's keyboard back, THEN give the emulator back."""
     restores = await _restore_run_state(str(owner))
+    restore_outcomes.record(str(owner), restores)
     stale = await _sweep_stale_state(str(owner))
     released = release_device_lock(str(owner), DeviceRelease(**release_kwargs))
     run_lease_release.mark_released(str(owner))
