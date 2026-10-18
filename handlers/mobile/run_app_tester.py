@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from handlers import _common
+from handlers.mobile import run_skipped
 from handlers.mobile.run_request import _AppCall, _mobile_ask
 from tools.mobile import adb as mobile_adb
 from tools.mobile import app_alias, app_stage_pick, resolve_cache, run_store
@@ -62,6 +63,7 @@ async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
     source = AppTesterUiSource()
     if want.package and await source.is_latest(call.serial, want.package):
         await _common.emit(call.progress, _ALREADY_LATEST)
+        run_skipped.mark_tester_install(call.serial, want.package, False)
         return "", want.package
     ask = _mobile_ask(call.choose)
     bundle = await source.find_listed_app(want, ask)
@@ -73,6 +75,7 @@ async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
     if not outcome.ok:
         return _failed(outcome), bundle
     app_alias.remember_alias(call.serial, want.label, bundle)
+    run_skipped.mark_tester_install(call.serial, bundle, True)
     return "", bundle
 
 

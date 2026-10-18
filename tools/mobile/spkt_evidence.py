@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import run_store
+from tools.mobile import explore_stop, run_store
+from tools.mobile.run_finalize import finalize_explore_cases
 from tools.mobile_evidence import capture
 
 logger = logging.getLogger("tools.mobile.session")
@@ -41,6 +42,9 @@ async def _finish_evidence(run_id: str, resolved: object) -> None:
     try:
         body = resolved if isinstance(resolved, dict) else {}
         manifest = (run_store.read_manifest(run_id) or {}).get("content") or {}
+        if isinstance(manifest, dict) and explore_stop.display_stop(manifest):
+            # Every end path (deadline, budget, report-now) passes here.
+            finalize_explore_cases(run_id)
         if not isinstance(manifest, dict) or manifest.get("events_source"):
             return
         pulled = await capture.pull_events(

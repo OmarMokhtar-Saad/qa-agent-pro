@@ -161,6 +161,7 @@ async def _app_stage_install(call: _AppCall, st: tuple, probe: tuple) -> tuple:
 async def _mobile_app_stage(call: _AppCall) -> tuple:
     """Get the app under test onto the device. ``(markdown_or_empty, package)``."""
 
+    run_skipped.forget_run(call.serial)
     label = str(call.source or "").strip()
     install_source = mobile_render.install_source_for_label(label)
     target = call.typed_package

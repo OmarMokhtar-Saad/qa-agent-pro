@@ -7,6 +7,7 @@ import logging
 
 from tools.mobile.action_consts import MAX_EXPECT_APPS, is_package_id
 from tools.mobile.action_schema import TURN_FIELD_SCHEMA
+from tools.mobile.app_label import package_for_label
 
 logger = logging.getLogger("tools.mobile.actions")
 
@@ -19,13 +20,25 @@ def expect_apps_from(payload: object) -> list[str]:
     collapse and the list is cut at :data:`MAX_EXPECT_APPS`.
     """
     listed = payload.get("expect_apps") if isinstance(payload, dict) else None
-    if not isinstance(listed, list):
-        return []
     out: list[str] = []
-    for item in listed[:MAX_EXPECT_APPS]:
+    for item in (listed if isinstance(listed, list) else [])[:MAX_EXPECT_APPS]:
         if is_package_id(item) and item not in out:
             out.append(item)
+    declared = declared_app_package(payload)
+    if declared and declared not in out and len(out) < MAX_EXPECT_APPS:
+        out.append(declared)
     return out
+
+
+def declared_app_package(payload: object) -> str:
+    """The package the turn's ``app`` names (a package id or a known label), else ``""``.
+
+    An ``app`` that cannot be resolved yields ``""`` so the cut keeps its current,
+    stricter behaviour.
+    """
+    said = payload.get("app") if isinstance(payload, dict) else None
+    text = said.strip() if isinstance(said, str) else ""
+    return text if is_package_id(text) else package_for_label(text)
 
 
 def script_finding(payload: object) -> str:

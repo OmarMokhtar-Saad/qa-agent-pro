@@ -121,5 +121,7 @@ def left_app_detail(package: str, expected: str) -> str:
         + " and not to "
         + str(expected)[:80]
         + ", so nothing further was replayed. Send `launch` to bring the app "
-        "under test back to the front, then continue the case."
+        "under test back to the front, then continue the case. To keep working "
+        "in that other app on purpose, declare it with `app` or `expect_apps` "
+        "in the reply."
     )

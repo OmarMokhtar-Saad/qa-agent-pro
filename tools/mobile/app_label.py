@@ -30,3 +30,14 @@ async def known_labels(serial: str, packages: Sequence[str]) -> dict:
     """The built-in labels for whichever of ``packages`` are installed."""
     del serial  # the built-in table is the same on every device
     return {p: KNOWN_LABELS[p] for p in packages if p in KNOWN_LABELS}
+
+
+def package_for_label(text: object) -> str:
+    """The package whose built-in label equals ``text`` (case-folded), else ``""``."""
+    wanted = " ".join(str(text or "").split()).casefold()
+    if not wanted:
+        return ""
+    for package, label in KNOWN_LABELS.items():
+        if label.casefold() == wanted:
+            return package
+    return ""

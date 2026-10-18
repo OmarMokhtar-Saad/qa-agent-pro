@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from tools.mobile import explore_runner, finding_check, media
-from tools.mobile.session_explore_case import TurnRecord, _checkpoint_explore_turn
+from tools.mobile.run_finalize import finalize_explore_cases
+from tools.mobile.session_explore_case import (
+    TurnRecord,
+    _checkpoint_explore_turn,
+)
 from tools.mobile.session_explore_net import _explore_finish_network
 from tools.mobile.session_explore_plan import _explore_planned_case, _persist_explore
 from tools.mobile.session_explore_prior import _latest_finding
@@ -97,7 +101,7 @@ async def _settle_explore_turn(settle: _Settle) -> dict:
     # ONE derivation of "has this run stopped", read by BOTH consumers below.
     stopped = refused or str(turn.get("status") or "") != explore_runner.RUNNING
     if stopped:
-        await _finish_evidence(settle.run_id, resolved)
+        await _close_run(settle.run_id, resolved)
     notice = (
         explore_runner.GUARD_REFUSED_NOTICE
         if refused
@@ -105,6 +109,12 @@ async def _settle_explore_turn(settle: _Settle) -> dict:
     )
     case = _explore_turn_case(settle.checkpoint, outcome, verdict)
     return _explore_turn_reply(_TurnReply(case, notice, resolved, stopped))
+
+
+async def _close_run(run_id: str, resolved: dict) -> None:
+    """Pull the run's evidence and close its in-flight turns."""
+    await _finish_evidence(run_id, resolved)
+    finalize_explore_cases(run_id)
 
 
 def _full_trace(outcome: dict, state: dict) -> list:

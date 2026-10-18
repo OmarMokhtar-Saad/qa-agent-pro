@@ -11,9 +11,12 @@ the full check again; a refusal forgets the proof. Per-dump freshness checks
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
+import tempfile
 import time
 
 from tools.mobile import a11y_settle, adb, imes_upgrade, paths
@@ -24,20 +27,29 @@ logger = logging.getLogger("tools.mobile.a11y")
 STATE_FILE = "a11y-parity.json"
 
 #: Seconds a parity pass is reused. Bounded from above in
-#: ``tests/mobile/test_mobile_bounds_upper.py``.
+#: ``tests/mobile/bounds_rows/stream_1350.py``.
 PROOF_TTL_S = 7 * 24 * 3600
+
+#: Version of the host-side parity rules (``a11y_parity`` compare, ``a11y_settle``). It is
+#: part of the proof identity: bump it with any change to what a parity pass means, so
+#: proofs made under the old rules are no longer reused.
+PARITY_CONTRACT = "p1"
 
 #: Devices remembered; the oldest proof is dropped first.
 MAX_PROOFS = 32
 
 
 async def identity(serial: str) -> str:
-    """``<android build>|<qa-ime versionName>``, ``""`` when either is unreadable."""
+    """``<android build>|<qa-ime versionName>|<parity contract>``, ``""`` when either is unreadable."""
     got = await adb.shell(serial, ["getprop", "ro.build.fingerprint"])
     build = str((got.get("content") or {}).get("out") or "").strip()
     package = str((host().manifest().get("content") or {}).get("package") or "")
     ime = await imes_upgrade.installed_version(serial, package) if package else ""
-    return f"{build}|{ime}" if build and ime and not got.get("error") else ""
+    return (
+        f"{build}|{ime}|{PARITY_CONTRACT}"
+        if build and ime and not got.get("error")
+        else ""
+    )
 
 
 def _load() -> dict:
@@ -48,16 +60,54 @@ def _load() -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def _at(entry: object) -> float:
+    """The proof time of *entry*; 0 when it is missing, non-numeric or not a dict."""
+    try:
+        return float(entry.get("at") or 0) if isinstance(entry, dict) else 0.0
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _write(path, kept: dict) -> None:
+    """Write *kept* to *path* through a unique tmp file, fsynced before the rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(kept))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(name)
+        raise
+
+
 def _save(proofs: dict) -> None:
     path = paths.state_file(STATE_FILE)
-    tmp = path.with_name(path.name + ".tmp")
-    kept = dict(sorted(proofs.items(), key=lambda kv: kv[1].get("at", 0))[-MAX_PROOFS:])
+    kept = dict(sorted(proofs.items(), key=lambda kv: _at(kv[1]))[-MAX_PROOFS:])
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(kept), encoding="utf-8")
-        os.replace(tmp, path)
+        _write(path, kept)
     except OSError:
         logger.warning("a11y_parity_proof: could not write %s", path, exc_info=True)
+
+
+@contextlib.contextmanager
+def _locked():
+    """Hold an exclusive file lock over a load-modify-save; unlocked if it cannot be taken."""
+    path = paths.state_file(STATE_FILE)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 async def proven(serial: str) -> bool:
@@ -65,7 +115,8 @@ async def proven(serial: str) -> bool:
     entry = _load().get(str(serial or ""))
     if not isinstance(entry, dict):
         return False
-    fresh = time.time() - float(entry.get("at") or 0) < PROOF_TTL_S
+    age = time.time() - _at(entry)
+    fresh = 0 <= age < PROOF_TTL_S
     return fresh and bool(entry.get("id")) and entry["id"] == await identity(serial)
 
 
@@ -74,15 +125,17 @@ async def remember(serial: str) -> None:
     ident = await identity(serial)
     if not ident:
         return
-    proofs = _load()
-    proofs[str(serial or "")] = {"id": ident, "at": time.time()}
-    _save(proofs)
+    with _locked():
+        proofs = _load()
+        proofs[str(serial or "")] = {"id": ident, "at": time.time()}
+        _save(proofs)
 
 
 def forget(serial: str) -> None:
-    proofs = _load()
-    if proofs.pop(str(serial or ""), None) is not None:
-        _save(proofs)
+    with _locked():
+        proofs = _load()
+        if proofs.pop(str(serial or ""), None) is not None:
+            _save(proofs)
 
 
 async def checked(serial: str, fast_xml: str) -> dict:

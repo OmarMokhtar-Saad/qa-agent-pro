@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.131.0] - 2026-10-17
+## [1.132.0] - 2026-10-18
 
 ### Added
 
@@ -84,6 +84,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
   (up to 20 s) instead of reporting 0 builds.
 - A one-time code that submits itself and moves to the next screen
   reads as unknown, not as not typed.
+- When the server already ran the App Tester step or opened the app,
+  the start reply says so, so the chat model does not do it again.
+- An app named without quotes (named exactly X) is recognised.
+- A goal that starts from the home screen no longer opens the app
+  first when no install step ran.
+- A turn that declares the app it moves to (App Tester, Play Store,
+  Settings, Chrome or a package id) is no longer cut after one action
+  for leaving the app.
+- Explore cases still waiting on the model are closed when the run
+  ends, so none stay open.
+- An unknown screen is not treated as another app by the flow gate.
+- Held screenshots and recordings are capped and dropped when the run
+  ends; a failed case write keeps them.
+- The fast screen reader's remembered start check is written safely,
+  ignores corrupt or future-dated entries, and is reset when its
+  screen-read rules change.
 
 ### Known
 

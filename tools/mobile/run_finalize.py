@@ -18,7 +18,13 @@ reported instead of a success-shaped reply.
 
 from __future__ import annotations
 
-from tools.mobile import run_store
+import logging
+import time
+
+from config.settings_guard import never_raise
+from tools.mobile import media_pending, run_store
+
+logger = logging.getLogger("tools.mobile.session")
 
 #: Written as ``final.stop`` when the tester ended the run through ``qa_mobile_stop``.
 STOP_TESTER = "stopped_by_tester"
@@ -65,6 +71,33 @@ def _mark_explore(manifest: dict, stop: str) -> None:
         explore["stop"] = _clip(stop)
 
 
+#: The in-flight statuses a stopped run must not leave on a turn. A turn the
+#: model never came back to (the run ended on a later turn) is over, not waiting.
+_IN_FLIGHT = ("needs_model", "planning")
+
+
+def _finalized(body: dict) -> dict | None:
+    """The turn *body* closed out, or ``None`` when it needs no change."""
+    if str(body.get("status") or "") not in _IN_FLIGHT:
+        return None
+    # The verdict is left as recorded: only the run's own done() turn earns
+    # one, so a closed turn is "done" with no verdict, never a pass.
+    return {**body, "status": "done", "updated": time.time()}
+
+
+def finalize_explore_cases(run_id: str) -> None:
+    """Close every turn still "needs_model" once the run has stopped. Never raises."""
+    with never_raise(
+        logger,
+        "mobile.session: could not finalize explore turns",
+        level=logging.WARNING,
+    ):
+        for body in run_store.list_cases(run_id).get("content") or []:
+            closed = _finalized(body) if isinstance(body, dict) else None
+            if closed is not None:
+                run_store.write_case(run_id, str(closed["tc_id"]), closed)
+
+
 def finalize(run_id: str, verdict: object, *, stop: str = "") -> bool:
     """Record ``verdict`` as the run\'s final outcome; True when THIS call wrote it.
 
@@ -72,12 +105,16 @@ def finalize(run_id: str, verdict: object, *, stop: str = "") -> bool:
     ``RuntimeError`` when the manifest cannot be read or written.
     """
     manifest = _read(run_id)
+    if manifest.get("lane") == "explore":
+        finalize_explore_cases(run_id)
     if isinstance(manifest.get("final"), dict):
+        media_pending.drop_run(run_id)
         return False
     manifest["final"] = _final_of(verdict, stop)
     _mark_explore(manifest, stop)
     if run_store.write_manifest(run_id, manifest).get("error"):
         raise RuntimeError("the run verdict could not be written")
+    media_pending.drop_run(run_id)  # the run ended: no case will drain these
     return True
 
 

@@ -35,11 +35,19 @@ def _case_file(run_id: str, tc_id: str) -> Path:
     return run_io.run_path(run_id) / run_consts.CASES_DIR / (tc_id + ".json")
 
 
-def _drain_media(run_id: str, tc_id: str, body: dict) -> None:
-    """Index media produced before this case had a record."""
+def _write_draining(run_id: str, tc_id: str, body: dict) -> None:
+    """Index media produced before this case had a record, then write the case.
+
+    The held media is taken before the write; if the write fails it is put back.
+    """
     late = media_pending.take(run_id, tc_id)
     if late:
         body["media"] = [*list(body.get("media") or []), *late]
+    try:
+        run_io._write_json(_case_file(run_id, tc_id), body)
+    except BaseException:
+        media_pending.put_back(run_id, tc_id, late)
+        raise
 
 
 def write_case(run_id: str, tc_id: str, payload: dict) -> dict:
@@ -51,8 +59,7 @@ def write_case(run_id: str, tc_id: str, payload: dict) -> dict:
         body = dict(payload or {})
         body.setdefault("tc_id", tc_id)
         body.setdefault("updated", time.time())
-        _drain_media(run_id, tc_id, body)
-        run_io._write_json(_case_file(run_id, tc_id), body)
+        _write_draining(run_id, tc_id, body)
         return {"error": None, "content": {"tc_id": tc_id}}
     except Exception as exc:
         logger.exception("mobile.run_store.write_case failed")

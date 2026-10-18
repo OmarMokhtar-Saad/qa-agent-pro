@@ -79,14 +79,21 @@ def foreign_decline(rec: dict, package: str) -> bool:
     """A decline on a screen not proven to be *package*'s own (an OS permission dialog).
 
     Replay allows OS permission dialogs, so a flow must not decline one. A decline on
-    the app's own sheet is part of the app's route and replays as recorded.
+    the app's own sheet is part of the app's route and replays as recorded. A screen
+    with no stamped package is unknown, not foreign: it stays in the route.
     """
-    return declines(rec) and (not package or observed(rec) != package)
+    seen = observed(rec)
+    return declines(rec) and bool(seen) and seen != package
 
 
 def _declines_permission(recs: list, package: str) -> bool:
-    """True when a tap declines a permission outside the app's own screens."""
-    return any(foreign_decline(rec, package) for rec in recs)
+    """True when a tap declines a permission on a screen not proven the app's own.
+
+    An unknown screen is not trimmed as foreign, but nothing proved it is the app's,
+    so a flow declining there is not learned.
+    """
+    own = {package} - {""}
+    return any(declines(rec) and observed(rec) not in own for rec in recs)
 
 
 def reject(recs: list, package: str = "") -> str:
