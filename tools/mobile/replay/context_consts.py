@@ -56,10 +56,19 @@ WAIT_POLL_MAX_S = 0.5
 #: again. Bounded, because a tap that really did nothing must still say so.
 AUTO_SETTLE_MAX_S = 2.0
 
-#: The longest an explore turn waits for the screen to change (S3). The turn
-#: ends and hands the model the screen; a 10s wait for a change that is not
-#: coming only delays that. Scripted runs keep the model's own ``ms``.
-EXPLORE_CHANGED_WAIT_MAX_MS = 3000
+#: The longest an explore turn waits for the screen to change. The wait is
+#: event/probe driven and ends at the first change, then holds it still on the frame probe
+#: (:mod:`changed_settle`: no extra dump when it is quiet), so this is
+#: only the bound of a change that never comes. It must outlast app timers
+#: (a splash that moves on after several seconds): a 3s cap reported a false
+#: "did not change" on a real Splash -> Onboarding move. Scripted runs keep the
+#: model's own ``ms``.
+EXPLORE_CHANGED_WAIT_MAX_MS = 10000
+
+#: The longest the forced fresh read of a "no change" wait may take past the
+#: wait's own deadline (s): it re-dumps once, cache cleared, before the screen
+#: is called unchanged.
+FRESH_READ_BUDGET_S = 3.0
 
 #: Screen-changing ops that do NOT auto-settle: a field edit changes one
 #: element in place, and polling for a "change" after it would spend the whole

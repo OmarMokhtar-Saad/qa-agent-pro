@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, NamedTuple
 
-from tools.mobile import screen_key
+from tools.mobile import run_redact, screen_key
 from tools.mobile.replay.context import (
     STATUS_NEEDS_MODEL,
     Context,
@@ -35,7 +35,7 @@ class StepAt(NamedTuple):
 
 
 def _reply(content: Any) -> dict:
-    return {"error": None, "content": content}
+    return {"error": None, "content": run_redact.redact(content)}
 
 
 def _close(run: _ReplayRun, at: StepAt) -> None:

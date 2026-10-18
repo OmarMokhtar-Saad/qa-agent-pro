@@ -90,6 +90,8 @@ def _clean_row(item: dict) -> dict:
         row["caller"] = str(item["caller"])[:40]
     if item.get("source"):
         row["source"] = str(item["source"])[:40]
+    if item.get("nested"):
+        row["nested"] = True
     if int(item.get("n") or 0) > 1:
         row["n"] = int(item["n"])
     return row

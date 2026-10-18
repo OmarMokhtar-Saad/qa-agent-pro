@@ -11,21 +11,27 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 
-from tools.mobile import step_timing
+from tools.mobile import prerun_timing, step_timing
 
 _OUTER: ContextVar = ContextVar("_STEP_OUTER", default=False)
 
 
+def _arm() -> None:
+    """Arm the ledger and ledger the pre-run phases (``prerun:*`` rows)."""
+    step_timing.begin()
+    prerun_timing.replay_all_into_ledger()
+
+
 def begin_outer() -> None:
     """Arm the ledger from the outermost handler."""
-    step_timing.begin()
+    _arm()
     _OUTER.set(True)
 
 
 def begin_inner() -> None:
     """Arm for the step itself, unless an outer handler already did."""
     if not _OUTER.get():
-        step_timing.begin()
+        _arm()
 
 
 def end_outer() -> None:

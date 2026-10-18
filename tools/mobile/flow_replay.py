@@ -133,7 +133,7 @@ async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
 async def run(run_id: str, ctx: Any, auto: Auto) -> Auto:
     """The live screen after every flow that fit and ran (the input when none did)."""
     try:
-        if flow_replay_state.opted_out(run_id):
+        if flow_replay_state.honoured(run_id, auto.body.get("goal")):
             return auto
         auto.body.pop("auto_trace", None)
         flow_replay_switch.clear(auto.body)

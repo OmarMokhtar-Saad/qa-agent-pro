@@ -22,8 +22,8 @@ def hint_text(perms: list[str]) -> str:
     names = [p.rsplit(".", 1)[-1] for p in perms]
     more = ", ..." if len(names) > SHOWN else ""
     return (
-        "\n\n%d runtime permissions not granted (%s%s): pass "
-        "`grant_permissions=true` with `apply=true` unless you are testing the "
+        "\n\n%d runtime permissions not granted (%s%s): rerun "
+        "without `grant_permissions=false` unless you are testing the "
         "permission prompt." % (len(names), ", ".join(names[:SHOWN]), more)
     )
 

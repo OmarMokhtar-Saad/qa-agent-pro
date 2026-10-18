@@ -8,6 +8,8 @@ took the time. A label is the command's first words, never an argument value.
 
 from __future__ import annotations
 
+import time
+
 #: Distinct command labels kept per step; a later new label is counted as ``other``.
 MAX_LABELS = 24
 
@@ -36,7 +38,20 @@ def note_adb(state: dict | None, body: str, seconds: float) -> None:
     if label not in table and len(table) >= MAX_LABELS:
         label = OTHER
     count, total = table.get(label, (0, 0.0))
-    table[label] = (count + 1, total + seconds)
+    table[label] = (count + 1, total + _exclusive(state, seconds))
+
+
+def _exclusive(state: dict, seconds: float) -> float:
+    """The part of this call's *seconds* no other adb call already covers.
+
+    Calls overlap (a dump runs beside probes), so summing their wall time
+    reported 8.9 s of adb inside a 3.1 s step. Calls are noted as they END, in
+    order, so the union is one moving edge: only the time past it is new.
+    """
+    end = time.monotonic()
+    new = max(0.0, end - max(end - seconds, float(state.get("adb_reach", 0.0))))
+    state["adb_reach"] = max(end, float(state.get("adb_reach", 0.0)))
+    return min(new, max(0.0, seconds))
 
 
 def rows(state: dict) -> list:
@@ -50,6 +65,7 @@ def rows(state: dict) -> list:
             "ms": int(total * 1000),
             "n": count,
             "skipped": False,
+            "nested": True,
         }
         for label, (count, total) in top
     ]

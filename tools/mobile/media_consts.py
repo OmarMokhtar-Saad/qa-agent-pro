@@ -67,7 +67,8 @@ NOTES: dict = {
         "back to this machine. Nothing about the step's verdict depends on it."
     ),
     WITHHELD: (
-        "No picture of this step is stored, deliberately: a credential was "
+        "WITHHELD (credential entered): no picture of this step is stored, "
+        "deliberately: a credential was "
         "entered while it ran, and a frame cannot be masked the way text can."
     ),
     NOT_ATTEMPTED: (

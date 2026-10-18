@@ -26,6 +26,7 @@ CHECK_NAMES: tuple[str, ...] = (
     "adb_responds",
     "adb_first_on_path",
     "emulator_booted",
+    "device_screen",
     "device_dns",
     "package_installed",
     "ime_pinned",

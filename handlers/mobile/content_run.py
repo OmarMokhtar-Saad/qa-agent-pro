@@ -43,9 +43,15 @@ async def _avd_audit(avd: AvdCall, name: str, apply: bool) -> None:
     )
 
 
+def _effective_apply(call: StepCall) -> bool:
+    """``apply`` as ``handle_mobile_test`` reads it: on, and ``dry_run`` not on."""
+    on = _mobile_arg(call.args, call.kwargs, "apply") is True
+    return on and _mobile_arg(call.args, call.kwargs, "dry_run") is not True
+
+
 async def _avd_run(avd: AvdCall, call: StepCall, avd_manage) -> str:
     """Audit, then run the AVD action; ``apply`` and ``avd`` come from the ORIGINAL call."""
-    apply = _mobile_arg(call.args, call.kwargs, "apply") is True
+    apply = _effective_apply(call)
     name = str(_mobile_arg(call.args, call.kwargs, "avd") or "").strip()
     await _avd_audit(avd, name, apply)
     return await avd_manage.manage(

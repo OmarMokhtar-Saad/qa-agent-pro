@@ -31,6 +31,7 @@ TILES = (
     "fail",
     "blocked",
     "unverified",
+    "no_verdict",
     "needs_tester",
     "needs_model",
     "planning",
@@ -45,6 +46,7 @@ VERDICT_TONE = {
     "fail": ("def", "s-def", "p-def", "Failed"),
     "blocked": ("gap", "s-gap", "p-gap", "Blocked"),
     "unverified": ("gap", "s-gap", "p-gap", "Not verified"),
+    "no_verdict": ("void", "s-void", "p-void", "No verdict (nothing asserted)"),
     "needs_tester": ("void", "s-void", "p-void", "Needs the tester"),
     "needs_model": ("void", "s-void", "p-void", "Needs the model"),
     "planning": ("void", "s-void", "p-void", "Planning"),
@@ -67,6 +69,9 @@ def _verdict_of(case: object) -> str:
     if verdict in DONE_VERDICTS:
         return verdict
     status = _text(body.get("status"), 40)
+    if _token(status) == "done":
+        # Finished with nothing asserted: its own word, not "done" read as a verdict.
+        return "no_verdict"
     return _token(status) if status else "unknown"
 
 

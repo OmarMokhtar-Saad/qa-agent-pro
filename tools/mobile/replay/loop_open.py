@@ -25,6 +25,7 @@ from tools.mobile.replay.screen import (
     _screen_id,
     _texts,
 )
+from tools.mobile.replay.shown_baseline import note_shown
 from tools.mobile.replay.steps_stop import (
     StepAt,
     _reply,
@@ -82,6 +83,7 @@ async def _replay_first_screen(
             stop = ReplayStop(STATUS_ERROR, trace, None, "", str(dumped["error"]), -1)
             return screen, _reply(_result(stop))
         screen = dumped.get("content")
+    note_shown(ctx, screen)
     return screen, None
 
 

@@ -74,3 +74,9 @@ def shape(template: dict) -> str:
     ids = [[str(s.get("op") or ""), _label(s)] for s in steps if _counts(s)]
     raw = json.dumps(ids, ensure_ascii=False)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:SIG_CHARS]
+
+
+def route_of_records(recs: list) -> str:
+    """The goal-free shape of the route a learn run is about to save (its flow name key)."""
+    steps = [r.get("flow_action") or {} for r in recs]
+    return shape({"steps": steps})

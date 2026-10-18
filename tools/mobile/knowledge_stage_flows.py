@@ -18,6 +18,7 @@ from typing import NamedTuple
 
 from tools.mobile import (
     app_flows,
+    flow_goal_migrate,
     kstg_flow_build,
     kstg_flow_cut,
     kstg_flow_dedupe,
@@ -88,7 +89,7 @@ def _packets(recs: list) -> tuple:
 def _plan(goal: str, recs: list, packets: list) -> list:
     done = kstg_flow_meta.all_kept(recs, packets)
     metas = kstg_flow_meta.packet_metas(recs, packets, done)
-    sig = kstg_flow_sig.of_records(recs)
+    sig = kstg_flow_sig.route_of_records(recs)
     names = kstg_flow_packets.names(goal, len(packets), sig)
     metas = [dict(m, goal=kstg_flow_build.normalise(goal)) for m in metas]
     return [_Packet(n, p, m) for n, p, m in zip(names, packets, metas)]
@@ -139,6 +140,7 @@ def run(conn, lc) -> StageResult:
     if not goal or not kstg_flow_build.ended_clean(lc.steps):
         return StageResult("flows", notes=["no clean goal_reached run"])
     result = StageResult("flows")
+    flow_goal_migrate.run(lc.package)
     recs = kstg_flow_build.app_recs(lc.steps, lc.package)
     if len(recs) >= kstg_flow_build.MIN_STEPS:
         _save_all(lc, (goal, recs), result)

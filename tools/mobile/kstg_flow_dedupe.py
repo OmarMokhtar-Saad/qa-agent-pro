@@ -4,7 +4,9 @@ A new flow whose steps equal, or sit inside, an existing flow of the package add
 nothing, so it is not saved. An existing flow that sits strictly inside the new one is
 replaced by it. Steps compare by op, target label and the pressed key or scroll
 direction: run ids, waits' ``max_s`` ceilings and screen records do not count. A flow
-that stops short of the goal never covers one that reaches it. Never raises.
+that stops short of the goal never covers one that reaches it. A flow holding an optional step (a permission or popup tap) is never
+replaced by one without it, so a later run that skipped the popup cannot delete it.
+Never raises.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import NamedTuple
 from tools.mobile import app_flows, app_flows_meta, kstg_flow_packets, kstg_flow_rules
 
 logger = logging.getLogger(__name__)
+OPTIONAL = "tap_text_if_present|"
 
 
 class Verdict(NamedTuple):
@@ -46,17 +49,29 @@ def _others(package: str, name: str) -> list:
     return [(n, g["content"]) for n, g in got if n != name and not g.get("error")]
 
 
+def optional(rows: list) -> dict:
+    """Per chain base, the optional steps (``tap_text_if_present``) any packet holds."""
+    held: dict = {}
+    for name, content in rows:
+        steps = (s for s in normalized(content) if s.startswith(OPTIONAL))
+        held.setdefault(base(name), set()).update(steps)
+    return held
+
+
 def judge(package: str, name: str, template: dict) -> Verdict:
     """How *template* (saved as *name*) relates to the package's other flows."""
     new, goal = normalized(template), app_flows_meta.reached(template)
     covered, replaces = "", []
     try:
-        for other, content in _others(package, name):
+        rows = _others(package, name)
+        opt = optional(rows)
+        for other, content in rows:
             old = normalized(content)
             holds = old == new or kstg_flow_rules.inside(new, old)
+            lost = opt[base(other)] - set(new)  # a chain goes as a unit
             if holds and (app_flows_meta.reached(content) or not goal):
                 covered = covered or other
-            elif old == new or kstg_flow_rules.inside(old, new):
+            elif (old == new or kstg_flow_rules.inside(old, new)) and not lost:
                 replaces.append(other)
     except Exception:
         logger.exception("flow dedupe failed")
@@ -64,16 +79,16 @@ def judge(package: str, name: str, template: dict) -> Verdict:
     return Verdict(covered, [] if covered else replaces)
 
 
-def _base(name: str) -> str:
+def base(name: str) -> str:
     hit = kstg_flow_packets.PACKET_RE.match(name)
     return hit.group("base") if hit else name
 
 
 def _chain(package: str, names: list) -> list:
     """*names* plus the other packets of each one's chain (a chain goes as a unit)."""
-    bases = {_base(n) for n in names}
+    bases = {base(n) for n in names}
     rows = app_flows.list_flows(package).get("content") or []
-    mates = [r["name"] for r in rows if _base(r["name"]) in bases]
+    mates = [r["name"] for r in rows if base(r["name"]) in bases]
     return list(dict.fromkeys(list(names) + mates))
 
 

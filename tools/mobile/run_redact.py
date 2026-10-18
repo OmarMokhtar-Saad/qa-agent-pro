@@ -7,9 +7,9 @@ to the last four, credential-field values redacted, password nodes blanked.
 under a key in ``SECRET_VALUE_KEYS`` inside an object marked ``secret: true``,
 and any value under a key in ``ALWAYS_MASKED_KEYS`` wherever it appears.
 
-It is still not a value scrubber: a credential stored under an unrecognised key
-name with no marker WILL reach disk, so a new writer of tester-supplied values
-must mark it.
+Every string also passes :func:`tools.mobile.act_scrub.scrub`, which removes each
+secret value the process has been given (typed into a credential field, marked
+``secret`` or supplied as a tester input) whatever key it sits under.
 
 :func:`redact` is applied on every write in the store. Structure is preserved --
 the report still shows that a credential was typed into a named field, which is
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tools.mobile import run_consts, run_mask_id
+from tools.mobile import act_scrub, run_consts, run_mask_id
 
 
 def _is_secret(value: object) -> bool:
@@ -48,13 +48,23 @@ def _mask_always(out: dict) -> None:
             out[key] = run_consts.SECRET_MASK
 
 
+def _leaf(key: object, value: object) -> Any:
+    # Structural keys (bounds, ids, class) are never value-scrubbed.
+    if isinstance(value, str) and str(key).lower() in act_scrub.STRUCTURAL_KEYS:
+        return value
+    return redact(value)
+
+
 # Applied on every write in this module. Structure is preserved -- the report
 # still shows that a credential was typed into a named field, which is what a
 # tester needs, without showing the credential.
 def redact(obj: object) -> Any:
     """Recursively mask the value of anything marked ``secret``."""
+    if isinstance(obj, str):
+        return act_scrub.scrub(obj)
     if isinstance(obj, dict):
-        out: dict = {key: redact(value) for key, value in obj.items()}
+        act_scrub.register_action(obj)
+        out: dict = {key: _leaf(key, value) for key, value in obj.items()}
         _mask_marked(out)
         _mask_always(out)
         run_mask_id.mask_node(out)

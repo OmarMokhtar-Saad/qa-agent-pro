@@ -77,7 +77,8 @@ async def handle_mobile_test(  # noqa: PLR0913 - MCP tool schema
     package: str = "",
     run_id: str = "",
     session_token: str = "",
-    apply: bool = False,
+    apply: bool = True,
+    dry_run: bool = False,
     continue_run: bool = False,
     serial: str = "",
     avd: str = "",
@@ -87,7 +88,7 @@ async def handle_mobile_test(  # noqa: PLR0913 - MCP tool schema
     capture_ack: bool = False,
     reset_app: bool = False,
     charter: str = "",
-    grant_permissions: bool = False,
+    grant_permissions: bool = True,
     launch: bool = True,
     *,
     choose: _common.ChooseCb = None,
@@ -103,6 +104,7 @@ async def handle_mobile_test(  # noqa: PLR0913 - MCP tool schema
     if not _common.mobile_lane_enabled():
         return mobile_gate._mobile_lane_off_message()
 
+    apply = apply and not dry_run
     request = _MobileTestRequest.from_call(locals())
     try:
         return await _mobile_test_route(request, (run_id, session_token, continue_run))

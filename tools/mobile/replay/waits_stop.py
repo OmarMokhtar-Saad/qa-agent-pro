@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from tools.mobile import step_timing
+from tools.mobile.replay.changed_settle import settle_changed
 from tools.mobile.replay.context import ReplayStop, _append, _ReplayRun, _result
 from tools.mobile.replay.context_consts import STATUS_NEEDS_MODEL
 from tools.mobile.replay.screen import _stamp_after
@@ -112,6 +113,15 @@ def _unchanged_verdict(run: _ReplayRun, step: ChangedStep, seen: tuple) -> tuple
     return _changed_finish(run, view, timed_out)
 
 
+async def _settle_wait(run: _ReplayRun, step: ChangedStep, seen: tuple) -> tuple:
+    """Settle the wait's read, *seen* being ``(screen, reusable)``: ``(screen, stop)``."""
+    screen, reusable = seen
+    job = SettleJob(run.ctx, step.entry, run.trace, step.entry["index"])
+    opts = SettleOpts(redump=not reusable, mark_no_change=False, op=step.op)
+    screen, stop = await _settle(job, screen, opts)
+    return screen, (None if stop is None else {"error": None, "content": stop})
+
+
 # `redump=not reusable`: only a wait whose LAST poll dumped the unchanged
 # screen hands back a post-wait screen (`_wait_until_changed` says when).
 # Every other path holds a screen from before the wait ended, and skipping
@@ -128,11 +138,11 @@ async def _changed_wait(run: _ReplayRun, step: ChangedStep, screen: object) -> t
         return screen, _interrupted_stop(run, StopView(entry, screen), interruption)
     if reusable:
         step_timing.mark("dump_reused")
-    job = SettleJob(run.ctx, entry, run.trace, entry["index"])
-    opts = SettleOpts(redump=not reusable, mark_no_change=False, op=step.op)
-    screen, stop = await _settle(job, screen, opts)
+    screen, stop = await _settle_wait(run, step, (screen, reusable))
     if stop is not None:
-        return screen, {"error": None, "content": stop}
+        return screen, stop
+    if changed:
+        screen = await settle_changed(run.ctx, screen)  # the first change, held still
     if step.op == "wait" or changed:
         return _changed_finish(run, StopView(entry, screen), False)
     return _unchanged_verdict(run, step, (before_wait, screen))

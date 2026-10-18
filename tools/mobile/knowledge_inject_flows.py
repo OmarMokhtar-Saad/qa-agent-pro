@@ -9,7 +9,8 @@ _PRIO = 1
 
 _HOW = (
     " The server replays it by itself when the app is on its first screen; "
-    "flow=%s replays it on demand, flow=none turns auto-replay off."
+    "flow=%s replays it on demand. flow=none is honoured only when the "
+    "user asked for no flow."
 )
 
 
@@ -78,12 +79,27 @@ def _best_per_goal(groups: dict) -> dict:
     return dict(best.values())
 
 
+def _why(got: list) -> str:
+    first = got[0]
+    bits = [
+        "it reached its goal" if first.get("reached") else "the longest known route"
+    ]
+    if int(first.get("ok") or 0):
+        bits.append("%d good replays" % int(first["ok"]))
+    return " Offered because " + " and ".join(bits) + "."
+
+
 def flows(snap: dict, key) -> list:
-    """One item per goal (its best flow, packets grouped), in the stable block only."""
+    """ONE item: the best saved flow (packets grouped), said why; stable block only."""
     if key is not None:
         return []
     rows = [r for r in snap.get("flows") or [] if isinstance(r, dict) and r.get("name")]
-    return [_item(base, got) for base, got in _best_per_goal(_groups(rows)).items()]
+    best = _best_per_goal(_groups(rows))
+    if not best:
+        return []
+    base, got = max(best.items(), key=lambda kv: _rank(kv[1]))
+    item = _item(base, got)
+    return [dict(item, text=item["text"] + _why(got))]
 
 
 knowledge_inject.register_source("flows", flows)

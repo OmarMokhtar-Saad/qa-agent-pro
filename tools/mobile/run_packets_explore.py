@@ -129,7 +129,9 @@ def _explore_worker_instructions() -> str:
         "Set `sub_goal` to the one step you are on now: it goes INSIDE "
         "the `script` JSON, "
         '{"actions": [...], "sub_goal": "..."}, never as a tool '
-        "argument. When the goal moves on to ANOTHER app and that "
+        "argument. End each script with an assert action that checks what "
+        "the turn proved, then call done(); a turn that asserts nothing "
+        "has no verdict. When the goal moves on to ANOTHER app and that "
         "app is on screen, set `app` the same way, once."
     )
 

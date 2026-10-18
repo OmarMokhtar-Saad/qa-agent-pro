@@ -10,17 +10,12 @@ from tools.mobile.replay.context import (
     _result,
 )
 from tools.mobile.replay.guard import NOTHING_MOVED_NOTE, inert_ops
-from tools.mobile.replay.screen import _verification_summary, _verified
+from tools.mobile.replay.screen import _has_verification, _verification_summary
 from tools.mobile.replay.steps_stop import _reply
 
 _REASON_VERIFIED_TAIL = (
     ". The script ended without a done() action, so this verdict "
     "rests on the asserts above."
-)
-_REASON_VERIFIED_EARLIER = (
-    "This turn ended without a done() action. It asserted nothing "
-    "itself; an earlier turn of this run did, and that is what the "
-    "verdict rests on."
 )
 _REASON_UNASSERTED = (
     "The script finished without a done() action. Nothing in it "
@@ -28,10 +23,10 @@ _REASON_UNASSERTED = (
     "-- a screen that moved is activity, not verification."
 )
 _REASON_EXPLORATORY = (
-    "This turn ended without a done() action and asserted nothing, "
-    "which is ordinary for an exploratory turn -- it recorded what "
-    "the screen did. No verdict is claimed for it. The run's "
-    "verdict comes from the turn that judges the goal."
+    "No verdict for this turn: it ended without a done() action and asserted "
+    "nothing, which is ordinary for an exploratory turn -- it only recorded "
+    "what the screen did. The run is NOT finished: to verify the goal, add "
+    "assert actions on what you expect, then call done() with a verdict."
 )
 
 
@@ -54,8 +49,6 @@ def _no_done_reason(ended_verified: bool, summary: str, asserts_expected: bool) 
     """The reason a script that never called done() ends with (why: above)."""
     if ended_verified and summary:
         return "Verified: " + summary + _REASON_VERIFIED_TAIL
-    if ended_verified:
-        return _REASON_VERIFIED_EARLIER
     if asserts_expected:
         return _REASON_UNASSERTED
     return _REASON_EXPLORATORY
@@ -66,12 +59,10 @@ def _no_done_reason(ended_verified: bool, summary: str, asserts_expected: bool) 
 # bypassed the whole verification rule the done() branch enforces. The same
 # rule applies on both exits or it is not a rule.
 #
-# ``_verified``, not ``_has_verification``: the done() branch asks the
-# run-wide question (:1533) and this exit asked the narrower one, so an
-# explore run whose earlier turn DID assert was still told nothing had been
-# verified whenever a turn omitted done(). That is the refusal
-# ``prior_verified`` exists to remove, surviving on the other exit -- and
-# the scripted lane is unmoved, because that field defaults to False.
+# ``_has_verification``, NOT the run-wide ``_verified``: an assert an earlier
+# turn made covered a different field or screen, so a turn that asserted nothing
+# itself carries no verdict -- it is rendered "No verdict", never inherits one.
+# (done() still judges the goal run-wide; only this exit is per-script.)
 #
 # THE TRACE THIS REASON IS SUMMARISING, actually read. Every branch above
 # is derived from `ended_verified` and `ctx.asserts_expected` alone, so all
@@ -83,7 +74,7 @@ def _no_done_reason(ended_verified: bool, summary: str, asserts_expected: bool) 
 def _end_of_script(run: _ReplayRun, screen: dict | None) -> dict:
     """The reply of a script that never calls done() (why: above)."""
     ctx, trace = run.ctx, run.trace
-    ended_verified = _verified(trace, ctx)
+    ended_verified = _has_verification(trace)
     summary = _verification_summary(trace)
     reason = _no_done_reason(ended_verified, summary, ctx.asserts_expected)
     inert = inert_ops(trace)

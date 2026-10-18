@@ -30,7 +30,7 @@ class _MobileTestRequest:
     charter: str
     choose: _common.ChooseCb
     progress: _common.ProgressCb
-    grant_permissions: bool = False
+    grant_permissions: bool = True
     launch: bool = True
 
     @classmethod

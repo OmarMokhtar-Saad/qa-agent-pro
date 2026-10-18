@@ -12,6 +12,7 @@ from tools.mobile.replay.context_consts import (
     WAIT_POLL_S,
 )
 from tools.mobile.replay.dump import _dump, _focus_probe
+from tools.mobile.replay.fresh_read import unchanged
 from tools.mobile.replay.screen import _screen_hash, system_dialog_package
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_poll import _wait_deadline
@@ -144,7 +145,7 @@ async def _dumped_changed(ctx: Context, screen: object, deadline: float) -> tupl
             return current, True, await _change_reusable(ctx, current, focus)
         if system_dialog_package(current):  # unchanged AND covered: stop polling
             return current, False, False
-    return current, False, fresh
+    return await unchanged(ctx, (current, fresh), deadline)
 
 
 def _changed_detail(op: str, wait_ms: int, changed: bool) -> str:

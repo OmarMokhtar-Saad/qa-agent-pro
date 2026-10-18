@@ -45,3 +45,10 @@ def replay_into_ledger(serial: str) -> None:
     """Ledger the pre-run phases of *serial* into the armed step breakdown."""
     for name, ms in _ROWS.pop(str(serial), []):
         step_timing.note("prerun:" + name, ms)
+
+
+def replay_all_into_ledger() -> None:
+    """Ledger every recorded device's pre-run phases (the explore lane arms the
+    step before it knows its serial; one start drains one device in practice)."""
+    for serial in list(_ROWS):
+        replay_into_ledger(serial)

@@ -18,6 +18,7 @@ from typing import NamedTuple
 from tools.mobile import dump_latency, screen_anchor, screen_probe
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.dump import _dump
+from tools.mobile.replay.fresh_read import dump_known_fresh, fresh_read
 from tools.mobile.replay.probe_gate import PROBE_BUDGET_S, wait_moved
 from tools.mobile.replay.screen import _screen_hash, system_dialog_package
 from tools.mobile.replay.waits_prior import _spinning
@@ -50,17 +51,31 @@ async def _still_shown(ctx: Context, screen: object) -> bool:
     return base is not None
 
 
-async def _confirm(ctx: Context, screen: object, plan: Plan) -> tuple:
-    """The confirming read of an unmoved wait: ``(screen, changed, reusable)``."""
-    if await _still_shown(ctx, screen):
+async def _agreed(ctx: Context, screen: object, plan: Plan) -> tuple:
+    """A dump equal to the baseline: ``(screen, changed, reusable)`` after one fresh read.
+
+    Skipped when the dump came from a service that clears its node cache."""
+    if dump_known_fresh(ctx.serial):
         return screen, False, True
+    return await fresh_read(ctx, screen, plan.deadline)
+
+
+async def _confirm(ctx: Context, screen: object, plan: Plan) -> tuple:
+    """The confirming read of an unmoved wait: ``(screen, changed, reusable)``.
+
+    "Unchanged" is said only after a fresh read agreed: one that dropped every
+    held dump (see :mod:`fresh_read`), unless the dump just taken came from a
+    service that clears its own node cache.
+    """
+    if await _still_shown(ctx, screen):
+        return await fresh_read(ctx, screen, plan.deadline)
     dumped = await _dump(ctx, deadline=plan.deadline)
     if dumped.get("error"):
         return screen, False, False
     content = dumped.get("content")
-    if _screen_hash(content) == _screen_hash(screen):
-        return content, False, True
-    return content, True, await _reusable(ctx, content, plan.base)
+    if _screen_hash(content) != _screen_hash(screen):
+        return content, True, await _reusable(ctx, content, plan.base)
+    return await _agreed(ctx, content, plan)
 
 
 async def _rebaseline(ctx: Context, shown: object) -> tuple:
@@ -107,5 +122,5 @@ async def probed_changed(ctx: Context, screen: object, plan: Plan) -> tuple:
         if base is None:
             break
     if fresh and base:
-        return current, False, True
+        return await _agreed(ctx, current, plan)
     return await _confirm(ctx, current, plan)

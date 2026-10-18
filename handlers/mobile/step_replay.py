@@ -71,13 +71,15 @@ async def _step_reply(turn: StepTurn, body: dict, previous_screen_id: str) -> st
     """The verdict line, the notice and the tail, in that order."""
 
     run_id, case = turn.run_id, body.get("case") or {}
+    # The tail persists the post-step screen (explore_runner._auto_replay), so
+    # the verdict is built AFTER it: before, it compared the screen with itself.
+    tail = await _step_tail(turn, body)
     line = mobile_render.verdict_line(
         case,
         screen=run_store.latest_screen(run_id),
         previous_id=previous_screen_id,
     )
     notice = str(body.get("notice") or "")
-    tail = await _step_tail(turn, body)
     return line + (("\n\n" + notice) if notice else "") + "\n\n" + tail
 
 

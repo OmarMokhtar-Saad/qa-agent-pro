@@ -47,8 +47,8 @@ _CONTROLLER = frozenset(p for p in PERMISSION_PACKAGES if "permissioncontroller"
 
 GRANT_HINT = (
     " The front window is the runtime-permission dialog: rerun with "
-    "`grant_permissions=true` and `apply=true` to grant the app's permissions "
-    "up front (leave it off only when testing the permission prompt)."
+    "`grant_permissions=true` (the default) to grant the app's permissions "
+    "up front; pass `false` only when testing the permission prompt."
 )
 
 

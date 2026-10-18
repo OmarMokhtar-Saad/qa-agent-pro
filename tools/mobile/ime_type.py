@@ -104,7 +104,19 @@ async def _verified_result(job: _TypeJob, value: str, before: str | None) -> dic
     # EMPTY after the commit: only the screen can say whether that is a dead
     # field or an auto-submitting OTP that moved on, so the replay asks it.
     result["content"]["empty_after"] = after is not None and not after
+    result["content"]["seen_chars"] = _seen_chars(after)
     return result
+
+
+def _seen_chars(after: object) -> int | None:
+    """How many characters the field held after the commit, or ``None`` when unread.
+
+    A secret field reads back as a LENGTH (never its text), a plain one as text;
+    both reduce to a count, so the proof names a number and never the value.
+    """
+    if isinstance(after, bool) or after is None:
+        return None
+    return after if isinstance(after, int) else len(str(after))
 
 
 def _typed_result(value: str, secret: bool, landed: str) -> dict:

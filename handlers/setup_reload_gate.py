@@ -8,6 +8,7 @@ import threading
 import time
 
 from handlers import _common, export, setup_reload_marker, setup_reload_report
+from handlers.mcp_srv_state import _INFLIGHT, _INFLIGHT_LOCK
 from tools import updater
 
 # Baked by scripts/build_dist.py in the public distribution ("owner/repo").
@@ -54,6 +55,28 @@ def reloading_message(headline: str) -> str:
     )
 
 
+#: Longest the reload waits for in-flight tool calls (the doctor's own reply included).
+DRAIN_TIMEOUT_S = 30.0
+#: Seconds after the last call ends for its reply to flush before the exit.
+FLUSH_GRACE_S = 2.0
+_DRAIN_POLL_S = 0.1
+
+
+def _calls_in_flight() -> int:
+    with _INFLIGHT_LOCK:
+        return int(_INFLIGHT["n"])
+
+
+def wait_until_drained(timeout: float = DRAIN_TIMEOUT_S) -> bool:
+    """Block until no tool call is in flight (the reply that scheduled this
+    reload has been returned), or *timeout* seconds; ``True`` when drained.
+    Exiting earlier lost that reply and the client waited 120 s (-32001)."""
+    deadline = time.monotonic() + timeout
+    while _calls_in_flight() and time.monotonic() < deadline:
+        time.sleep(_DRAIN_POLL_S)
+    return not _calls_in_flight()
+
+
 def schedule_reload(reason: str = "") -> None:
     """Exit the server process shortly after the current response flushes.
 
@@ -69,7 +92,8 @@ def schedule_reload(reason: str = "") -> None:
     setup_reload_marker._write_reload_marker(reason)
 
     def _later() -> None:
-        time.sleep(2)
+        wait_until_drained()
+        time.sleep(FLUSH_GRACE_S)
         os._exit(86)
 
     threading.Thread(target=_later, daemon=True).start()

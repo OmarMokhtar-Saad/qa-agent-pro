@@ -138,9 +138,12 @@ def build_middleware():
 
     class _RejectionLog(Middleware):
         async def on_call_tool(self, context, call_next):
-            await mcp_arg_tolerance.tolerate(context)
+            dropped = await mcp_arg_tolerance.tolerate(context)
             with never_raise() as g:
-                return await call_next(context)
+                result = await call_next(context)
+                if dropped:
+                    result = mcp_arg_tolerance.add_note(result, dropped)
+                return result
             assert g.exc is not None
             _note_rejection(context, g.exc)
             raise await _fixable(context, g.exc) or g.exc

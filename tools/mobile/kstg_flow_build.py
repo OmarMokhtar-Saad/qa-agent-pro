@@ -49,14 +49,14 @@ def normalise(goal: str) -> str:
 
 
 def flow_name(goal: str, reserve: int = 0, sig: str = "") -> str:
-    """A valid flow name keyed by the normalised goal (and route signature *sig*).
+    """A valid flow name: a short goal slug plus a hash of the route shape *sig*.
 
-    A short slug plus a hash of goal and route: the same goal reached by the same
-    route is the same flow, a different route a different one. *reserve* characters
+    The same route reached under reworded goals is one flow (the goal only labels
+    it); without a *sig* the hash covers the normalised goal. *reserve* characters
     stay free for a ``-pN`` packet suffix.
     """
     norm = normalise(goal)
-    digest = hashlib.sha1((norm + sig).encode("utf-8")).hexdigest()[:_HASH_CHARS]
+    digest = hashlib.sha1((sig or norm).encode("utf-8")).hexdigest()[:_HASH_CHARS]
     room = MAX_FLOW_NAME_CHARS - _HASH_CHARS - 1 - reserve
     slug = norm.replace(" ", "-")[:room].strip("-") or "goal"
     return "%s-%s" % (slug, digest)
@@ -75,11 +75,15 @@ def _saw_no_change(rec: dict) -> bool:
     )
 
 
-def _ran(rec: dict) -> bool:
+def _ran(rec: dict, package: str) -> bool:
+    """A step that ran; a permission-dialog tap needs no landing (the dialog is left)."""
+    landed = rec.get("landed") is not False or kstg_flow_popup.is_popup_tap(
+        rec, package
+    )
     return (
         bool(rec.get("flow_action"))
         and str(rec.get("outcome") or "") in OK_OUTCOMES
-        and rec.get("landed") is not False
+        and landed
         and not _saw_no_change(rec)
     )
 
@@ -93,13 +97,15 @@ def app_recs(steps: list, package: str) -> list:
 
     A step that errored, found no element, needed the model, or whose screen never
     changed as expected (``landed`` False) is not part of the route, so it is left out.
-    A tap on an OS permission dialog stays, as an optional step (``kstg_flow_popup``).
+    A tap on a popup (an OS permission dialog, or an in-app sheet that came and went)
+    stays, as an optional step (``kstg_flow_popup``).
     """
-    return [
-        kstg_flow_popup.as_optional(rec, package)
-        for rec in steps
-        if _ran(rec) and _in_route(rec, package)
-    ]
+    kept = [r for r in steps if _ran(r, package) and _in_route(r, package)]
+    out: list = []
+    for rec in kept:
+        rec = kstg_flow_popup.as_optional(rec, package)
+        out.append(kstg_flow_popup.as_inapp_optional(out[-1] if out else {}, rec))
+    return out
 
 
 def app_actions(steps: list, package: str) -> list:

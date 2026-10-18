@@ -16,6 +16,7 @@ from tools.mobile import (
     flow_stats,
     kstg_flow_build,
     kstg_flow_chain,
+    kstg_flow_dedupe,
     kstg_flow_rules,
     kstg_flow_sig,
 )
@@ -50,6 +51,13 @@ def _templates(package: str, names: list) -> list:
     return [(n, g["content"]) for n, g in got if not g.get("error")]
 
 
+def _protected(items: list, mine: list) -> set:
+    """Names whose chain holds an optional step the new save lacks: never a duplicate."""
+    new = {s for t in mine for s in kstg_flow_dedupe.normalized(t)}
+    opt = kstg_flow_dedupe.optional(items)
+    return {n for n, _t in items if opt[kstg_flow_dedupe.base(n)] - new}
+
+
 def _losers(items: list, held: list) -> list:
     """Names of the duplicates among the saved *items*; *held* are the new save's flows."""
     mine = [t for n, t in items if n in held]
@@ -59,7 +67,10 @@ def _losers(items: list, held: list) -> list:
     new = (all(_rank(t)[0] for t in mine), len(route), max(_rank(t)[2] for t in mine))
     goal = str((mine[0].get("meta") or {}).get("goal") or "")
     dupes = [(n, t) for n, t in items if n not in held and _same_goal(t, goal)]
-    related = [(n, t) for n, t in dupes if _related(route_of(t), route)]
+    safe = _protected(items, mine)
+    related = [
+        (n, t) for n, t in dupes if _related(route_of(t), route) and n not in safe
+    ]
     if any(_rank(t) > new for _n, t in related):
         return list(held)
     return [n for n, _t in related]

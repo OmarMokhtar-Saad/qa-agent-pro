@@ -47,8 +47,8 @@ def mark_released(
             return False
         path = run_lease_core._lease_path(run_id)
         current = run_io._read_json(path)
-        if not _releasable(current, session_id):
-            return False
+        if not _releasable(current, session_id) or current.get("released_at"):
+            return False  # not ours, or already released: keep the first stamp
         _stamp(path, current, run_io._now(now))
         return True
     return False

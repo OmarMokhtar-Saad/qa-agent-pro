@@ -4,7 +4,7 @@ A dump takes 2-3 s. :func:`begin` starts a probe reading beside it (the
 "before" reading); :func:`trusted_baseline` takes one right after and answers
 only when the two are equal, so a change landing while the dump ran is never
 mistaken for the screen the dump showed. A carried screen is anchored the same
-way (:func:`schedule`), which lets it outlive the 15 s age cap.
+way (:func:`schedule`), outliving the 15 s age cap.
 """
 
 from __future__ import annotations
@@ -12,7 +12,13 @@ from __future__ import annotations
 import asyncio
 import time
 
-from tools.mobile import dump_latency_state, dump_reuse, screen_probe, step_timing
+from tools.mobile import (
+    dump_latency_state,
+    dump_reuse,
+    screen_probe,
+    screen_reuse,
+    step_timing,
+)
 
 ANCHOR_BUDGET_S = 3.0
 #: Seconds one anchor probe is assumed to cost until one has been timed.
@@ -30,6 +36,7 @@ _PENDING: dict = {}
 def begin(serial: str) -> None:
     """Start the "before" probe beside a dump about to run; never raises."""
     key = str(serial or "")
+    screen_reuse.drop(key)
     if cheaper_to_dump(key):  # note_read already popped the last one
         return
     try:
@@ -65,7 +72,7 @@ async def trusted_baseline(
     if not screen_is_current(key, shown):
         return None
     before = await _before(key)
-    base = await screen_probe.baseline(key, budget)
+    base = screen_reuse.fresh(key) or await screen_probe.baseline(key, budget)
     if before is None or base is None or not screen_probe.same(before, base):
         return None
     return base
@@ -93,6 +100,7 @@ async def _anchor(serial: str, gen: int) -> None:
     reading = await screen_probe.baseline(serial, ANCHOR_BUDGET_S)
     _COST[serial] = time.monotonic() - started
     step_timing.note("probe", int(_COST[serial] * 1000))
+    screen_reuse.keep(serial, reading)
     if before is None or reading is None or not screen_probe.same(before, reading):
         return
     if gen == dump_reuse.token(serial):
@@ -116,8 +124,7 @@ def schedule(serial: str, gen: int) -> None:
 
 
 def worth_waiting(serial: str) -> bool:
-    """True when this device's dumps cost clearly more than its anchor probe;
-    on a fast dump path the caller acts at once and takes the dump instead."""
+    """True when this device's dumps cost clearly more than its anchor probe."""
     key = str(serial or "")
     dump_ms = dump_latency_state.next_dump_p90(key)
     cost = _COST.get(key, PROBE_GUESS_S)
@@ -125,8 +132,7 @@ def worth_waiting(serial: str) -> bool:
 
 
 def cheaper_to_dump(serial: str) -> bool:
-    """True once dump AND probe are timed (an untimed probe runs once) and the dump
-    is too fast to pay for it: the action would bump the generation first."""
+    """True once dump AND probe are timed and the dump is too fast to pay for it."""
     key = str(serial or "")
     timed = key in _COST and dump_latency_state.next_dump_p90(key) is not None
     return timed and not worth_waiting(key)
@@ -146,12 +152,7 @@ def miss_reason(serial: str) -> str:
 
 
 async def ready(serial: str) -> None:
-    """Let the anchor probe still running for *serial* finish; never raises.
-
-    The probe takes about a second, and any actuating command bumps the
-    generation, which discards a reading that lands after it. Awaiting it before
-    an action runs is what lets :func:`before_action` hold a baseline at all.
-    """
+    """Let the anchor probe still running finish before an action; never raises."""
     task = _PENDING.get(str(serial or ""))
     if task is None or task.done() or not worth_waiting(serial):
         return
@@ -177,8 +178,7 @@ async def unmoved(serial: str, gen: int) -> bool:
 
 
 def note_read(serial: str, observed: object) -> None:
-    """Record the screen hash the latest dump produced, its generation and the
-    "before" probe that ran beside that dump."""
+    """Record the latest dump's screen hash, generation and "before" probe."""
     content = observed.get("content") if isinstance(observed, dict) else None
     shown = str((content or {}).get("hash") or "") if isinstance(content, dict) else ""
     key = str(serial or "")

@@ -22,6 +22,7 @@ from handlers import (
     machine_tools,
     mcp_srv_settings,
     mcp_srv_state,
+    mcp_srv_text_once,
     prompts,
     setup_check,
     suite_tools,
@@ -120,6 +121,7 @@ def build_server(rt):
         )
     mcp, editions = _new_fastmcp(FastMCP)
     _install_rejection_log(mcp)
+    mcp_srv_text_once.single_text_output(mcp)
     kit = _Kit(Context, ContentBlock, ToolAnnotations)
     _register_first(mcp, kit, rt)
     _register_rest(mcp, kit, rt)

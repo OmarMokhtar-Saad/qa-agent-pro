@@ -171,6 +171,37 @@ def _env_fingerprint():
         return ""
 
 
+ORPHAN_POLL_S = 5.0
+
+
+def _client_gone(parent_pid: int) -> bool:
+    """True once our client (the parent process) is no longer our parent.
+
+    Several clients share one install, each with its own supervisor, so this
+    only ever judges THIS supervisor's own parent. Not probed on Windows.
+    """
+    return os.name != "nt" and os.getppid() != parent_pid
+
+
+def _end_orphan() -> None:
+    log.info("Client process is gone — this supervisor exits.")
+    os._exit(0)
+
+
+def orphan_watch(sup, parent_pid: int, on_gone=_end_orphan) -> None:
+    """Exit promptly when the client is gone (stdin EOF is the fast path)."""
+    stop = threading.Event()
+    while not sup.closing:
+        if _client_gone(parent_pid):
+            sup.closing = True
+            with sup.child_lock:
+                if sup.child is not None and sup.child.poll() is None:
+                    sup.child.terminate()
+            on_gone()
+            return
+        stop.wait(ORPHAN_POLL_S)
+
+
 def _self_hash() -> str:
     try:
         with open(os.path.abspath(__file__), "rb") as fh:
@@ -861,6 +892,9 @@ def main() -> int:
         # An install without on-demand restart still self-updates on its poll.
         log.debug("SIGUSR1 restart trigger unavailable on this platform")
     threading.Thread(target=sup.watchdog, daemon=True).start()
+    threading.Thread(
+        target=orphan_watch, args=(sup, os.getppid()), daemon=True
+    ).start()
     sup.pump_client_in()  # blocks until the editor disconnects
     return 0
 

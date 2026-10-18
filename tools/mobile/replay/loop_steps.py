@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Any
 
+from tools.mobile import run_redact
 from tools.mobile.replay.context import Context, _ReplayRun, _ReplayState, _StepCursor
 from tools.mobile.replay.loop_end import _end_of_script
 from tools.mobile.replay.loop_one import Turn, _replay_one
@@ -23,6 +24,11 @@ logger = logging.getLogger("tools.mobile.executor")
 # trace, because the trace is the only thing that tells a tester how far the
 # case got.
 async def _replay_steps(script: Any, ctx: Context) -> dict:
+    """Execute *script* against ``ctx``; the reply is redacted like every run file."""
+    return run_redact.redact(await _replay_steps_raw(script, ctx))
+
+
+async def _replay_steps_raw(script: Any, ctx: Context) -> dict:
     """Execute *script* against ``ctx``. Never raises (the reply: above)."""
     trace: list[dict] = []
     screen = ctx.screen if isinstance(ctx.screen, dict) else None

@@ -15,9 +15,11 @@ write path and masks any value under a key in ``SECRET_VALUE_KEYS`` inside an
 object marked ``secret: true``, and any value under a key in
 ``ALWAYS_MASKED_KEYS`` wherever it appears.
 
-It is still not a value scrubber: a credential stored under an unrecognised key
-name with no marker WILL reach disk, so a new writer of tester-supplied data
-must mark it. A frame in ``shots/`` is pixels and is stored RAW.
+On top of that, every string is value-scrubbed against the credentials this
+process has seen (``act_scrub``: typed secrets, held tester inputs, credential
+dicts). A credential this process never saw, under an unrecognised key with no
+marker, is NOT caught (it is not a pattern detector), so a new writer of
+tester-supplied data must mark it. A frame in ``shots/`` is pixels and is stored RAW.
 """
 
 from __future__ import annotations

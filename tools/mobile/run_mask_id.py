@@ -24,6 +24,16 @@ from collections.abc import Iterable
 from tools.mobile import run_consts
 
 _ID_RE = re.compile(r"(?<![\w.-])\d{8,}(?![\w-]|\.\d)")
+# A Saudi National ID / Iqama: 10 digits starting 1 or 2, optional single space or
+# dash between digits, any letter/underscore/dash prefix. Never inside a longer digit
+# run, a decimal, or after a digit group ("+1 202 555 0123", timestamps). A date
+# ("2026-10-18 20:29", "18-10-2026 12 runs") is no ID, whatever number follows it.
+_DATE_AHEAD = r"(?!\d{4}[-/]\d\d?[-/]\d\d?(?!\d)|\d\d?[-/]\d\d?[-/]\d{4}(?!\d))"
+_SHAPE_RE = re.compile(
+    r"(?<![\d.])(?<!\d[ -])(?<![A-Za-z]{7})"
+    + _DATE_AHEAD
+    + r"[12](?:[ -]?\d){9}(?![A-Za-z\d]|\.\d|[ -]\d)"
+)
 _SECRET_FIELD_RE = re.compile(r"(?<![a-z])(otp|pin|cvv|passw\w*|passcode)(?![a-z])")
 _TYPED_OPS = frozenset({"type", "fill"})
 _PROSE_KEYS = frozenset({"title", "reason", "finding", "detail", "note", "summary"})
@@ -33,6 +43,7 @@ _PASSWORD_FLAGS = frozenset({"secure", "password", "ispassword", "is_password"})
 
 def mask_id(text: str) -> str:
     """*text* with every ID-like digit run cut to ``****`` + its last four digits."""
+    text = _SHAPE_RE.sub(lambda m: "****" + re.sub(r"\D", "", m.group(0))[-4:], text)
     return _ID_RE.sub(lambda m: "****" + m.group(0)[-4:], text)
 
 
@@ -72,8 +83,8 @@ def mask_node(out: dict) -> None:
     if _is_password_node(out):
         for key in _strings(out, ("text", "desc", "value")):
             out[key] = ""
-    elif _truthy(out.get("editable")):
-        for key in _strings(out, ("text",)):
+    else:
+        for key in _strings(out, ("text", "desc")):
             out[key] = mask_id(out[key])
     for key in _strings(out, [k for k in out if str(k).lower() in _PROSE_KEYS]):
         out[key] = mask_id(out[key])

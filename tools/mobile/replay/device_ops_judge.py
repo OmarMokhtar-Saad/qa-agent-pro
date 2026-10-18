@@ -40,11 +40,27 @@ def _judge_landed(result: object, field: str) -> dict:
     content = result.get("content") or {}
     landed = content.get("landed")
     if landed == ime.LANDED_YES:
-        return result
+        return _with_proof(result, content, field)
     typed = content.get("typed", 0)
     if landed == ime.LANDED_NO:
         return _landed_no_with_fallback(content, field)
     return _unknown_with_advance(bool(content.get("secret")), typed, field)
+
+
+# The proof a fill leaves: WHICH field took the text and a masked length check.
+#
+# A password or OTP field reads back as bullets (one per character), so the
+# count proves the secret landed without revealing it. ``N/N chars`` is the
+# characters the field holds over the characters sent; an unreadable field says
+# so instead of claiming a match.
+def _with_proof(result: dict, content: dict, field: str) -> dict:
+    """*result* with the receiving field's name and an ``N/N chars`` check."""
+    sent = content.get("typed", 0)
+    seen = content.get("seen_chars")
+    proof = "%s/%s chars" % (seen, sent)
+    if seen is None:
+        proof = "?/%s chars (field not readable)" % sent
+    return {**result, "content": {**content, "field": field[:60], "chars": proof}}
 
 
 def _unknown_with_advance(secret: bool, typed: object, field: str) -> dict:

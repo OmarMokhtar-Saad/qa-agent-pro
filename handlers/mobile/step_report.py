@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -36,6 +37,10 @@ def _mobile_render_report_file(run_id: str) -> tuple[str, bool, str]:
             False,
             "the report renderer failed; the verdicts below are unaffected",
         )
+
+
+#: Background report renders still running (held so they are not collected).
+_RENDERS: set = set()
 
 
 #: The last line of a finished run's reply: stops the chat's status/stop/status.
@@ -83,11 +88,23 @@ def _relay_kwargs(resolved: Any, rows_for_relay: list) -> dict[str, Any]:
 # ``partial`` stays a hardcoded LIFECYCLE fact: this is reached only
 # when ``next_packet`` reports STATE_REPORT. It decides ONE word of the
 # heading and claims nothing about verdicts (the coverage line does).
+def _render_later(run_id: str) -> str:
+    """Render and open the report AFTER the reply (a ~3 s webp derivation the
+    tester does not wait for); the path is known up front. Never raises."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return _mobile_render_report_file(run_id)[0]
+    task = loop.run_in_executor(None, _mobile_render_report_file, run_id)
+    _RENDERS.add(task)
+    task.add_done_callback(_RENDERS.discard)
+    return str(mobile_report.report_path(run_id))
+
+
 def _summary_kwargs(run_id: str, coverage: str) -> dict[str, Any]:
-    """The summary block arguments; renders and opens the report file."""
-    report_path, report_opened, report_failed = step_timing.timed_call(
-        "report_render", _mobile_render_report_file, run_id
-    )
+    """The summary block arguments; the report file is rendered lazily."""
+    report_path = step_timing.timed_call("report_schedule", _render_later, run_id)
+    report_opened, report_failed = False, ""
     return {
         "coverage_line": coverage,
         "run_id": run_id,

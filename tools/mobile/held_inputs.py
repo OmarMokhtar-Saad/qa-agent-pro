@@ -27,6 +27,7 @@ import threading
 import time
 
 from config.settings_guard import never_raise
+from tools.mobile import act_scrub
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ def remember(run_id: str, values: object, *, now: float | None = None) -> None:
         if not key or not isinstance(values, dict) or not values:
             return
         stamp = _clock(now)
+        act_scrub.register_all(values.values(), key)
         with _LOCK:
             _prune(stamp)
             held = dict((_HELD.get(key) or (stamp, {}))[1])
@@ -108,6 +110,7 @@ def forget(run_id: str) -> None:
     with never_raise(logger, "held_inputs.forget failed"):
         with _LOCK:
             _HELD.pop(str(run_id or ""), None)
+        act_scrub.drop(str(run_id or ""))
 
 
 def clear() -> None:

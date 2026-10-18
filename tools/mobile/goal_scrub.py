@@ -7,6 +7,7 @@ import re
 #: adb serials: ``emulator-5554``, ``host:port``, or a long letters-and-digits token.
 _FIXED = re.compile(r"\b(?:emulator-\d+|\d{1,3}(?:\.\d{1,3}){3}:\d+)\b", re.IGNORECASE)
 _TOKEN = re.compile(r"\b[a-z0-9]{8,20}\b", re.IGNORECASE)
+_HEX16 = re.compile(r"[0-9a-f]{16}", re.IGNORECASE)
 _SWAPS = 3  # a hardware serial swaps between letters and digits at least this often
 MASK = "device"
 
@@ -16,6 +17,8 @@ def _serial_shaped(token: str) -> bool:
 
     ``R5CR207KY7H`` does (8 swaps); an order id such as ``ORD12345678`` does not (1).
     """
+    if _HEX16.fullmatch(token) and not token.isdigit() and not token.isalpha():
+        return True  # emulator and some boards: 16 hex chars, too few swaps to count
     kinds = [c.isdigit() for c in token]
     return sum(a != b for a, b in zip(kinds, kinds[1:])) >= _SWAPS
 

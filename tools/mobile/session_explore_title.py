@@ -6,11 +6,15 @@ from tools.mobile.session_explore_ids import EXPLORE_TITLE_PREFIX, explore_turn_
 
 
 def explore_turn_title(state: object, goal: str) -> str:
-    """The case title of a turn; an auto-replayed turn names the flow and its steps."""
+    """The case title of a turn: the model's ``sub_goal`` when given, else the run goal.
+
+    An auto-replayed turn also names the flow and its steps.
+    """
     body = state if isinstance(state, dict) else {}
     turn = explore_turn_number(body)
     tag = _replay_tag(body.get("auto_replay"))
-    return (EXPLORE_TITLE_PREFIX + str(turn) + tag + " \u2014 " + goal)[:250]
+    named = " ".join(str(body.get("sub_goal") or "").split()) or goal
+    return (EXPLORE_TITLE_PREFIX + str(turn) + tag + " \u2014 " + named)[:250]
 
 
 def _replay_tag(replay: object) -> str:

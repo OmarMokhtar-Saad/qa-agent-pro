@@ -1,6 +1,6 @@
 """The qa-ime accessibility event clock, per serial (qa-ime 1.2.1+).
 
-A fast a11y dump reply may carry one ``n:LAST,NOW,COUNT`` part: the device
+A fast a11y dump reply may carry one ``n:LAST,NOW,COUNT[,GEN]`` part: the device
 uptime (ms) of the service's last window/content event, the uptime when the
 dump was taken, and how many such events the service has seen since it
 connected. The reply parser records it here; waits read it. A reply without
@@ -18,6 +18,7 @@ class EventClock:
     last_ms: int
     now_ms: int
     count: int
+    generation: int | None = None  # every-event counter (qa-ime 1.2.2+)
 
     def quiet_ms(self) -> int:
         """How long the screen had sent no event when this dump was taken."""
@@ -30,15 +31,15 @@ _LATEST: dict = {}
 def parse(text: str) -> EventClock | None:
     """``"LAST,NOW,COUNT"`` -> an EventClock, or ``None`` when malformed."""
     bits = str(text or "").split(",")
-    if len(bits) != 3:
+    if len(bits) not in (3, 4):
         return None
     try:
-        last, now, count = (int(b) for b in bits)
+        last, now, count, *gen = (int(b) for b in bits)
     except (ValueError, OverflowError):
         return None
-    if min(last, now, count) < 0:
+    if min(last, now, count, *gen) < 0:
         return None
-    return EventClock(last, now, count)
+    return EventClock(last, now, count, gen[0] if gen else None)
 
 
 def record(serial: str, clock: EventClock | None) -> None:

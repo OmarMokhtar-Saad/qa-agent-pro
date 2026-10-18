@@ -19,6 +19,8 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
     _unresolved_message,
     parse_releases,
 )
+from tools.mobile.install_sources.app_tester_ui_gate import card_proves_current
+from tools.mobile.install_sources.app_tester_ui_settle import wait_screen_changed
 from tools.mobile.resolve import PickOpts, decide, resolve_or_ask
 
 
@@ -32,28 +34,35 @@ def _note_latest(run: _Run, texts) -> None:
         memory.remember_latest(at, max(codes))
 
 
+async def _tap_action(run: _Run, texts) -> Optional[InstallOutcome]:
+    """Tap Update / Download / Install once; an outcome only when that failed."""
+    label = next((name for name in ACTION_LABELS if name in texts), "")
+    if not label:
+        return _no_action(texts)
+    if not await run.ui.tap_text(label):
+        return _tap_failed(label)
+    run.tapped += 1
+    return None
+
+
 class _DetailMixin:
     """The app-page steps of the flow."""
 
     async def _detail(self: _Flow, run: _Run, texts) -> Optional[InstallOutcome]:
         if not run.tapped:
             _note_latest(run, texts)
+            current = card_proves_current(run, parse_releases(texts), texts)
+            if current is not None:
+                return current
         if not (run.release_done or run.tapped or run.request.latest):
             releases = parse_releases(texts)
             if len(releases) > 1:
                 return await self._tap_release(run, releases)
             run.release_done = True
-        if run.tapped:
-            await self._sleep(APP_TESTER_POLL_S)
-            return None
-        label = next((name for name in ACTION_LABELS if name in texts), "")
-        if not label:
-            return _no_action(texts)
-        if not await run.ui.tap_text(label):
-            return _tap_failed(label)
-        run.tapped += 1
-        await self._sleep(APP_TESTER_POLL_S)
-        return None
+        failed = None if run.tapped else await _tap_action(run, texts)
+        if failed is None:
+            await wait_screen_changed(run.ui, list(texts), self._sleep)
+        return failed
 
     async def _tap_release(
         self: _Flow, run: _Run, releases: list

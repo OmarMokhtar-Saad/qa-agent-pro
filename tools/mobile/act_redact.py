@@ -6,7 +6,7 @@ import logging
 
 from pydantic import BaseModel
 
-from tools.mobile import perception
+from tools.mobile import act_scrub, perception
 from tools.mobile.act_cred import SECRET_MASK, is_credential_action
 
 logger = logging.getLogger("tools.mobile.actions")
@@ -64,6 +64,7 @@ def redact_action(action: object) -> dict:
             payload = dict(action)
         else:
             return {"op": str(action)[:40]}
+        act_scrub.register_action(payload)
         return _masked(payload)
     except Exception:  # pragma: no cover - defensive
         logger.exception("mobile.actions.redact_action failed")

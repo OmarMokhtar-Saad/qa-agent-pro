@@ -24,6 +24,7 @@ from tools.mobile.preflight_host import (
 from tools.mobile.preflight_ime import _step_ime_pinned, _step_ime_probes
 from tools.mobile.preflight_package import _step_package_installed
 from tools.mobile.preflight_rows import _Dev, _mark_typing_blocking, _Req
+from tools.mobile.preflight_screen_step import _step_device_screen
 
 logger = logging.getLogger("tools.mobile.preflight")
 
@@ -104,6 +105,7 @@ async def _run_device_steps(checks: list[dict], req: _Req) -> str:
 # what the serial version produced; a step that finds no task makes the
 # call itself.
 async def _run_probe_steps(checks: list[dict], target_package: str, dev: _Dev) -> None:
+    await _step_device_screen(checks, target_package, dev)
     await _step_device_dns(checks, dev)
     await _step_package_installed(checks, target_package, dev)
     pinned = _step_ime_pinned(checks)
