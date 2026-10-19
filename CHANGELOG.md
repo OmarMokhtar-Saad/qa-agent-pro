@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.139.0] - 2026-10-19
+## [1.139.1] - 2026-10-19
 
 ### Added
 
@@ -33,17 +33,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Installing from App Tester works again with the fast accessibility
-  reader on: the screen text it writes is read again, so the install
-  dialog, the Install/Update buttons and the app in front are seen.
-- An App Tester page that is still drawing is read again a few times
-  before it is judged, so it no longer reports no releases or no
-  Update, Download or Install button.
-- A blank screen during an install is read again before the run
-  stops on it.
-- When App Tester opens on the page of the app under test (one it has
-  installed before), the run stays there instead of going back to
-  the list.
+- The desktop app opens again. The 1.139.0 DMG was missing a Java part
+  (java.net.http) that the update check needs, so it showed only an
+  "Error" window. The desktop release now refuses a DMG that lacks any
+  Java part the app uses.
+- The desktop app now starts a working backend when opened from Finder
+  or the Dock. On first launch it installs the backend's Python packages
+  once and shows the progress; it also finds Homebrew tools (python, adb,
+  scrcpy). The backend launcher builds its own `.venv` when the packages
+  are missing, and repairs one that a stopped install left half-built.
 
 ### Known
 

@@ -171,6 +171,153 @@ def _env_fingerprint():
         return ""
 
 
+VENV_PROBE_IMPORT = "import dotenv, fastmcp, httpx, yaml"
+VENV_PIP_TIMEOUT_S = 600.0
+VENV_DIR = INSTALL_DIR / ".venv"
+VENV_PYTHON = VENV_DIR / (
+    "Scripts/python.exe" if os.name == "nt" else "bin/python"
+)
+VENV_LOCK = INSTALL_DIR / "data" / "venv.lock"
+
+
+def running_in_venv() -> bool:
+    """True when this process already runs from the install's own .venv."""
+    try:
+        return _PathLib(sys.prefix).resolve() == VENV_DIR.resolve()
+    except OSError:
+        return False
+
+
+def deps_present(python: str) -> bool:
+    """Can `python` import what mcp_server.py imports? (A subprocess: the
+    answer for a DIFFERENT interpreter cannot be read from this one.) A
+    probe that times out (cold disk) counts as present: a slow answer is no
+    reason to delete a working .venv."""
+    try:
+        proc = subprocess.run(
+            [python, "-c", VENV_PROBE_IMPORT],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("dependency probe of %s timed out; assuming present", python)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _pip_step() -> list:
+    return [str(VENV_PYTHON), "-m", "pip", "install", "--quiet", "-e", "."]
+
+
+def run_step(argv: list) -> bool:
+    """One bootstrap command in the install dir, stdin kept off the MCP
+    pipe. Logs and returns False on failure."""
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(INSTALL_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=VENV_PIP_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("venv bootstrap failed: %s (%s)", " ".join(argv), exc)
+        return False
+    if proc.returncode == 0:
+        return True
+    tail = proc.stdout.decode("utf-8", "replace").strip().splitlines()[-5:]
+    log.warning("venv bootstrap failed (exit %s): %s\n%s",
+                proc.returncode, " ".join(argv), "\n".join(tail))
+    return False
+
+
+def _under_lock(work) -> bool:
+    """Run work() holding data/venv.lock, so a second launcher waits instead
+    of racing pip or deleting a .venv mid-install. False when the lock
+    cannot be made (a read-only install)."""
+    import fcntl
+
+    try:
+        VENV_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(VENV_LOCK, "a")
+    except OSError as exc:
+        log.warning("cannot lock %s: %s", VENV_LOCK, exc)
+        return False
+    with lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return bool(work())
+
+
+def _create_venv() -> bool:
+    """Fresh .venv, then pip. A failed step removes the half-built .venv so
+    no later launch (nor the desktop app) takes it for a working one."""
+    import shutil
+
+    shutil.rmtree(VENV_DIR, ignore_errors=True)
+    for argv in ([sys.executable, "-m", "venv", str(VENV_DIR)], _pip_step()):
+        if not run_step(argv):
+            shutil.rmtree(VENV_DIR, ignore_errors=True)
+            return False
+    log.warning("Backend dependencies installed into %s.", VENV_DIR)
+    return True
+
+
+def venv_healthy() -> bool:
+    return VENV_PYTHON.is_file() and deps_present(str(VENV_PYTHON))
+
+
+def build_venv() -> bool:
+    """Create .venv beside launcher.py and `pip install -e .` into it --
+    what install.sh does, for the install that was copied (DMG seed,
+    manual unzip) instead of installed. Re-probes after the lock wait: the
+    launcher that held the lock may have built it already."""
+    log.warning(
+        "Backend dependencies are missing for %s — creating %s and "
+        "installing them (one-time, needs network).",
+        sys.executable,
+        VENV_DIR,
+    )
+    return _under_lock(lambda: venv_healthy() or _create_venv())
+
+
+def _repair_in_venv() -> None:
+    """Running from a .venv whose pip never finished (killed, or an older
+    launcher): python runs but the deps are missing. Re-run pip into it;
+    when that fails too the crash loop stays visible in the log."""
+    if deps_present(sys.executable):
+        return
+    log.warning("%s lacks the backend dependencies — reinstalling.", VENV_DIR)
+    _under_lock(lambda: deps_present(sys.executable) or run_step(_pip_step()))
+
+
+def ensure_venv() -> None:
+    """Re-exec this launcher from the install's .venv when the current
+    interpreter cannot run the server. Never raises: when nothing can be
+    done the launcher carries on as before and the crash loop stays
+    visible in its log. POSIX only: os.execv on Windows forks, and the
+    MCP stdio pipes do not survive that; install.ps1 builds the venv."""
+    if os.name == "nt":
+        return
+    if running_in_venv():
+        return _repair_in_venv()
+    if deps_present(sys.executable):
+        return  # a dev checkout or system python that carries the deps
+    if not venv_healthy():
+        if not build_venv():
+            return
+    log.info("Restarting from %s.", VENV_PYTHON)
+    argv = [str(VENV_PYTHON), os.path.abspath(__file__)] + sys.argv[1:]
+    try:
+        os.execv(str(VENV_PYTHON), argv)
+    except OSError as exc:
+        log.warning("could not restart from %s: %s", VENV_PYTHON, exc)
+
+
 ORPHAN_POLL_S = 5.0
 
 
@@ -825,6 +972,8 @@ def main() -> int:
         _stderr.setLevel(logging.INFO)
     for _noisy in ("httpx", "httpcore"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
+    # DMG seed / manual unzip ship no .venv: build it and re-exec (no-op in venv).
+    ensure_venv()
     resume_path = ""
     if "--resume" in sys.argv:
         try:
