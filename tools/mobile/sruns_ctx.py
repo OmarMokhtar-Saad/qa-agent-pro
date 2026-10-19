@@ -8,6 +8,7 @@ from config.settings_guard import never_raise
 from tools.mobile import run_store
 from tools.mobile.replay.context import Context
 from tools.mobile.session_core import LANE_EXPLORE
+from tools.mobile.session_records import permissions_record
 
 logger = logging.getLogger("tools.mobile.session")
 
@@ -47,6 +48,7 @@ def context_for(resolved: object) -> Context:
         asserts_expected=str(body.get("lane") or "") != LANE_EXPLORE,
         run_id=str(body.get("run_id") or "") or None,
         lane=str(body.get("lane") or "") or None,
+        permissions=permissions_record(body.get("permissions")),
     )
 
 

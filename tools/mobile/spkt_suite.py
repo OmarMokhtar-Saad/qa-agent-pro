@@ -68,5 +68,6 @@ async def _next_suite_packet(run_id: str, body: dict, env: PacketEnv) -> dict:
         return loaded
     if env.budget is not None and _in_reserve(env.budget):
         return await _reserved_reply(body, tc_id, env)
+    env.ctx.call_deadline = getattr(env.budget, "deadline", None)
     started = await _start_suite_case(run_id, loaded, env.ctx)
     return started if started.get("error") else _started_reply(body, started)

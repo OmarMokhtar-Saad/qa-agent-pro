@@ -31,6 +31,7 @@ LIVE_ENV: frozenset = frozenset(
         "QA_LOG_RETENTION_ENABLED",
         "QA_LOG_RETENTION_DAYS",
         "QA_LOG_RETENTION_MAX_FILES",
+        "QA_AUTO_FLOW_REPLAY",
         "API_AUTH_TOKEN",
         "GITHUB_TOKEN",
     }

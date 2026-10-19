@@ -73,6 +73,7 @@ class _Plan(NamedTuple):
     used: int
     started: float
     packet: dict
+    trace: tuple = ()
 
 
 class _Ask(NamedTuple):

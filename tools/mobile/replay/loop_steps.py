@@ -11,6 +11,7 @@ from tools.mobile.replay.context import Context, _ReplayRun, _ReplayState, _Step
 from tools.mobile.replay.loop_end import _end_of_script
 from tools.mobile.replay.loop_one import Turn, _replay_one
 from tools.mobile.replay.loop_open import Start, _replay_open
+from tools.mobile.replay.steps_notrun import with_not_run
 from tools.mobile.replay.verdicts import _budget_seconds
 
 logger = logging.getLogger("tools.mobile.executor")
@@ -42,7 +43,7 @@ async def _replay_steps_raw(script: Any, ctx: Context) -> dict:
         for index, action in (cursor := _StepCursor(items)):
             reply = await _replay_one(run, Turn(cursor, state), (index, action))
             if reply is not None:
-                return reply
+                return with_not_run(run, reply, index)
 
         return _end_of_script(run, state.screen)
     except Exception as exc:  # pragma: no cover - defensive

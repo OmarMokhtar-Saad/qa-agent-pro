@@ -18,13 +18,20 @@ from typing import Any, cast
 
 from config.settings_guard import never_raise
 
+try:
+    from tools.mobile import path_plan_text
+except ModuleNotFoundError as _exc:  # a build with no mobile package: never served
+    if not (_exc.name or "").startswith("tools.mobile"):
+        raise
+    path_plan_text = None
+
 TOOL_DESCRIPTION_MAX_CHARS = 1200
 TOOL_DESCRIPTIONS_TOTAL_MAX_CHARS = 15000
 
 MOBILE_BRIEF = """\
 MOBILE RULES (qa_mobile_test / qa_submit_mobile_step / qa_mobile_status)
 
-ANY action on an Android emulator or device -- install, launch, switch environment, log in, tap, type, explore -- goes through qa_mobile_test. For ad-hoc steps pass goal="..." (apply defaults to true; no suite, no cases needed) and it drives the device step by step. Do NOT use raw adb or shell commands for device actions (adb shell input/am/pm, uiautomator dumps, ADB Keyboard broadcasts): the tool owns the destructive guard, keyboard install/restore, the run folder, evidence and per-step screenshots, and a raw command skips every one of them. To reset the app under test, pass `reset_app=true` (clears its data and relaunches it) or send a `clear_app_data` op to `qa_submit_mobile_step`; either needs a live run (apply, the default) and never touches a different app. For a login or explore run that must not stop on a runtime-permission dialog (notifications on Android 13+, location), `grant_permissions` is on by default: it grants the permissions the app declares (incl. notifications) before the first step. Pass `grant_permissions=false` when the run tests the permission prompt itself. Leave `launch` at its default: the server opens the app under test before the first packet, also when the goal asks to confirm the home screen first (the reply then tells you to send a `home` op to observe it). Pass `launch=false` ONLY when the user explicitly says the app must NOT be opened for them: the start then does not open the app and the run begins on whatever the device shows, with an "App NOT opened" line in the reply. `reset_app=true` still relaunches the app after clearing it, and a scripted case run (cases or suite) still opens the app for each case. A goal charter (explore lane) defaults to `destructive: "none"`, which REFUSES every irreversible op it meets -- a goal that reads like a reset gets a named hint to resend with `destructive: "reversible"` rather than failing on its first step with no explanation. An out-of-enum charter field (e.g. `depth: "functional"`) is never silently accepted either: the reply names the field, what was sent, what was used instead, and a fenced JSON block carrying the field's real `enum` values, sourced from this server's own charter vocabulary rather than restated by hand.
+ANY action on an Android emulator or device -- install, launch, switch environment, log in, tap, type, explore -- goes through qa_mobile_test. For ad-hoc steps pass goal="..." (apply defaults to true; no suite, no cases needed) and it drives the device step by step. Do NOT use raw adb or shell commands for device actions (adb shell input/am/pm, uiautomator dumps, ADB Keyboard broadcasts): the tool owns the destructive guard, keyboard install/restore, the run folder, evidence and per-step screenshots, and a raw command skips every one of them. To reset the app under test, pass `reset_app=true` (clears its data and relaunches it) or send a `clear_app_data` op to `qa_submit_mobile_step`; either needs a live run (apply, the default) and never touches a different app. For a login or explore run that must not stop on a runtime-permission dialog (notifications on Android 13+, location), `grant_permissions` is on by default: it grants the permissions the app declares (incl. notifications) before the first step. Pass `grant_permissions=false` when the run tests the permission prompt itself. All permissions are granted by default; if the test prompt denies one, pass `deny_permissions=[names]` (location, camera, microphone, notifications, contacts, photos/storage, phone, sms, calendar, nearby/bluetooth) and only those are denied. An unclear pop-up then stops the run as `permission_unclear` for you to answer. Leave `launch` at its default: the server opens the app under test before the first packet, also when the goal asks to confirm the home screen first (the reply then tells you to send a `home` op to observe it). Pass `launch=false` ONLY when the user explicitly says the app must NOT be opened for them: the start then does not open the app and the run begins on whatever the device shows, with an "App NOT opened" line in the reply. `reset_app=true` still relaunches the app after clearing it, and a scripted case run (cases or suite) still opens the app for each case. A goal charter (explore lane) defaults to `destructive: "none"`, which REFUSES every irreversible op it meets -- a goal that reads like a reset gets a named hint to resend with `destructive: "reversible"` rather than failing on its first step with no explanation. An out-of-enum charter field (e.g. `depth: "functional"`) is never silently accepted either: the reply names the field, what was sent, what was used instead, and a fenced JSON block carrying the field's real `enum` values, sourced from this server's own charter vocabulary rather than restated by hand.
 
 Call qa_mobile_test with NO arguments to start: it answers with whatever the machine needs next (a setup guide, an install source, a preflight list, or the start menu) and asks the tester itself. Every step that installs, downloads or launches needs apply=true, and nothing is installed or downloaded without it. With no Android SDK or no emulator (AVD) on this machine it answers with a setup guide (`setup_required: true`): relay its steps to the tester -- this server downloads no SDK (it can list, boot, create and delete AVDs: see AVDS below). Pass run_id to continue a run in ANY chat -- that takes the run over and the previous chat is told. It hands you ONE packet at a time; answer each with qa_submit_mobile_step.
 
@@ -46,7 +53,7 @@ When a packet asks for TWO OR MORE fields in the same turn (a password plus a on
 
 Send {"op": "clear_app_data"} as a script action to wipe this run's OWN app's data and relaunch it -- gated by the same destructive guard as every other irreversible action, and never a different app. If the first packet already says app data was cleared at run start (reset_app=true), do not send clear_app_data again for that reason.
 
-One script may carry SEVERAL actions -- up to actions.MAX_MODEL_ACTIONS (10), replayed in order until one needs the screen re-read or the case ends -- so batch what you already know you want done rather than one action per call: {"actions": [{"op": "tap", "text": "Email"}, {"op": "type", "text": "user@example.com"}, {"op": "tap", "text": "Continue"}, {"op": "assert", "kind": "new_text", "text": "Password"}]} is ONE submit, not four. A script that carries exactly one action still runs, but the reply says so: use more of the budget you already have per call.
+One script may carry SEVERAL actions, replayed in order until one needs the screen re-read or the case ends, so batch what you already know you want done rather than one action per call: {"actions": [{"op": "tap", "text": "Email"}, {"op": "type", "text": "user@example.com"}, {"op": "tap", "text": "Continue"}, {"op": "assert", "kind": "new_text", "text": "Password"}]} is ONE submit, not four. @@PATH_PLAN@@ @@STOP_NOTE@@ @@PERMISSION_NOTE@@ A script that carries exactly one action still runs, but the reply says so: use more of the budget you already have per call.
 
 To type into a form field, prefer {"op": "fill", "label": "Email", "text": "user@example.com"} over a tap then a type: it finds the editable field by its hint, text or description, or the nearest field below or right of a matching label, taps it, types and checks the text landed. `field` is read only for a secret fill (a plain fill ignores it) and never replaces `text`: a plain fill needs `text`, as above. For a secret send "secret": true with "field" naming the tester input, never the value. If two fields match, the step is refused with the candidates named: resend with a narrower label.
 
@@ -72,6 +79,14 @@ AVDS: never run `avdmanager`, `sdkmanager` or `emulator` yourself in a shell. Us
 
 Never sleep in a shell between calls: a shell sleep is a wait nobody watches; use a `wait` action with a condition. A `wait` waits for `ms`, for `until_text`, or for an element by resource id: `until_rid` (present), with `until_gone=true` (gone) or `until_rid_text` (its text or description contains it). `until_text` and `until_rid` never go together.
 """
+for _tok, _name in (
+    ("@@PATH_PLAN@@", "PATH_PLAN"),
+    ("@@STOP_NOTE@@", "STOP_NOTE"),
+    ("@@PERMISSION_NOTE@@", "PERMISSION_NOTE"),
+):
+    _text = getattr(path_plan_text, _name, "")
+    # a blanked block takes its trailing space too: no stray double space
+    MOBILE_BRIEF = MOBILE_BRIEF.replace(_tok if _text else _tok + " ", _text)
 
 FLOW_BRIEF = """\
 TEST-CASE FLOW RULES (qa_prepare_test_cases / qa_generate_test_cases / qa_submit_category / qa_submit_suite / qa_export_suite / qa_get_category_job)

@@ -17,6 +17,7 @@ OUTCOME_WORDS = {
     "assert_fail": "check failed",
     "visual_check": "visual check (judged by the model)",
     "left_app": "left the app",
+    "permission_unclear": "permission pop-up unclear (host decides)",
     "route_mismatch": "not run (screen not as saved)",
     "screen_mismatch": "not run (screen not as saved)",
     "supplied": "tester answered",
@@ -65,7 +66,7 @@ def _step_html(slot: _StepSlot, row: dict, page: _PageData) -> str:
     act = '<p class="stepact" dir="auto">' + _step_text(row, page) + "</p>"
     notes = "".join(
         '<p class="stepnote" dir="auto">' + esc(line, 300) + "</p>"
-        for line in (detail, applied)
+        for line in (detail, applied, row.get("replayed"))
         if line
     )
     shots = ('<div class="steppics">' + pics + "</div>") if pics else ""

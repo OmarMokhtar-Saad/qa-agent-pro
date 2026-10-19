@@ -26,6 +26,9 @@ class Context:
     # Per-call wall-clock bound for the replay. ``None`` means
     # :data:`SUBMIT_BUDGET_S`; a test shortens it rather than sleeping.
     budget_s: float | None = None
+    # The monotonic deadline of the whole tool call this context serves (45 s
+    # from its start), so optional work can ask how much of it is left.
+    call_deadline: float | None = None
     # Whether an EARLIER unit of the same run already recorded an
     # ``assert_pass``. Defaults False, which is the SCRIPTED lane's rule
     # unchanged: there the case IS the unit that earns the verdict and its own
@@ -107,6 +110,10 @@ class Context:
     # (a dialog, a call, an error text, a device that stopped answering): the
     # "interrupted: <what>" sentence. Read and cleared by the `wait` branch.
     wait_interruption: str = ""
+    # What the pop-ups answered DURING the current wait left behind: the
+    # ``dialog_taps`` / ``permission_unclear`` / ``dialog_refused`` a settle
+    # would write on its trace entry. Reset per wait, merged into the step entry.
+    wait_dialog: dict = dataclasses.field(default_factory=dict)
     # S10 saved route (PROVISIONAL): the screen_id each step must START on, in script order.
     # Empty = not a route replay. Set by session.submit; read ONLY by _route_expected.
     route_expect: tuple = ()
@@ -122,3 +129,6 @@ class Context:
     # (screen, why)``. Run on the screen in hand before step *index*; a non-empty
     # ``why`` ends the script there with nothing actuated. ``None`` = no gate.
     step_gate: Any = None
+    # The run's permission choices from its manifest: ``{deny: [names], grant: bool}``
+    # (``session_records.permissions_record``). Empty = grant every pop-up, as ever.
+    permissions: dict = dataclasses.field(default_factory=dict)

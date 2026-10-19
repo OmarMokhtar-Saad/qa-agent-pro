@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from handlers import _common, _elicit
-from tools.mobile import mobile_elicit
+from tools.mobile import mobile_elicit, perm_groups
 from tools.mobile import render as mobile_render
 
 
@@ -32,11 +32,17 @@ class _MobileTestRequest:
     progress: _common.ProgressCb
     grant_permissions: bool = True
     launch: bool = True
+    deny_permissions: object = None
 
     @classmethod
     def from_call(cls, params: dict) -> "_MobileTestRequest":
         """Build from a handler's ``locals()``; names that are no field are ignored."""
         return cls(**{k: v for k, v in params.items() if k in cls.__dataclass_fields__})
+
+    def permission_record(self) -> dict:
+        """What the run manifest keeps of the permission choices, for later steps."""
+        deny, _ = perm_groups.parse_deny(self.deny_permissions)
+        return {"deny": deny, "grant": bool(self.grant_permissions)}
 
     def source_menu(self) -> str:
         """The source menu (or the narrow conflict question) for these arguments."""
@@ -83,6 +89,7 @@ class _MobileStartContext:
     reset_app: object
     owner: str
     progress: _common.ProgressCb = None
+    permissions: object = None
 
 
 @dataclass(frozen=True)

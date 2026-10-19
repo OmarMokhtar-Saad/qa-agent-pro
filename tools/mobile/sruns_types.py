@@ -15,6 +15,7 @@ class RunEnv(NamedTuple):
     locale: object = None
     capture: object = None
     reset_app: object = None
+    permissions: object = None
 
 
 class RunTarget(NamedTuple):

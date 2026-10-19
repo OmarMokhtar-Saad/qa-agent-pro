@@ -79,12 +79,14 @@ async def ungranted(serial: str, package: str) -> dict:
 # on device, and a second case of the same run finds everything granted and
 # sends no grant at all. A permission the device refuses (a Health Connect
 # grant on an older OS, a hard-restricted one) is reported, never fatal.
-async def grant_runtime(serial: str, package: str) -> dict:
-    """Grant every not-yet-granted runtime permission *package* requests."""
+async def grant_runtime(
+    serial: str, package: str, skip: frozenset = frozenset()
+) -> dict:
+    """Grant every not-yet-granted runtime permission *package* requests, bar *skip*."""
     if not valid_package_name(package) or package.startswith(SYSTEM_PACKAGE_PREFIXES):
         return {"error": "Refusing to grant for " + repr(package[:60]), "content": None}
     pending = await ungranted(serial, package)
-    perms = pending.get("content") or []
+    perms = [p for p in pending.get("content") or [] if p not in skip]
     if pending.get("error") or not perms:
         return {"error": pending.get("error"), "content": {"granted": [], "failed": []}}
     result = await host().shell(serial, _grant_argv(package, perms))
@@ -93,3 +95,32 @@ async def grant_runtime(serial: str, package: str) -> dict:
     failed = _failed(str((result.get("content") or {}).get("out") or ""))
     granted = [p for p in perms if p not in failed]
     return {"error": None, "content": {"granted": granted, "failed": failed}}
+
+
+def _revoke_argv(package: str, perms: list[str]) -> list[str]:
+    """One shell line: every revoke, each failure echoed by name, never aborting."""
+    argv: list[str] = []
+    for perm in perms:
+        argv += ["pm", "revoke", *_USER, package, perm]
+        argv += ["2>/dev/null", "||", "echo", _FAIL + perm, ";"]
+    return argv
+
+
+# A test prompt that denies a permission: after the grant, take it away so the app
+# has to ask. ONE shell line; a permission the app never declared (a group lists
+# more names than one app uses) fails quietly and is only reported.
+async def revoke_runtime(serial: str, package: str, perms: list[str]) -> dict:
+    """Revoke the runtime permissions *perms* from *package* (user 0)."""
+    if not valid_package_name(package) or package.startswith(SYSTEM_PACKAGE_PREFIXES):
+        return {
+            "error": "Refusing to revoke for " + repr(package[:60]),
+            "content": None,
+        }
+    if not perms:
+        return {"error": None, "content": {"revoked": [], "failed": []}}
+    result = await host().shell(serial, _revoke_argv(package, perms))
+    if result.get("error"):
+        return result
+    failed = _failed(str((result.get("content") or {}).get("out") or ""))
+    revoked = [p for p in perms if p not in failed]
+    return {"error": None, "content": {"revoked": revoked, "failed": failed}}

@@ -19,6 +19,7 @@ from tools.mobile.replay.loop_settle import (
     _settle_device,
 )
 from tools.mobile.replay.screen import _screen_hash
+from tools.mobile.replay.skip_done import skip_if_done
 from tools.mobile.replay.steps_assert import Seen, _assert_step
 from tools.mobile.replay.verdicts import SCROLL_TARGET_MISSED
 from tools.mobile.replay.waits import _changed_wait, _wait_spec
@@ -117,6 +118,8 @@ async def _dispatch_op(
 
     ``(screen, reply)``; ``reply`` is ``None`` when the replay goes on.
     """
+    if (skipped := await skip_if_done(run, step, seen.screen)) is not None:
+        return skipped
     if step.op == "assert":
         return seen.screen, _assert_step(run, step, seen)
     if step.op in actions_mod.WAIT_OPS:

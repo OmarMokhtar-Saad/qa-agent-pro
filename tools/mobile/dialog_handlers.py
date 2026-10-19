@@ -31,6 +31,9 @@ from tools.mobile.xml_attrs import attr_pattern, attr_values
 TAP_TEXT = "tap_text"
 TAP_RID = "tap_rid"
 BACK = "back"
+# No tap: the handler cannot tell what the dialog asks, so the script stops and the
+# host answers it. ``value`` is the reason (the dialog's own text).
+STOP = "stop"
 
 _TEXT_ATTR = attr_pattern("text")
 _RID_ATTR = attr_pattern("resource-id")
@@ -42,6 +45,9 @@ class DialogContext:
     package: str
     expected_apps: frozenset = frozenset()
     xml: str = ""
+    # The permission groups the test prompt denies, and whether pop-ups may be answered.
+    deny_permissions: frozenset = frozenset()
+    grant_permissions: bool = True
 
 
 @dataclass(frozen=True)
@@ -116,6 +122,8 @@ def handle(ctx: DialogContext) -> Optional[DialogAction]:
         if not handler.matches(ctx):
             continue
         action = handler.decide(ctx)
+        if action is not None and action.kind == STOP:
+            return action
         if action is None or is_denied(action):
             continue
         if _control_is_visible(action, ctx):

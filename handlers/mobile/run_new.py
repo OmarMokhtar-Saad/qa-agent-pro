@@ -163,5 +163,6 @@ async def _new_run_start(
         locale=locale_taken,
         capture=capture_result,
         reset_app=reset_result,
+        permissions=req.permission_record(),
     )
     return await mobile_run.mobile_start(ask)

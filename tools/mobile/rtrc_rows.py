@@ -54,7 +54,16 @@ def _step_cells(safe: dict, action: dict) -> dict:
         "ms": _ms(safe.get("ms")),
         "detail": _text(safe.get("detail"), MAX_TEXT),
         "notes_applied": _notes_applied(safe.get("knowledge")),
+        "replayed": _replay_note(safe),
     }
+
+
+def _replay_note(safe: dict) -> str:
+    """Name the saved flow when the server replayed this step, not the host."""
+    if safe.get("source") != "auto_replay" and not safe.get("replay"):
+        return ""
+    name = _text(safe.get("flow"), 80)
+    return "Auto-replayed from saved flow " + name if name else "Auto-replayed"
 
 
 # Derived ONCE. The id that names a screen and the key that names a LOOK

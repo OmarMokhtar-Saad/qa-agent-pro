@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.139.1] - 2026-10-19
+## [1.140.0] - 2026-10-19
 
 ### Added
 
@@ -33,15 +33,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- The desktop app opens again. The 1.139.0 DMG was missing a Java part
-  (java.net.http) that the update check needs, so it showed only an
-  "Error" window. The desktop release now refuses a DMG that lacks any
-  Java part the app uses.
-- The desktop app now starts a working backend when opened from Finder
-  or the Dock. On first launch it installs the backend's Python packages
-  once and shows the progress; it also finds Homebrew tools (python, adb,
-  scrcpy). The backend launcher builds its own `.venv` when the packages
-  are missing, and repairs one that a stopped install left half-built.
+- Mobile runs need fewer chat turns. The run asks for a whole-screen
+  script (several actions per packet), waits up to 6 s for the next
+  step's target to appear instead of stopping at once, skips a step
+  that is already done (the field already holds the text, or is
+  already empty), and a script that stops early lists the actions it
+  did not run so the chat resumes from there.
+- A saved flow that fits the first screen replays on its own when the
+  case title matches the flow's goal; replayed steps appear in the
+  case trace and report. Saying no saved flow in the case title or
+  goal turns this off.
+- New `deny_permissions` run argument: all permissions are still
+  allowed, and only the named ones (location, camera, ...) are denied.
+  A pop-up that cannot be matched to a name stops the run as
+  `permission_unclear` for the chat to answer.
+- With `grant_permissions=false` the pop-up handler no longer taps
+  Allow; the pop-up is left for the chat. Sending `deny_permissions`
+  together with `grant_permissions=false` is now refused by name.
 
 ### Known
 
@@ -71,3 +79,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
   route is saved.
 - The fallback keyboard cannot read the field back, so its fill proof
   says "?/N chars" instead of a count.
+- The words that turn auto-replay off (no saved flow, from scratch)
+  are English only. Matching a case title to a flow goal compares word
+  stems, so a short goal matches a longer title (login also matches
+  login with a wrong password), and a title in another language than
+  the flow's goal does not match. A flow learned while exploring has
+  a long goal and rarely replays on its own.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import charter as charter_mod
-from tools.mobile import perception
+from tools.mobile import path_plan_text, perception
 from tools.mobile.run_packets_args import ExploreRef
 from tools.mobile.run_packets_base import (
     _PACKET_ERRORS,
@@ -123,7 +123,7 @@ def _explore_worker_instructions() -> str:
     return (
         "Spend turns, not actions: one script that finishes a whole "
         "round costs one turn, and four scripts that each do one "
-        "step of it cost four. "
+        "step of it cost four. " + path_plan_text.PACKET_POINTER + " "
         "Record anything a tester would want to know in `finding`, "
         "one sentence, even when the turn went fine. "
         "Set `sub_goal` to the one step you are on now: it goes INSIDE "

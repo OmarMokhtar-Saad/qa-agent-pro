@@ -44,6 +44,10 @@ STATUS_UNVERIFIED = "unverified"
 #: and asserts the ordering this reasoning rests on.
 WAIT_POLL_S = 0.25
 
+#: How long a step waits for its target to appear after the previous action of
+#: the script changed the screen (``target_wait``); bounded by the submit budget.
+TARGET_WAIT_S = 6.0
+
 #: The longest pause a watched poll backs off to while the screen stays the
 #: same: the pause doubles per unchanged read from ``WAIT_POLL_S`` up to this,
 #: so a long wait on a static screen is not 13 dumps in 3 s. Any change resets it.

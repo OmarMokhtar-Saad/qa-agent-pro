@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 
-from tools.mobile import adb, prerun_timing, run_store, step_timing
+from tools.mobile import adb, host_auto_replay, prerun_timing, run_store, step_timing
 from tools.mobile import run_packets as mobile_run
 from tools.mobile.case_run_counts import case_view, escapes_used
 from tools.mobile.case_run_evidence import _abandon, _begin_evidence
@@ -76,7 +76,11 @@ async def _plan_first_screen(run_id: str, ctx: Context, opened: _Opened) -> dict
         ref = _Ref(run_id, opened.tc_id, ctx)
         return await _abandon(ref, opened.evidence, settle.error)
     screen = await step_timing.timed("first_settle", _settled_screen(ctx, settle))
+    ref = _Ref(run_id, opened.tc_id, ctx)
+    replay = host_auto_replay.run(ref, screen, True)
+    screen, note = await step_timing.timed("auto_replay", replay)
     planned = _write_planning(run_id, opened, screen)
+    host_auto_replay.annotate(planned, note)
     run_store.append_step_timing(run_id, step_timing.current_row(0))
     return planned
 
@@ -171,6 +175,7 @@ def _write_planning(run_id: str, opened: _Opened, screen: dict) -> dict:
         screen,
         mobile_run.CaseRef(run_id=run_id, tc_id=opened.tc_id, escapes=used),
     )
-    plan = _Plan(used, time.time(), packet)
+    taken = tuple(host_auto_replay.take_trace(run_id, opened.tc_id))
+    plan = _Plan(used, time.time(), packet, taken)
     run_store.write_case(run_id, opened.tc_id, _planning_record(opened, screen, plan))
     return _planning_payload(opened, screen, plan)

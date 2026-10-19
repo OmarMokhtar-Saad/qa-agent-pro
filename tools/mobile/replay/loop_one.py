@@ -28,6 +28,7 @@ from tools.mobile.replay.steps_know import (
     _knowledge_target,
 )
 from tools.mobile.replay.steps_stop import StepAt, _budget_stop, _close
+from tools.mobile.replay.target_wait import note_wait, wait_for_target
 from tools.mobile.replay.waits_cond import _needs_model_reply
 from tools.mobile.replay.waits_types import TextWait
 
@@ -110,9 +111,11 @@ async def _run_step(run: _ReplayRun, turn: Turn, cur: Cur) -> dict | None:
     state.screen, reply, inserted = await _knowledge_before(run, turn.cursor, ahead)
     if reply is not None or inserted:
         return reply
+    if (reply := await wait_for_target(run, turn, cur)) is not None:
+        return reply
     step, reply = await _target_step(run, cur.aim, cur.at._replace(screen=state.screen))
     if reply is not None:
-        return reply
+        return note_wait(reply, entry)
     return await _act(run, turn, cast("_Step", step))
 
 

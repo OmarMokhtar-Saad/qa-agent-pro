@@ -23,6 +23,7 @@ from tools.mobile import (
     flow_replay_switch,
     flow_stats,
     held_inputs,
+    host_flow_goal,
     media,
     session_explore_ids,
     step_timing,
@@ -44,6 +45,8 @@ class Auto(NamedTuple):
     screen: Any
     body: dict
     ran: bool
+    first_only: bool = False  # host lane: only a flow whose FIRST step fits
+    seconds: float = 0.0  # one pass's replay budget (0 = MAX_CHAIN_SECONDS)
 
 
 def _inputs(run_id: str, ctx: Any) -> dict:
@@ -85,7 +88,8 @@ def _record(
         "retry": retry,
         "note": flow_replay_note.text(head, walk.pos, walk.why),
     }
-    body["auto_trace"] = (list(body.get("auto_trace") or []) + walk.trace)[-MAX_TRACE:]
+    named = [dict(entry, flow=name) for entry in walk.trace]
+    body["auto_trace"] = (list(body.get("auto_trace") or []) + named)[-MAX_TRACE:]
 
 
 def _count(package: str, name: str, walk: flow_replay_run.Walk) -> None:
@@ -97,7 +101,12 @@ def _count(package: str, name: str, walk: flow_replay_run.Walk) -> None:
 def _next(auto: Auto, ctx: Any) -> tuple:
     """``(name, template, pos)`` to run now; no template when the chain is over."""
     key = flow_replay_match.live_keys(auto.screen, ctx)
-    got = _resume(auto.body, key, str(getattr(ctx, "package", "") or ""))
+    package = str(getattr(ctx, "package", "") or "")
+    if auto.first_only:
+        skip = host_flow_goal.skip(package, auto.body)
+        got = flow_replay_match.pick_first(package, key, skip)
+    else:
+        got = _resume(auto.body, key, package)
     name, template, pos = got
     if (
         template
@@ -109,12 +118,19 @@ def _next(auto: Auto, ctx: Any) -> tuple:
     return got
 
 
+def _case(auto: Auto) -> str:
+    """The clip case id: the host lane's own, else the explore turn's."""
+    return auto.body.get("case_id") or session_explore_ids.explore_turn_case_id(
+        auto.body
+    )
+
+
 async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
     """``(Auto, stop)``: one flow replayed from the live screen; stop ends the chain."""
     name, template, pos = _next(auto, ctx)
     if not template:
         return auto, True
-    case = session_explore_ids.explore_turn_case_id(auto.body)
+    case = _case(auto)
     ref = media.ClipRef(run_id, case, str(getattr(ctx, "serial", "") or ""))
     plan = flow_replay_run.Plan(template, _inputs(run_id, ctx), ref)
     walk = await step_timing.timed(
@@ -127,7 +143,7 @@ async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
     _record(auto.body, head, walk)
     _count(str(getattr(ctx, "package", "") or ""), name, walk)
     detour = flow_replay_switch.detour(auto.body, (name, walk.pos), walk.why)
-    return Auto(walk.screen, auto.body, True), bool(walk.why) and not detour
+    return auto._replace(screen=walk.screen, ran=True), bool(walk.why) and not detour
 
 
 async def run(run_id: str, ctx: Any, auto: Auto) -> Auto:
@@ -139,7 +155,7 @@ async def run(run_id: str, ctx: Any, auto: Auto) -> Auto:
         flow_replay_switch.clear(auto.body)
         if isinstance(auto.body.get("auto_replay"), dict):
             auto.body["auto_replay"]["note"] = ""
-        deadline = time.monotonic() + MAX_CHAIN_SECONDS
+        deadline = time.monotonic() + (auto.seconds or MAX_CHAIN_SECONDS)
         for _ in range(MAX_CHAIN):
             auto, stop = await _one(run_id, ctx, auto)
             if stop or time.monotonic() > deadline:

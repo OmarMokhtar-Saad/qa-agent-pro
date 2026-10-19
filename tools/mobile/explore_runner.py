@@ -83,6 +83,10 @@ async def _observe_screen(ctx: object) -> dict:
     )
 
 
+# The public name: the host lane re-reads the device after its own auto-replay.
+observe_screen = _observe_screen
+
+
 # Same contract as before the split: dump, prune and build the turn packet -- or stop.
 #
 # ``{"error", "content": {"status", "state", "screen", "packet", "remaining"}}``

@@ -21,6 +21,7 @@ FAILED_OUTCOMES = frozenset(
         "route_mismatch",
         "dump_failed",
         "system_dialog",
+        "permission_unclear",
     }
 )
 

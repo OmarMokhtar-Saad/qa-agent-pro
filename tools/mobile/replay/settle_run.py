@@ -34,6 +34,7 @@ from tools.mobile.replay.settle_mark import (
     SettleOpts,
     _unchanged,
 )
+from tools.mobile.replay.settle_perm import mark_unclear
 
 logger = logging.getLogger("tools.mobile.executor")
 
@@ -183,6 +184,7 @@ def _cut_stop(job: SettleJob, screen: Any, cut: Cut) -> dict:
     entry, kind = job.entry, cut.kind
     entry["outcome"] = "system_dialog" if kind == "system_dialog" else "left_app"
     entry["detail"] = _cut_detail(cut, job.ctx, entry)
+    mark_unclear(entry)
     _stamp_after(entry, screen)
     _append(job.trace, entry)
     return _result(

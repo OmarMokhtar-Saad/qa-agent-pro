@@ -6,11 +6,18 @@ from tools.mobile import action_consts, action_schema, launch_guard
 from tools.mobile.script_help_ex import MULTI_ACTION_EXAMPLE, TARGET_KEYS, _dumps
 
 
-def _limit_lines() -> list:
-    return [
+def _script_line() -> str:
+    return (
         'Script: {"actions":[...]}, at most '
         + str(action_consts.MAX_MODEL_ACTIONS)
-        + " actions per step.",
+        + " actions per step: plan the whole likely path (about 3-4 per screen), "
+        "tap_text_if_present for screens that may not show, end with an assert."
+    )
+
+
+def _limit_lines() -> list:
+    return [
+        _script_line(),
         "Ops: " + ", ".join(action_schema.OPS) + ".",
         "Selectors (" + ", ".join(TARGET_KEYS) + ") go inside a target object, never "
         "beside op. fill takes a label instead of a target.",

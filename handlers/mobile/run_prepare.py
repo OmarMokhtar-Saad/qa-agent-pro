@@ -66,6 +66,14 @@ async def _mobile_preflight_reply(serial: str, target: str) -> str:
     return ""
 
 
+async def _relaunch_after_revoke(
+    req: _MobileTestRequest, serial: str, target: str
+) -> None:
+    """`pm revoke` of a granted permission kills the app: start it again."""
+    if getattr(req, "deny_permissions", None) and req.grant_permissions and req.apply:
+        await _launch_for_start(req, serial, target)
+
+
 async def _prepare_tail(
     req: _MobileTestRequest, serial: str, done: tuple[str, Any, Any]
 ) -> tuple[str, Any]:
@@ -83,5 +91,6 @@ async def _prepare_tail(
     grant_stage = await mobile_grant_stage(req, serial, target)
     if grant_stage:
         return grant_stage, None
+    await _relaunch_after_revoke(req, serial, target)
     failed = await _mobile_preflight_reply(serial, target)
     return failed, (target, locale_taken, capture_result, reset_result)

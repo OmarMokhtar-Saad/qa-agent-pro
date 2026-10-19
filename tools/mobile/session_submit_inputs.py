@@ -90,6 +90,7 @@ def _cap_submit_budget(ctx: Context, budget: Any) -> None:
     # reply is left with nothing to build a packet from. Never above
     # SUBMIT_BUDGET_S: that constant is unchanged and still the
     # ceiling.
+    ctx.call_deadline = getattr(budget, "deadline", None)
     ctx.budget_s = max(
         1.0,
         min(SUBMIT_BUDGET_S, budget.remaining() - PACKET_RESERVE_S),

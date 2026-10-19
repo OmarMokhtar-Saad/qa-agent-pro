@@ -8,9 +8,11 @@ _PRIO = 1
 
 
 _HOW = (
-    " The server replays it by itself when the app is on its first screen; "
-    "flow=%s replays it on demand. flow=none is honoured only when the "
-    "user asked for no flow."
+    " The server replays it by itself when the app is on its first screen "
+    "(at the start of a case, after a stopped step, and in an explore run); "
+    "flow=%s replays it on demand. flow=none turns auto-replay off for the "
+    "run in a test run; an explore run honours it only when the user asked "
+    "for no flow."
 )
 
 

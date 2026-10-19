@@ -75,6 +75,21 @@ def reset_app_record(body: object) -> dict:
     }
 
 
+def permissions_record(body: object) -> dict:
+    """Normalise the run's permission choices for the manifest. Never raises.
+
+    ``deny`` holds the canonical group or raw names the tester's prompt denied
+    (``perm_groups``); ``grant`` is ``grant_permissions``. Later
+    ``qa_submit_mobile_step`` calls read it to answer the pop-ups.
+    """
+    given = body if isinstance(body, dict) else {}
+    deny = given.get("deny")
+    return {
+        "deny": [str(d) for d in deny] if isinstance(deny, list) else [],
+        "grant": given.get("grant") is not False,
+    }
+
+
 def _clear_ops(cases: Any) -> tuple[bool, bool]:
     """(requested, done) from every ``clear_app_data`` op in the case traces."""
     requested = done = False

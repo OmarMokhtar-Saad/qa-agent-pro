@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from tools.mobile.case_run_trace import merge_traces
 from tools.mobile.case_run_types import _Opened, _Plan
 
 
 def _planning_record(opened: _Opened, screen: dict, plan: _Plan) -> dict:
     """The case record stored while the case waits for the planner's script."""
-    return {
+    record = {
         "tc_id": opened.tc_id,
         "title": opened.view.get("title") or "",
         "verdict": "",
@@ -17,6 +18,9 @@ def _planning_record(opened: _Opened, screen: dict, plan: _Plan) -> dict:
         "started": plan.started,
         "evidence": opened.evidence,
     }
+    if plan.trace:  # steps the server auto-replayed before the planner's first packet
+        record["trace"] = merge_traces(None, list(plan.trace))
+    return record
 
 
 def _planning_payload(opened: _Opened, screen: dict, plan: _Plan) -> dict:

@@ -64,6 +64,7 @@ def _plan_suite(ask: _SuiteAsk, ctx: _MobileStartContext) -> dict:
         locale=ctx.locale,
         capture=ctx.capture,
         reset_app=ctx.reset_app,
+        permissions=ctx.permissions,
     )
     return session_runs.plan_suite_run(
         ask.collected,

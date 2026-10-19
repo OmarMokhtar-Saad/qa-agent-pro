@@ -7,6 +7,7 @@ import logging
 from handlers.mobile.run_request import _MobileTestRequest
 from tools.mobile import adb_grant
 from tools.mobile import render as mobile_render
+from tools.mobile.perm_groups import parse_deny, perms_of
 
 logger = logging.getLogger("handlers.mobile.run")
 
@@ -25,12 +26,34 @@ async def mobile_grant_stage(req: _MobileTestRequest, serial: str, target: str) 
             "Granting the app's runtime permissions",
             "pm grant of every runtime permission this run's own app requests",
         )
-    result = await adb_grant.grant_runtime(serial, target)
+    denied = frozenset(perms_of(parse_deny(getattr(req, "deny_permissions", None))[0]))
+    result = await adb_grant.grant_runtime(serial, target, denied)
+    _log("grant", result)
+    return await _revoke_stage(serial, target, denied) if denied else ""
+
+
+async def _revoke_stage(serial: str, target: str, denied: frozenset) -> str:
+    """Take the denied permissions away; a refusal when the revoke itself failed.
+
+    A denied permission that is still granted would make the run's deny a lie,
+    so an adb error stops the run. A per-permission failure (a name the app never
+    declared) stays a log line."""
+    result = await adb_grant.revoke_runtime(serial, target, sorted(denied))
+    _log("revoke", result)
+    if result.get("error"):
+        return (
+            "Not started: could not revoke the denied permissions (%s)."
+            % (str(result["error"])[:200])
+        )
+    return ""
+
+
+def _log(what: str, result: dict) -> None:
     body = result.get("content") or {}
     logger.info(
-        "mobile grant_permissions: granted=%d failed=%d error=%s",
-        len(body.get("granted") or []),
+        "mobile %s_permissions: done=%d failed=%d error=%s",
+        what,
+        len(body.get("granted") or body.get("revoked") or []),
         len(body.get("failed") or []),
         result.get("error"),
     )
-    return ""

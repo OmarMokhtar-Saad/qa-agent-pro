@@ -13,6 +13,7 @@ from typing import Any
 from tools.mobile import (
     flow_nochange,
     goal_scrub,
+    kstg_flow_host,
     kstg_flow_popup,
     kstg_foreign,
     run_store,
@@ -41,6 +42,7 @@ def reached(run_id: str) -> str:
     if explore.get("stop") != "goal_reached" and not passed:
         return ""
     goal = explore.get("goal") or _dict(explore.get("charter")).get("goal")
+    goal = goal or kstg_flow_host.goal(run_id, body)
     return goal_scrub.scrub(str(goal or ""), str(body.get("serial") or ""))
 
 

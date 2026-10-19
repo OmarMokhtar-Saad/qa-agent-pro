@@ -14,6 +14,7 @@ from tools.mobile.replay.context_consts import (
 from tools.mobile.replay.dump import _dump, _focus_probe
 from tools.mobile.replay.fresh_read import unchanged
 from tools.mobile.replay.screen import _screen_hash, system_dialog_package
+from tools.mobile.replay.waits_dialog import answer_new_dialog
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_poll import _wait_deadline
 from tools.mobile.replay.waits_prior import _spinning, already_changed
@@ -194,5 +195,6 @@ async def _watch_after_wait(ctx: Context, screen: object, after: AfterWait) -> t
             screen = reread.get("content")
             reusable = True
     if changed and not interruption:
+        screen = await answer_new_dialog(ctx, screen, before_wait)
         interruption = _interruption_of(ctx, screen, before_wait)
     return screen, reusable, interruption

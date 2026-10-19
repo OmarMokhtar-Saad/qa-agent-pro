@@ -10,6 +10,7 @@ from tools.mobile.session_records import (
     capture_record,
     device_record,
     locale_record,
+    permissions_record,
     reset_app_record,
 )
 from tools.mobile.sruns_cases import _case_dumps
@@ -49,6 +50,7 @@ def _run_records(env: RunEnv) -> dict:
         "device": device_record(env.device),
         "capture": capture_record(env.capture),
         "reset_app": reset_app_record(env.reset_app),
+        "permissions": permissions_record(env.permissions),
     }
 
 

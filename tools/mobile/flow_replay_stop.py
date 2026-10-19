@@ -24,7 +24,7 @@ def failed_why(content: dict) -> str:
     last = _last(content)
     outcome = str(last.get("outcome") or "")
     detail = str(last.get("detail") or "")
-    if outcome in ("left_app", "system_dialog"):
+    if outcome in ("left_app", "system_dialog", "permission_unclear"):
         return "%s (%s): %s" % (LEFT_APP, outcome, detail)
     if outcome == "screen_mismatch" and detail:
         return detail

@@ -14,6 +14,7 @@ from tools.mobile.replay.context_consts import (
 from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
 from tools.mobile.replay.probe_gate import KEEPS_GATE, TEXT, open_gate, rebased
 from tools.mobile.replay.screen import _screen_has_element, absent_from
+from tools.mobile.replay.waits_dialog import answer_unless_met
 from tools.mobile.replay.waits_early import gate_is_noise, quiet_exit, rest_pause
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_prior import _spinning
@@ -97,6 +98,14 @@ async def _keep_gate(gate: object, shown: object, seen: tuple) -> object:
     return await rebased(gate, shown)
 
 
+async def _advance(ticker: watch.Ticker, gate: object, seen: tuple) -> object:
+    """The gate for the next poll of a wait, after one progress tick."""
+    content, verdict, quiet = seen
+    gate = await _keep_gate(gate, content, (verdict, quiet))
+    await ticker.tick()
+    return gate
+
+
 def _ended(ctx: Context, probe: Probe, seen: tuple):
     """``(met, current, False)`` once the wait is met or interrupted, else ``None``."""
     previous, current, screen = seen
@@ -136,6 +145,7 @@ async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
     deadline, ticker, gate, current = await _begin(ctx, screen, probe)
     previous, took, quiet = None, 0.0, 0
     while True:
+        current = await answer_unless_met(ctx, probe, (previous, current, screen))
         if ended := _ended(ctx, probe, (previous, current, screen)):
             return ended
         final, content, took, verdict = await _poll(
@@ -149,8 +159,7 @@ async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
         quiet, previous, current = (quiet + 1) * (content == current), current, content
         if _early_exit(ctx, probe, (quiet, current)):
             return False, current, True
-        gate = await _keep_gate(gate, content, (verdict, quiet))
-        await ticker.tick()
+        gate = await _advance(ticker, gate, (content, verdict, quiet))
 
 
 def _early_exit(ctx: Context, probe: Probe, seen: tuple) -> bool:

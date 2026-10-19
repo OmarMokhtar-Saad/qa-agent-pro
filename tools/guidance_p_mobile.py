@@ -25,10 +25,23 @@ asked for the install, pass `apply=true` on the first call.
    pruned screen, and the exact action vocabulary you may use. The budget is
    TURNS, not actions, so plan the WHOLE case -- or a whole conversational
    round -- as ONE script and send it straight back with
-   `qa_submit_mobile_step`. A script may carry dozens of actions and the
-   packet states its own ceiling; four scripts that each do one step of a
-   round cost four times what one script costs. Do not echo the screen, and
-   do not ask for a packet you already hold.
+   `qa_submit_mobile_step`. The cap is the per-submit action limit the packet
+   and the mobile brief state (this text stays free of internal imports, so
+   it quotes no number). Plan the whole likely path, about 3-4 actions per
+   screen: after a tap that opens a new page keep going for the next screen,
+   targeting by role, rid, label or text (ids belong to the screen you were
+   given), use `tap_text_if_present` for screens that may not show
+   (onboarding, Skip, Not now), and end with an assert or wait that proves the
+   goal. Four scripts that each do one step of a round cost four times what
+   one script costs. A script stops at a missing target (the server first
+   waits briefly), the wrong screen, a guard, an unknown system dialog or the
+   time budget; you get the new screen, the reason and the actions that did not
+   run: continue from there, do not redo steps that ran. System permission
+   pop-ups are answered automatically (Allow) unless the test asks to deny
+   one: then pass `deny_permissions=[...]` (e.g. ["location"]) to
+   `qa_mobile_test`; if the test IS the permission prompt, pass
+   `grant_permissions=false` and answer it yourself. Do not echo the screen,
+   and do not ask for a packet you already hold.
 4. If a step comes back needing a credential, ask the TESTER for that ONE field
    in chat and pass the value in `tester_input` with `tester_input_field` set
    to the field name. It is typed into the app and stored nowhere -- not in the
@@ -72,7 +85,7 @@ Keep each script inside the budget the packet states: one submit replays for a
 bounded time and the waits in one script have a total cap. If a reply comes
 back saying the budget was reached, nothing was lost -- the actions that ran
 are recorded and the screen you were given is the current one; send the rest
-as a second, shorter script.
+as a second script.
 
 Wait for what the reply must SAY, not for a number: `wait_until_text` continues
 the moment that text appears, `wait_until_gone` when a spinner or 'Loading'

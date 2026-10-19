@@ -27,6 +27,8 @@ from tools.mobile.replay.guard import (
 from tools.mobile.replay.loop_field_moved import _focus_left
 from tools.mobile.replay.settle_cut import CutView, _cut_of, _expected_here
 from tools.mobile.replay.settle_mark import SettleJob
+from tools.mobile.replay.settle_perm import dialog_context, record_stop
+from tools.mobile.replay.waits_dialog import set_answerer
 
 logger = logging.getLogger("tools.mobile.executor")
 
@@ -96,11 +98,7 @@ async def _handler_action(ctx: Context, view: CutView, foreign: str) -> Any:
     if not isinstance(xml, str) or not xml:
         return None
     expected = frozenset({ctx.package, *_expected_here(ctx, view.extra)}) - {""}
-    return dialog_handlers.handle(
-        dialog_handlers.DialogContext(
-            serial=ctx.serial, package=foreign, expected_apps=expected, xml=xml
-        )
-    )
+    return dialog_handlers.handle(dialog_context(ctx, foreign, (expected, xml)))
 
 
 def _dialog_gate(ctx: Context, action: Any, screen: Any) -> tuple:
@@ -152,6 +150,8 @@ async def _answer_one_dialog(ctx: Context, view: CutView, foreign: str) -> dict 
     action = await _handler_action(ctx, view, foreign)
     if action is None:
         return None
+    if action.kind == dialog_handlers.STOP:
+        return {"unclear": action.value}
     point, refusal = (None, "")
     if action.kind != dialog_handlers.BACK:
         point, refusal = _dialog_gate(ctx, action, view.screen)
@@ -177,8 +177,7 @@ async def _answer_dialogs(job: SettleJob, view: CutView) -> Any:
         step = await _answer_one_dialog(job.ctx, view, foreign) if kind else None
         if step is None:
             break
-        if step.get("refused"):
-            job.entry["dialog_refused"] = step["refused"]
+        if record_stop(job.entry, step):
             break
         answered.append(step["label"])
         view = view._replace(screen=step["screen"])
@@ -187,3 +186,6 @@ async def _answer_dialogs(job: SettleJob, view: CutView) -> Any:
     if answered:
         job.entry["dialog_taps"] = answered
     return view.screen
+
+
+set_answerer(_answer_dialogs)

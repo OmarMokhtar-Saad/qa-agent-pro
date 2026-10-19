@@ -6,16 +6,17 @@ import re
 import threading
 
 _LOCK = threading.Lock()
-_OFF: set = set()
+_OFF: dict = {}
 _MAX_RUNS = 200
 
 
 def optout(run_id: object) -> None:
     """Stop auto-replaying saved flows for *run_id*."""
     with _LOCK:
-        if len(_OFF) >= _MAX_RUNS:
-            _OFF.clear()
-        _OFF.add(str(run_id or ""))
+        _OFF.pop(str(run_id or ""), None)
+        while len(_OFF) >= _MAX_RUNS:  # the OLDEST goes, never the whole set
+            _OFF.pop(next(iter(_OFF)))
+        _OFF[str(run_id or "")] = True
 
 
 def opted_out(run_id: object) -> bool:

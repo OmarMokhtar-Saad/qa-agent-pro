@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import ime_session, media, run_store, step_timing
+from tools.mobile import host_auto_replay, ime_session, media, run_store, step_timing
 from tools.mobile.case_run_counts import case_view
 from tools.mobile.case_run_script import (
     _fold_queue,
@@ -113,7 +113,11 @@ async def _replay_and_checkpoint(ref: _Ref, view: dict, script: object) -> dict:
         return replayed
     step = _read_step(ref.run_id, ref.tc_id, replayed)
     crash = await _close_step_evidence(step, clip, ref.ctx)
+    step, note = await host_auto_replay.after_stop(step, ref)
+    if note:  # the replayed steps have their own logcat to check for a crash
+        crash = await _slice_evidence(ref.run_id, ref.tc_id, ref.ctx) or crash
     outcome = _outcome_checkpoint(step, view, crash)
+    host_auto_replay.annotate(outcome, note)
     if not (outcome.get("content") or {}).get("packet"):
         await media.flush(ref.run_id)
     return outcome

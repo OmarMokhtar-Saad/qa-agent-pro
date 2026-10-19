@@ -51,6 +51,7 @@ def _mobile_plan_explore(goal: str, parsed: dict, ctx: _MobileStartContext) -> d
         locale=ctx.locale,
         capture=ctx.capture,
         reset_app=ctx.reset_app,
+        permissions=ctx.permissions,
     )
     return session_runs.plan_explore_run(
         goal,

@@ -8,6 +8,7 @@ from tools.mobile import case_run_start as start_mod
 from tools.mobile import run_store
 from tools.mobile.case_run_counts import _prior_uncharged
 from tools.mobile.case_run_evidence import _prior_content
+from tools.mobile.case_run_notrun import attach_not_run, queued_before
 from tools.mobile.case_run_record import _evidence_record
 from tools.mobile.case_run_trace import merge_traces
 from tools.mobile.case_run_types import _Case, _CpFields, _Step
@@ -107,9 +108,11 @@ def _step_payload(step: _Step, view: dict, **fields: Any) -> dict:
     passes the new total.
     """
     fields.setdefault("escapes", step.used)
-    return {
+    queued_n = queued_before(step.run_id, step.tc_id)
+    payload = {
         "error": None,
         "content": _checkpoint(
             step.run_id, step.tc_id, view, trace=step.trace, **fields
         ),
     }
+    return attach_not_run(payload, step.result, queued_n)

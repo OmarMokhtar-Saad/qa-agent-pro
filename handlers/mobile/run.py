@@ -62,7 +62,7 @@ from handlers.mobile.run_start import _mobile_avd_of as mobile_avd_of  # noqa: F
 from handlers.mobile.run_start import _mobile_start as mobile_start  # noqa: F401
 from handlers.mobile.run_start import _StartAsk  # noqa: F401
 from handlers.mobile.run_suite import _mobile_repeat_offer  # noqa: F401
-from tools.mobile import u2_consent
+from tools.mobile import perm_groups, u2_consent
 from tools.suite_store import load_suite  # noqa: F401
 from tools.untrusted import single_line as _safe
 
@@ -91,6 +91,7 @@ async def handle_mobile_test(  # noqa: PLR0913 - MCP tool schema
     charter: str = "",
     grant_permissions: bool = True,
     launch: bool = True,
+    deny_permissions: list[str] | None = None,
     *,
     choose: _common.ChooseCb = None,
     ask_text: _elicit.AskCb = None,
@@ -107,12 +108,22 @@ async def handle_mobile_test(  # noqa: PLR0913 - MCP tool schema
 
     apply = apply and not dry_run
     request = _MobileTestRequest.from_call(locals())
+    if bad := _bad_deny(request):
+        return bad
     try:
         return await _mobile_test_route(request, (run_id, session_token, continue_run))
     except Exception as exc:  # never-raise contract
         logger.exception("mcp mobile_test failed")
         _common.capture_error(exc, "qa_mobile_test")
         return "⚠️ The mobile run could not continue: " + _safe(str(exc), 200)
+
+
+def _bad_deny(req: _MobileTestRequest) -> str:
+    """A refusal when ``deny_permissions`` names an unknown permission, else ``""``."""
+    names, error = perm_groups.parse_deny(req.deny_permissions)
+    if names and not error and req.grant_permissions is False:
+        error = "deny_permissions needs grant_permissions=true (the default)"
+    return "Not started: " + error if error else ""
 
 
 async def _mobile_offer_u2(req: _MobileTestRequest, serial: str) -> None:

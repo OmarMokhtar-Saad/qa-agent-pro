@@ -31,8 +31,12 @@ _SYSTEM_PROMPT = (
     "alongside one that matches: both read as a plan built on an older screen "
     "and are handed back. Never invent coordinates: you cannot see the screen, "
     "only its structure.\n"
-    "- Plan only as far as you can SEE. Stop the script at the first action "
-    "whose target is not on this screen. Being handed the next screen costs one "
+    "- Plan only as far as you can SEE, then a little past it: after a tap that "
+    "opens a new page, keep going with actions for the next screen, targeting by role, rid, label or text "
+    "(ids are this screen only). A missing target stops the script and hands "
+    "you the new screen, the reason and the actions that did not run: continue "
+    "from there, never redo steps that ran. Stop the script at the first action whose "
+    "target you cannot predict. Being handed a screen costs one "
     "round trip; a wrong tap costs the tester a re-run.\n"
     "- Assert what the case says to verify, using assert actions, not prose. An "
     "assert that fails comes back to you with the screen that failed it.\n"
@@ -44,11 +48,13 @@ _SYSTEM_PROMPT = (
     "do NOT invent one or ask in prose: emit ONE ask_tester(prompt, field) per value, all in "
     "the same script so the tester is asked once, then reference each field "
     "name from a type action with secret=true and no text.\n"
-    "- Batch everything you can predict on this screen into ONE script (up to "
-    "10 actions): a whole form plus its submit, known popups then the next tap. "
-    "One action per turn wastes a round trip. A tap already waits for the "
-    "screen to settle: add wait_until_changed only for a slow change. An "
-    "optional popup: tap_text_if_present.\n"
+    "- Batch the whole likely path into ONE script (up to "
+    + str(actions_mod.MAX_MODEL_ACTIONS)
+    + " actions, about 3-4 per screen): a whole form plus its submit, known "
+    "popups, then the next screen. One action per turn wastes a round trip. A "
+    "tap already waits for the screen to settle: add wait_until_changed only "
+    "for a slow change. A screen that may not show (onboarding, Skip, Not "
+    "now): tap_text_if_present. End with an assert that proves the goal.\n"
     "- During a run call ONLY qa_submit_mobile_step: the next packet already "
     "carries the screen, device and app. No capture, status, app_info, "
     "list_devices, search_corpus or get_mcp_tools.\n"
@@ -72,8 +78,8 @@ _BUDGET_NOTE = (
     + " ms of device time, and the waits in one script may total at most "
     + str(actions_mod.MAX_TOTAL_WAIT_MS)
     + " ms -- over that total the whole script is refused. Split a long case "
-    "into several short scripts: the server hands you the screen back between "
-    "them, which costs one round trip and never a re-run."
+    "only when it exceeds this: the server hands you the screen back between "
+    "scripts, which costs one round trip and never a re-run."
 )
 
 #: The two recoveries, offered on EVERY escape rather than only when the
@@ -82,12 +88,11 @@ _BUDGET_NOTE = (
 #: step with the outcome that would have triggered it.
 _RECOVERY_NOTE = (
     "If the screen above belongs to another app or is a system permission "
-    "dialog, the case has not failed. A permission dialog is ORDINARY screen "
-    "content: its buttons are in the element list above, so if the app needs "
-    "that permission, tap the button that grants it by its own label. Send "
-    "`back` only when the app does not need it -- back denies the permission, "
-    "and a case that fails because you denied it failed for your reason and not "
-    "the app's. Otherwise send `launch` to bring the app under test back to the "
+    "dialog, the case has not failed. Permission pop-ups are normally "
+    "answered for you (Allow), unless the test asked to deny it; one still on "
+    "screen is ORDINARY content, if the app needs that permission, tap the button that grants it by its own label. "
+    "Send `back` only when the app does not need it -- back denies the "
+    "permission. Otherwise send `launch` to bring the app under test back to the "
     "front. Put that "
     "recovery FIRST IN THE SAME SCRIPT as the rest of your plan -- a script "
     "that reaches its end without done() ENDS the case, so a recovery sent on "
@@ -122,7 +127,8 @@ _ESCAPE_INSTRUCTION = (
 _EXPLORE_INSTRUCTION = (
     "This is one turn of a bounded exploratory session. The budget is TURNS, "
     "not actions, so put the WHOLE of your next intent in ONE script rather "
-    "than spending a turn per action -- a script may carry up to "
+    "than spending a turn per action; plan past this screen, "
+    "tap_text_if_present for screens that may not show -- a script may carry up to "
     + str(actions_mod.MAX_MODEL_ACTIONS)
     + " actions under a "
     + str(actions_mod.SUBMIT_BUDGET_MS // 1000)

@@ -159,6 +159,16 @@ def pick(package: str, key: str, skip: Any = ()) -> tuple:
     return ("", {}, 0)
 
 
+def pick_first(package: str, key: str, skip: Any = ()) -> tuple:
+    """Like ``pick`` but only a flow whose FIRST step starts on *key* (host lane)."""
+    rows = [(n, t) for n, t in _templates(package) if _usable(t) and n not in set(skip)]
+    for by_key in (True, False):
+        fits = [(n, t, 0) for n, t in rows if _first_at(t, key, by_key) == 0]
+        if fits:
+            return max(fits, key=_rank)
+    return ("", {}, 0)
+
+
 def needed(step: dict) -> str:
     """The tester input a step needs (a `{param}` or a secret field), or ``""``."""
     if step.get("op") not in ("type", "fill"):

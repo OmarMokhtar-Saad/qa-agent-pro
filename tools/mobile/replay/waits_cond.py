@@ -8,6 +8,7 @@ from tools.mobile.replay.context import ReplayStop, _append, _ReplayRun, _result
 from tools.mobile.replay.context_consts import STATUS_NEEDS_MODEL
 from tools.mobile.replay.screen import _stamp_after
 from tools.mobile.replay.settle_mark import SettleJob, SettleOpts
+from tools.mobile.replay.settle_perm import mark_unclear
 from tools.mobile.replay.settle_run import _settle
 from tools.mobile.replay.waits_poll import _wait_until_element
 from tools.mobile.replay.waits_prior import note_gone
@@ -34,6 +35,14 @@ def _element_want(action: object, spec: WaitSpec) -> ElementWait:
     return ElementWait(spec[1], rid_text, gone, spec[2])
 
 
+async def _poll_into(run: _ReplayRun, step: CondStep, screen: object) -> tuple:
+    """:func:`_poll_condition`, plus what pop-ups answered meanwhile onto the entry."""
+    action, spec, entry = step
+    polled = await _poll_condition(WaitView(run.ctx, screen), action, spec)
+    entry.update(run.ctx.wait_dialog)
+    return polled
+
+
 async def _poll_condition(view: WaitView, action: object, spec: WaitSpec) -> tuple:
     """Poll one wait condition: ``(found, screen, interruption)``.
 
@@ -43,7 +52,7 @@ async def _poll_condition(view: WaitView, action: object, spec: WaitSpec) -> tup
     """
     ctx, screen = view
     kind, wait_text, wait_ms = spec
-    ctx.wait_interruption = ""
+    ctx.wait_interruption, ctx.wait_dialog = "", {}
     if kind == "element":
         want = _element_want(action, spec)
         found, screen, _timed_out = await _wait_until_element(ctx, screen, want)
@@ -80,6 +89,7 @@ def _record_miss(entry: dict, interruption: str, missed: str) -> None:
 def _miss(entry: dict, words: tuple, timing: tuple) -> None:
     """:func:`_record_miss`, plus ``wait_early`` when the wait ended early."""
     _record_miss(entry, *words)
+    mark_unclear(entry)
     started, wait_ms = timing
     stamp_early(entry, int((time.monotonic() - started) * 1000), wait_ms)
 
@@ -115,9 +125,7 @@ async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tu
     """
     action, spec, entry = step
     started = time.monotonic()
-    found, screen, interruption = await _poll_condition(
-        WaitView(run.ctx, screen), action, spec
-    )
+    found, screen, interruption = await _poll_into(run, step, screen)
     met, missed, label = _condition_words(action, spec[0], spec[1])
     if found:
         screen, stop = await _on_met(run, step, (screen, met))

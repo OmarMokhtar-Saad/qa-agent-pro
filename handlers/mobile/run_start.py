@@ -91,6 +91,7 @@ class _StartAsk:
     locale: object = None
     capture: object = None
     reset_app: object = None
+    permissions: object = None
 
 
 # Notes for ``_mobile_start`` (moved out of the body to keep it short):
@@ -127,6 +128,7 @@ async def _start_context(ask: _StartAsk) -> _MobileStartContext:
         locale=ask.locale,
         capture=ask.capture,
         reset_app=ask.reset_app,
+        permissions=ask.permissions,
         owner=ask.pre_run_owner,
         progress=ask.progress,
     )
