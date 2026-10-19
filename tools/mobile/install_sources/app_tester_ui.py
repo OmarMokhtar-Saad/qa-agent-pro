@@ -58,6 +58,7 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (  # noqa: F401
 )
 from tools.mobile.install_sources.app_tester_ui_gate import remember_landed
 from tools.mobile.install_sources.app_tester_ui_pick import _PickMixin
+from tools.mobile.install_sources.app_tester_ui_ready import read_drawn, wait_page_ready
 from tools.mobile.install_sources.app_tester_ui_screens import _ScreenMixin
 from tools.mobile.resolve import AskCb, PickOpts, decide, resolve_or_ask  # noqa: F401
 from tools.mobile.version_fast import read_version_fast
@@ -96,13 +97,11 @@ class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
         run = _Run(self._ui_factory(request.serial), request, None, None)
         if not await run.ui.launch(APP_TESTER_PACKAGE):
             return []
-        shot = await run.ui.screen()
-        if shot is None or await self._open_card(run, shot.xml):
+        xml = await read_drawn(run, self._sleep)
+        if xml is None or await self._open_card(run, xml):
             return []
-        detail = await run.ui.screen()
-        if detail is None:
-            return []
-        return clip_releases(parse_releases(visible_texts(detail.xml)))
+        detail = await wait_page_ready(run, self._sleep)
+        return clip_releases(parse_releases(visible_texts(detail)))
 
     async def install(
         self, request: InstallRequest, ask: Optional[AskCb] = None

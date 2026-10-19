@@ -10,27 +10,16 @@ from __future__ import annotations
 
 import time
 
-from tools.mobile.dialog_handlers import visible_texts
 from tools.mobile.install_sources import app_tester_ui_memory as memory
 from tools.mobile.install_sources.app_tester_ui_consts import (
-    ACTION_LABELS,
     APP_TESTER_POLL_S,
     SleepFn,
     _Run,
 )
-from tools.mobile.install_sources.app_tester_ui_funcs import parse_releases
-from tools.mobile.install_sources.app_tester_ui_rows import is_listing
+from tools.mobile.install_sources.app_tester_ui_ready import page_ready
 
 #: Longest wait for the release page after the link was handed over.
 LINK_WAIT_S = 12.0
-
-
-def _release_page(xml: str) -> bool:
-    """True when the screen is an app's page: releases or an action button."""
-    if is_listing(xml):
-        return False
-    texts = visible_texts(xml)
-    return bool(parse_releases(texts)) or any(t in texts for t in ACTION_LABELS)
 
 
 async def _page_shows(run: _Run, sleep: SleepFn) -> bool:
@@ -38,7 +27,7 @@ async def _page_shows(run: _Run, sleep: SleepFn) -> bool:
     deadline = time.monotonic() + LINK_WAIT_S
     while time.monotonic() < deadline:
         shot = await run.ui.screen()
-        if shot is not None and _release_page(shot.xml):
+        if shot is not None and page_ready(shot.xml):
             return True
         await sleep(APP_TESTER_POLL_S)
     return False

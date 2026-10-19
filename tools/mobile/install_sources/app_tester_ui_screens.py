@@ -27,6 +27,11 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
     _foreign_stop,
     _in_progress,
 )
+from tools.mobile.install_sources.app_tester_ui_ready import (
+    PAGE_READY_POLLS,
+    page_ready,
+    read_drawn,
+)
 from tools.mobile.install_sources.app_tester_ui_rows import AAB_SETUP_RID, has_rid
 
 
@@ -46,6 +51,15 @@ async def _quiet(run: _Run) -> bool:
     return True
 
 
+def _page_drawing(run: _Run, xml: str) -> bool:
+    """True while the app page, not tapped on yet, is still being drawn (no
+    release, no button), at most PAGE_READY_POLLS times per install."""
+    if run.tapped or page_ready(xml) or run.page_waits >= PAGE_READY_POLLS:
+        return False
+    run.page_waits += 1
+    return True
+
+
 class _ScreenMixin:
     """The screen-level steps of the flow."""
 
@@ -53,17 +67,15 @@ class _ScreenMixin:
         if await _quiet(run):
             await self._sleep(APP_TESTER_POLL_S)
             return None
-        shot = await run.ui.screen()
-        if shot is None:
-            await self._sleep(APP_TESTER_POLL_S)
+        xml = await read_drawn(run, self._sleep)
+        if xml is None:
             return None
         front = await run.ui.foreground()
-        texts = visible_texts(shot.xml)
         if front == APP_TESTER_PACKAGE:
-            return await self._tester_screen(run, shot.xml)
+            return await self._tester_screen(run, xml)
         if front == run.request.package:
             return await self._own_app(run)
-        return await self._foreign(run, Seen(front, shot.xml, texts))
+        return await self._foreign(run, Seen(front, xml, visible_texts(xml)))
 
     async def _own_app(self: _Flow, run: _Run) -> Optional[InstallOutcome]:
         if not run.tapped:
@@ -108,4 +120,7 @@ class _ScreenMixin:
             return await self._open_card(run, xml)
         if AAB_SETUP_LABEL in texts or has_rid(xml, AAB_SETUP_RID):
             return _aab_setup()
+        if _page_drawing(run, xml):
+            await self._sleep(APP_TESTER_POLL_S)
+            return None
         return await self._detail(run, texts)

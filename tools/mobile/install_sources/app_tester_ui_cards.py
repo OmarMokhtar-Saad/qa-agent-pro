@@ -21,6 +21,7 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
     _unresolved_message,
 )
 from tools.mobile.install_sources.app_tester_ui_link import open_by_link
+from tools.mobile.install_sources.app_tester_ui_ready import on_own_page
 from tools.mobile.install_sources.app_tester_ui_rows import (
     derive_label,
     is_listing,
@@ -37,7 +38,9 @@ class _CardMixin:
     """The listing steps of the flow."""
 
     async def _open_card(self: _Flow, run: _Run, xml: str) -> Optional[InstallOutcome]:
-        if await open_by_link(run, APP_TESTER_PACKAGE, self._sleep):
+        if on_own_page(run, xml) or await open_by_link(
+            run, APP_TESTER_PACKAGE, self._sleep
+        ):
             run.card_tapped = True
             return None
         picked = await self._pick_row(run, xml)
@@ -113,8 +116,9 @@ async def _scroll_to_row(run: _Run, text: str) -> bool:
 
 
 async def _wait_left_listing(run: _Run, sleep: SleepFn) -> None:
-    """After the tap, poll the screen until the list is gone (the app page is
-    up), at most MAX_BACK_TO_LIST reads; the pause is only between reads."""
+    """After the tap, poll the screen until the list is gone, at most
+    MAX_BACK_TO_LIST reads. The page may still be drawing: its readers wait
+    for it (wait_page_ready, and the flow's own page step)."""
     for _ in range(MAX_BACK_TO_LIST):
         shot = await run.ui.screen()
         if shot is not None and not is_listing(shot.xml):

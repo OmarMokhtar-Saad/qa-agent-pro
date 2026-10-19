@@ -67,6 +67,8 @@ class _Run:
     card_tapped: bool = False
     release_done: bool = False
     tapped: int = 0
+    #: polls spent waiting for the app page to finish drawing (bounded).
+    page_waits: int = 0
     #: bundle id -> scroll offset from the scan's start the row was read at.
     offsets: dict = field(default_factory=dict)
     #: current offset (scrolls) from the screen the scan started on.

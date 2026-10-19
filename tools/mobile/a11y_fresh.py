@@ -33,12 +33,12 @@ from __future__ import annotations
 import functools
 import hashlib
 import logging
-import re
 from typing import Any, Awaitable, Callable
 
 from tools.mobile import a11y_clock, a11y_reread, adb, dump_reuse, step_timing
 from tools.mobile.a11y_confirm import uiautomator_aside
 from tools.mobile.a11y_parity import compare, node_digest
+from tools.mobile.xml_attrs import attr_pattern, attr_values
 
 logger = logging.getLogger("tools.mobile.a11y")
 
@@ -89,7 +89,7 @@ def _digest(xml: str) -> str:
 
 def _packages(xml: str) -> frozenset:
     """The ``package`` attribute values of *xml*: which apps own the tree."""
-    return frozenset(re.findall(r'package="([^"]*)"', xml))
+    return frozenset(attr_values(attr_pattern("package"), xml))
 
 
 #: Whole dotted segments of an input-method package (Gboard, AOSP, Samsung,

@@ -18,8 +18,6 @@ in each handler:
 
 from __future__ import annotations
 
-import html
-import re
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -28,13 +26,14 @@ from tools.mobile.deny_terms import (
     is_control_label,
     leads_with_deny_term,
 )
+from tools.mobile.xml_attrs import attr_pattern, attr_values
 
 TAP_TEXT = "tap_text"
 TAP_RID = "tap_rid"
 BACK = "back"
 
-_TEXT_ATTR = re.compile(r'(?:^|\s)text="([^"]*)"')
-_RID_ATTR = re.compile(r'resource-id="([^"]*)"')
+_TEXT_ATTR = attr_pattern("text")
+_RID_ATTR = attr_pattern("resource-id")
 
 
 @dataclass(frozen=True)
@@ -78,11 +77,11 @@ def handler_names() -> list:
 
 
 def visible_texts(xml: str) -> set:
-    return {html.unescape(m) for m in _TEXT_ATTR.findall(xml or "") if m}
+    return {value for value in attr_values(_TEXT_ATTR, xml) if value}
 
 
 def visible_resource_ids(xml: str) -> set:
-    return {html.unescape(m) for m in _RID_ATTR.findall(xml or "") if m}
+    return {value for value in attr_values(_RID_ATTR, xml) if value}
 
 
 def is_denied(action: DialogAction) -> bool:

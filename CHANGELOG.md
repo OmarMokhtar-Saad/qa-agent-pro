@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.138.1] - 2026-10-19
+## [1.139.0] - 2026-10-19
 
 ### Added
 
@@ -33,28 +33,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- The fast accessibility reader now really comes on before App Tester:
-  the QA keyboard is selected first, then the reader is switched on,
-  and the log says why when it stays off.
-- Keyboard and accessibility records made before a run starts no
-  longer fail on the run label; they are moved to the run when it
-  starts, and a later run cleans them up if that run never started.
-- When a run stops before it begins, the keyboard is restored before
-  accessibility.
-- A replay step no longer counts screen furniture as "new text"; a
-  replay that ends without a verdict and rests only on new text says
-  "Passed:", not "Verified:".
-- A replay step that was not tapped because the screen did not match
-  says "Did not tap" and its outcome is "not run (screen not as
-  saved)"; the route line no longer ends in " -> ?".
-- A heartbeat no longer brings a released device lease back.
-- A failed screen-recording copy names the step and the reason
-  (copy failed, empty, or too big) in the evidence note.
-- For an app with no profile, evidence pages say the device log was
-  captured, instead of "no app log captured".
-- Granting app permissions is described as test setup.
-- A wait for text to appear also treats Lottie, shimmer and skeleton
-  placeholders as loading and does not end early on them.
+- Installing from App Tester works again with the fast accessibility
+  reader on: the screen text it writes is read again, so the install
+  dialog, the Install/Update buttons and the app in front are seen.
+- An App Tester page that is still drawing is read again a few times
+  before it is judged, so it no longer reports no releases or no
+  Update, Download or Install button.
+- A blank screen during an install is read again before the run
+  stops on it.
+- When App Tester opens on the page of the app under test (one it has
+  installed before), the run stays there instead of going back to
+  the list.
 
 ### Known
 
