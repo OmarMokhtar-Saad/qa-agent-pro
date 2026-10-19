@@ -20,10 +20,12 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
     _tap_failed,
     _unresolved_message,
 )
+from tools.mobile.install_sources.app_tester_ui_handoff import BACK_TO_LIST_RID
 from tools.mobile.install_sources.app_tester_ui_link import open_by_link
 from tools.mobile.install_sources.app_tester_ui_ready import on_own_page
 from tools.mobile.install_sources.app_tester_ui_rows import (
     derive_label,
+    has_rid,
     is_listing,
     matching_rows,
 )
@@ -132,9 +134,16 @@ async def _to_listing(run: _Run, xml: str, sleep: SleepFn) -> Optional[str]:
     for _ in range(MAX_BACK_TO_LIST):
         if is_listing(xml):
             return xml
-        await run.ui.press_back()
+        await _leave_page(run, xml)
         xml = await _read_until_listing(run, sleep)
     return xml if is_listing(xml) else None
+
+
+async def _leave_page(run: _Run, xml: str) -> None:
+    """The page's own All apps row when it shows one, else the Back key."""
+    rid = APP_TESTER_PACKAGE + BACK_TO_LIST_RID
+    if not (has_rid(xml, BACK_TO_LIST_RID) and await run.ui.tap_resource_id(rid)):
+        await run.ui.press_back()
 
 
 async def _read_until_listing(run: _Run, sleep: SleepFn) -> str:

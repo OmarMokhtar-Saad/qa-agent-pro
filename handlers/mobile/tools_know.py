@@ -22,7 +22,7 @@ def _register_mobile_notes_tool(mcp, Context, rt) -> None:
         reason: str = "",
     ) -> str:
         """List or retire (`note_id`, kept in history) ONE app's saved notes, by `package` or `run_id`."""
-        return await rt._tracked(
+        return await rt._tracked_mobile(
             "qa_mobile_notes",
             ctx,
             mobile_content.handle_mobile_notes(
@@ -43,7 +43,7 @@ def _register_mobile_knowledge_tool(mcp, Context, rt) -> None:
         data: dict | None = None,
     ) -> str:
         """ONE app's learned knowledge: list/show/confirm/reject/edit/export/import. data: table,page,run_id"""
-        return await rt._tracked(
+        return await rt._tracked_mobile(
             "qa_mobile_knowledge",
             ctx,
             mobile_content.handle_mobile_knowledge(
@@ -65,7 +65,7 @@ def _register_mobile_flows_tool(mcp, Context, rt) -> None:
         kind: str = "flow",
     ) -> str:
         """List, show or delete one app's saved flows."""
-        return await rt._tracked(
+        return await rt._tracked_mobile(
             "qa_mobile_flows",
             ctx,
             mobile_content.handle_mobile_flows(

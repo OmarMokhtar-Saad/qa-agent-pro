@@ -17,7 +17,7 @@ def _register_mobile_status_tool(mcp, Context, rt) -> None:
         """Where a mobile run stands, read from disk. Touches no device. Device actions go through `qa_mobile_test` (goal=... starts an exploration run toward that goal), never raw adb.
 
         Emulator, lease holder, cases done/failed/remaining. Call after anything outliving a tool call (big install, cold boot). No run_id lists runs; report_now=true writes the HTML report and returns its path."""
-        return await rt._tracked(
+        return await rt._tracked_mobile(
             "qa_mobile_status",
             ctx,
             mobile_device.handle_mobile_status(
@@ -44,7 +44,7 @@ def _register_mobile_network_watch_tool(mcp, Context, rt) -> None:
         device_id: str = "",
     ) -> str:
         """Watch what an emulator puts on the wire, passively, root-free. `device_id`: adb serial (alias `serial`). `action="start"` needs `apply=true`; `"stop"` (REVERTS) never does; `"status"`. Hosts come from TLS ClientHello and DNS; **paths and query strings are not visible and never guessed**. The pcap is parsed and DELETED; only the summary returns."""
-        return await rt._tracked_noted(
+        return await rt._tracked_mobile_noted(
             "qa_network_watch",
             ctx,
             mobile_device.handle_network_watch(
@@ -66,7 +66,7 @@ def _register_mobile_capture_setup_tool(mcp, Context, rt) -> None:
         device_id: str = "",
     ) -> str:
         """Prepare, check or remove API capture on a device AHEAD of a run. `device_id` is the adb serial (`serial` is an alias). `action="prepare"` installs the qa-agents proxy certificate and proves decryption; `"status"` reads the device's trust from disk; `"remove"` clears the live proxy. prepare and remove need `apply=true`."""
-        return await rt._tracked_noted(
+        return await rt._tracked_mobile_noted(
             "qa_setup_capture",
             ctx,
             mobile_device.handle_setup_capture(

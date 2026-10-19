@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.140.0] - 2026-10-19
+## [1.141.0] - 2026-10-19
 
 ### Added
 
@@ -33,26 +33,28 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Mobile runs need fewer chat turns. The run asks for a whole-screen
-  script (several actions per packet), waits up to 6 s for the next
-  step's target to appear instead of stopping at once, skips a step
-  that is already done (the field already holds the text, or is
-  already empty), and a script that stops early lists the actions it
-  did not run so the chat resumes from there.
-- A saved flow that fits the first screen replays on its own when the
-  case title matches the flow's goal; replayed steps appear in the
-  case trace and report. Saying no saved flow in the case title or
-  goal turns this off.
-- New `deny_permissions` run argument: all permissions are still
-  allowed, and only the named ones (location, camera, ...) are denied.
-  A pop-up that cannot be matched to a name stops the run as
-  `permission_unclear` for the chat to answer.
-- With `grant_permissions=false` the pop-up handler no longer taps
-  Allow; the pop-up is left for the chat. Sending `deny_permissions`
-  together with `grant_permissions=false` is now refused by name.
+- The tester's own keyboard comes back when the chat goes quiet. After
+  2 minutes with no mobile call, every run that switched the phone to
+  the QA keyboard gives the tester's keyboard back; the run's next call
+  takes the QA keyboard again.
+- App Tester installs no longer get stuck on the one-time consent page
+  some apps show. The installer leaves that page with its own back
+  button, never ticks the consent box for the tester, and stops with
+  `consent_required`. The reply names the exact server calls the chat
+  can use, once the tester says yes, to agree on the page and then
+  install again.
+- Every mobile tool that stops (a run, a step, stop, status, app
+  update, capture, network watch, notes, knowledge, flows) now ends its
+  reply with the chat's next steps, all as calls to the server's own
+  tools: call again with a fixed argument, drive the screen as a run,
+  or ask the tester. It works the same for every app.
+- The heavy-emulator note at the start of a run is now marked as
+  information (ℹ️), not as a stop.
 
 ### Known
 
+- If the server process is killed, the QA keyboard stays selected
+  until the next run's clean-up gives the tester's keyboard back.
 - A count in the learned-mistakes table is how often the mistake was
   seen, including retries within one run, not how many runs saw it.
 - A device or emulator lock file can still name its last holder after

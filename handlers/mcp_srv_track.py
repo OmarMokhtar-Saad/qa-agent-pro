@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from handlers import _lane
 from handlers.mcp_srv_toolcall import _capture_error, _close_tool_call, _open_tool_call
 from tools import tool_briefs
 
@@ -53,3 +54,14 @@ async def _tracked_noted(name, ctx, coro):
     """``_tracked`` plus the tool's own note (``tools/tool_briefs.TOOL_NOTES``)
     appended to a text reply. ``_tracked`` itself stays a pure pass-through."""
     return tool_briefs.append_tool_note(name, await _tracked(name, ctx, coro))
+
+
+async def _tracked_mobile(name, ctx, coro):
+    """``_tracked`` for a mobile tool: a stop reply ends with the host's way on
+    (``tools/mobile/host_way_on``, fix/1490)."""
+    return _lane.host_way_on.with_way_on(name, await _tracked(name, ctx, coro))
+
+
+async def _tracked_mobile_noted(name, ctx, coro):
+    """``_tracked_noted`` plus the host's way on after a stop reply."""
+    return _lane.host_way_on.with_way_on(name, await _tracked_noted(name, ctx, coro))

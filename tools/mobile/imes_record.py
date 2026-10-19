@@ -27,6 +27,15 @@ FALLBACK_FILE = "ime-fallback.json"
 #: the next typing case tries the install again.
 FALLBACK_TTL_S = 600.0
 
+#: Runs whose record THIS process wrote and has not cleared: the keyboards the
+#: idle give-back (``replay.keyboard_idle``) hands back when the agent goes quiet.
+_LIVE: set[str] = set()
+
+
+def live_runs() -> list[str]:
+    """Runs this process has a QA keyboard selected for (a copy, sorted)."""
+    return sorted(_LIVE)
+
 
 def record_path(run_id: str):
     """Public seam: where *run_id*'s IME record lives."""
@@ -48,6 +57,9 @@ def adopt(owner: str, run_id: str) -> bool:
     moved = run_records.move_record(_site(), owner, run_id)
     fallback = run_records.RecordSite(_fallback_path, logger, "mobile.ime_session")
     run_records.move_record(fallback, owner, run_id)
+    if moved and owner in _LIVE:
+        _LIVE.discard(owner)
+        _LIVE.add(run_id)
     return moved
 
 
@@ -58,12 +70,16 @@ def read_record(run_id: str) -> dict:
 
 def write_record(run_id: str, body: dict) -> dict:
     """Write the run's IME record through run_store's own writer."""
-    return run_records.write_record(_site(), run_id, body)
+    written = run_records.write_record(_site(), run_id, body)
+    if not (written or {}).get("error"):
+        _LIVE.add(str(run_id))
+    return written
 
 
 def clear_record(run_id: str) -> None:
     """Drop the record. A missing file is success: the point is that it is gone."""
     run_records.clear_record(_site(), run_id)
+    _LIVE.discard(str(run_id))
 
 
 def read_fallback(run_id: str) -> dict:

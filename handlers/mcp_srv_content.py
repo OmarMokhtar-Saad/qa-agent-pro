@@ -112,6 +112,11 @@ class MobileReplySpec(NamedTuple):
     handler: Callable
 
 
+def _device_of(fields: dict) -> str:
+    """The ``device_id`` a mobile call named, or ``""``."""
+    return str(fields.get("device_id") or "")
+
+
 async def _mobile_reply(spec: MobileReplySpec, ctx, fields: dict, **extra) -> list:
     """Run a mobile ``*_content`` handler under `_tracked` and shape its reply.
 
@@ -122,7 +127,13 @@ async def _mobile_reply(spec: MobileReplySpec, ctx, fields: dict, **extra) -> li
     `screen_image` note -- the reply never implies an image that is not there.
     """
 
-    text, specs = await _tracked(
-        spec.name, ctx, spec.handler(**fields, **extra, progress=_make_progress(ctx))
-    )
+    # The keyboard idle clock waits while any mobile call is in flight.
+    async with _lane.keyboard_idle.busy(str(fields.get("run_id") or "")):
+        text, specs = await _tracked(
+            spec.name,
+            ctx,
+            spec.handler(**fields, **extra, progress=_make_progress(ctx)),
+        )
+    if not specs:  # a stop never leaves the host without a way on (fix/1490)
+        text = _lane.host_way_on.with_way_on(spec.name, text, _device_of(fields))
     return [TextContent(type="text", text=text), *_image_content_blocks(specs)]

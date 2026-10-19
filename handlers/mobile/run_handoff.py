@@ -12,7 +12,7 @@ from handlers.mobile import run_early_a11y
 from handlers.mobile import step as mobile_step
 from handlers.mobile.run_device_prefs import _mobile_a11y_stage
 from handlers.mobile.run_hooks import mobile_run
-from tools.mobile import knowledge_run, step_timing
+from tools.mobile import host_way_on, knowledge_run, step_timing
 from tools.mobile import render as mobile_render
 
 logger = logging.getLogger("tools.mcp_handlers")
@@ -58,9 +58,9 @@ async def _mobile_hand_off(
     rendered = await mobile_step.mobile_next(
         run_id, token, mobile_step.NextOpts(progress=progress, first_packet=True)
     )
-    for note in notes:
+    for note in notes:  # the run goes on: a note is never a stop (fix/1490)
         if note:
-            rendered = note + "\n\n" + rendered
+            rendered = host_way_on.as_note(note) + "\n\n" + rendered
     return rendered + _start_timing_line(run_id), True
 
 

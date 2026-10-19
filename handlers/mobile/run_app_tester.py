@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from handlers import _common
 from handlers.mobile import run_skipped
@@ -23,6 +24,7 @@ from tools.mobile.install_source import (
 )
 from tools.mobile.install_sources.app_tester_ui import AppTesterUiSource
 from tools.mobile.install_sources.app_tester_ui_funcs import _label_required
+from tools.mobile.install_sources.app_tester_ui_handoff import host_next
 from tools.mobile.install_sources.app_tester_ui_memory import (
     known_bundle,
     parse_app_id,
@@ -69,8 +71,10 @@ async def _open_tester_store(serial: str) -> str:
     )
 
 
-def _failed(outcome: InstallOutcome) -> str:
-    return "⚠️ " + outcome.message + "\n\n" + APP_TESTER_HINT
+def _failed(outcome: InstallOutcome, want: Optional[ListedApp] = None) -> str:
+    """The stop reply; after a device step, the host's own way on."""
+    after = ("\n\n" + host_next(want.serial, want.tester)) if want else ""
+    return "⚠️ " + outcome.message + "\n\n" + APP_TESTER_HINT + after
 
 
 async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
@@ -87,7 +91,7 @@ async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
     await _common.emit(call.progress, _SCANNING)
     bundle = await source.find_listed_app(want, ask)
     if isinstance(bundle, InstallOutcome):
-        return _failed(bundle), ""
+        return _failed(bundle, want), ""
     return await _install_found(call, want, (source, ask, bundle))
 
 
@@ -104,7 +108,7 @@ async def _install_found(call: _AppCall, want: ListedApp, found: tuple):
     request = InstallRequest(call.serial, bundle, want.label, latest=True)
     outcome = await source.install(request, ask)
     if not outcome.ok:
-        return _failed(outcome), bundle
+        return _failed(outcome, want), bundle
     app_alias.remember_alias(call.serial, want.label, bundle)
     run_skipped.mark_tester_install(call.serial, bundle, outcome.code != ALREADY_LATEST)
     return "", bundle

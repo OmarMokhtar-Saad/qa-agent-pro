@@ -21,9 +21,11 @@ try:
     import handlers.mobile as mobile_lane
     import tools.mobile.adb as adb
     import tools.mobile.emulator as emulator
+    import tools.mobile.host_way_on as host_way_on
     import tools.mobile.locks as locks
     import tools.mobile.peek as peek
     import tools.mobile.render as render
+    import tools.mobile.replay.keyboard_idle as keyboard_idle
     import tools.mobile.script_help as script_help
     import tools.mobile.sdk_locator as sdk_locator
     import tools.mobile.watch as watch
@@ -33,8 +35,10 @@ except ImportError as exc:  # pragma: no cover - the dist-simulation test covers
     mobile_lane = cast("Any", None)
     adb = cast("Any", None)
     emulator = cast("Any", None)
+    host_way_on = cast("Any", None)
     locks = cast("Any", None)
     peek = cast("Any", None)
+    keyboard_idle = cast("Any", None)
     render = cast("Any", None)
     script_help = cast("Any", None)
     sdk_locator = cast("Any", None)

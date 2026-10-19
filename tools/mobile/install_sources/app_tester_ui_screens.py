@@ -27,6 +27,10 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
     _foreign_stop,
     _in_progress,
 )
+from tools.mobile.install_sources.app_tester_ui_handoff import (
+    CONSENT_RID,
+    consent_required,
+)
 from tools.mobile.install_sources.app_tester_ui_ready import (
     PAGE_READY_POLLS,
     page_ready,
@@ -120,6 +124,8 @@ class _ScreenMixin:
             return await self._open_card(run, xml)
         if AAB_SETUP_LABEL in texts or has_rid(xml, AAB_SETUP_RID):
             return _aab_setup()
+        if has_rid(xml, CONSENT_RID):
+            return consent_required(run.request.package)
         if _page_drawing(run, xml):
             await self._sleep(APP_TESTER_POLL_S)
             return None

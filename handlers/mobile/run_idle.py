@@ -98,7 +98,7 @@ async def _mobile_heavy_avd_note(serial: str) -> str:
         density = (await mobile_adb.display_density(serial) or {}).get("content")
         panel = avd_guard.Panel(size[0], size[1], density, avd_guard.host_load())
         note = avd_guard.assess(panel)
-        return ("⚠️ " + note + "\n\n") if note else ""
+        return ("ℹ️ " + note + "\n\n") if note else ""
     except Exception:
         logger.exception("mobile heavy-AVD check failed")
         return ""
