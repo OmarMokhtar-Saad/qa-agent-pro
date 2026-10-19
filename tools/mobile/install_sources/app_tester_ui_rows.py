@@ -66,6 +66,13 @@ def has_rid(xml: str, suffix: str) -> bool:
     return root is not None and any(_rid(n).endswith(suffix) for n in root.iter())
 
 
+def is_checked(xml: str, suffix: str) -> bool:
+    """True when the node whose resource id ends with ``suffix`` is ticked."""
+    root = _root(xml)
+    nodes = () if root is None else root.iter()
+    return any(_rid(n).endswith(suffix) and n.get("checked") == "true" for n in nodes)
+
+
 def is_loading(xml: str) -> bool:
     """True while the list screen shows its loading spinner."""
     return has_rid(xml, LOADING_RID)

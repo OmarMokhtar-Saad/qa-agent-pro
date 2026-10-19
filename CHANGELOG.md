@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.141.0] - 2026-10-19
+## [1.141.1] - 2026-10-19
 
 ### Added
 
@@ -33,23 +33,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- The tester's own keyboard comes back when the chat goes quiet. After
-  2 minutes with no mobile call, every run that switched the phone to
-  the QA keyboard gives the tester's keyboard back; the run's next call
-  takes the QA keyboard again.
-- App Tester installs no longer get stuck on the one-time consent page
-  some apps show. The installer leaves that page with its own back
-  button, never ticks the consent box for the tester, and stops with
-  `consent_required`. The reply names the exact server calls the chat
-  can use, once the tester says yes, to agree on the page and then
-  install again.
-- Every mobile tool that stops (a run, a step, stop, status, app
-  update, capture, network watch, notes, knowledge, flows) now ends its
-  reply with the chat's next steps, all as calls to the server's own
-  tools: call again with a fixed argument, drive the screen as a run,
-  or ask the tester. It works the same for every app.
-- The heavy-emulator note at the start of a run is now marked as
-  information (ℹ️), not as a stop.
+- App Tester installs now get past the one-time consent page on
+  their own. The installer ticks the "I consent" box (only when it is
+  not ticked yet) and taps START TESTING ON THIS DEVICE, then carries
+  on. It stops with `consent_required` only if the page is still there
+  after 2 tries. The chat no longer has to ask the tester or open a
+  second run (with its own second report) to get past that page.
+- Mobile screen reads are a little faster: the check of which window
+  is in front now runs at the same time as the screen read instead of
+  after it.
 
 ### Known
 

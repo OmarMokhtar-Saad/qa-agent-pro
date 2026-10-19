@@ -19,6 +19,7 @@ from tools.mobile.install_sources.app_tester_ui_consts import (
     APP_TESTER_POLL_S,
     QUIET_POLLS,
     Seen,
+    SleepFn,
     _Flow,
     _Run,
 )
@@ -28,7 +29,10 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
     _in_progress,
 )
 from tools.mobile.install_sources.app_tester_ui_handoff import (
+    CONSENT_BOX_RID,
+    CONSENT_BUTTON_RID,
     CONSENT_RID,
+    CONSENT_TRIES,
     consent_required,
 )
 from tools.mobile.install_sources.app_tester_ui_ready import (
@@ -36,7 +40,23 @@ from tools.mobile.install_sources.app_tester_ui_ready import (
     page_ready,
     read_drawn,
 )
-from tools.mobile.install_sources.app_tester_ui_rows import AAB_SETUP_RID, has_rid
+from tools.mobile.install_sources.app_tester_ui_rows import (
+    AAB_SETUP_RID,
+    has_rid,
+    is_checked,
+)
+
+
+async def _consent(sleep: SleepFn, run: _Run, xml: str) -> Optional[InstallOutcome]:
+    """Tick "I consent", then START TESTING; stop when the page stays."""
+    if run.consent_taps >= CONSENT_TRIES:
+        return consent_required(run.request.package)
+    run.consent_taps += 1
+    if not is_checked(xml, CONSENT_BOX_RID):
+        await run.ui.tap_resource_id(APP_TESTER_PACKAGE + CONSENT_BOX_RID)
+    await run.ui.tap_resource_id(APP_TESTER_PACKAGE + CONSENT_BUTTON_RID)
+    await sleep(APP_TESTER_POLL_S)
+    return None
 
 
 async def _quiet(run: _Run) -> bool:
@@ -125,7 +145,7 @@ class _ScreenMixin:
         if AAB_SETUP_LABEL in texts or has_rid(xml, AAB_SETUP_RID):
             return _aab_setup()
         if has_rid(xml, CONSENT_RID):
-            return consent_required(run.request.package)
+            return await _consent(self._sleep, run, xml)
         if _page_drawing(run, xml):
             await self._sleep(APP_TESTER_POLL_S)
             return None

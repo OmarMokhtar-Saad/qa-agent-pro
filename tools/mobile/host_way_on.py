@@ -32,8 +32,9 @@ _VERDICT = re.compile(r"\S+ `[^`\n]*`[^\n]* — \*\*")
 _WARN = "⚠"
 
 _ASK = (
-    "ask the tester when the choice is theirs (consent, sign-in, payment, "
-    "which app or device), and never answer such a page without their yes. "
+    "ask the tester when the choice is theirs (sign-in, payment, which app "
+    "or device; App Tester's consent page the server ticks itself), and "
+    "never answer such a page without their yes. "
     "Never use raw adb."
 )
 

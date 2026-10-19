@@ -82,13 +82,29 @@ async def _shell(serial: str, command: str, budget: float) -> str | None:
 
 async def _read_frame(serial: str, budget: float) -> Reading | None:
     """Focus plus a sampled raw frame; ``None`` when the raw frame is unavailable."""
-    frame = await screen_frame.fetch(serial, budget)
+    last = _LAST.get(str(serial))
+    # With no focus held, one is certainly needed: ask beside the frame fetch.
+    early = (
+        None if last and last.focus else asyncio.ensure_future(focus(serial, budget))
+    )
+    try:
+        frame = await screen_frame.fetch(serial, budget)
+    except BaseException:
+        _drop(early)
+        raise
     if frame is None:
+        _drop(early)
         return None
-    named = _kept_focus(serial, frame) or await focus(serial, budget)
+    named = _kept_focus(serial, frame) or await (early or focus(serial, budget))
     reading = Reading(named, frame.digest, frame.words, frame.flat)
     _LAST[str(serial)] = reading
     return reading
+
+
+def _drop(task: asyncio.Future | None) -> None:
+    """Cancel an early focus probe that is no longer needed."""
+    if task is not None and not task.done():
+        task.cancel()
 
 
 def _kept_focus(serial: str, frame: object) -> str:

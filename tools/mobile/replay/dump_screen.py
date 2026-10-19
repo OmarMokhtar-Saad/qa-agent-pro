@@ -43,10 +43,27 @@ async def _first_screen(ctx: Context) -> dict:
 # joins it. A cut returns :data:`DUMP_CUT_DETAIL` as an error.
 async def _dump(ctx: Context, deadline: float | None = None) -> dict:
     """Re-dump and re-prune. Returns the ``{"error","content"}`` shape."""
-    raw = await _fetched(ctx.serial, deadline)
-    if raw.get("error"):
-        return raw
-    return await _observed(ctx, raw)
+    # The focus probe (a separate adb spawn, ~90 ms) starts the moment the dump
+    # does and runs BESIDE it: still read fresh for this dump, but hidden behind
+    # a dump that is slower than it. A served kept dump starts none.
+    probes: list = []
+    begin = lambda: probes.append(asyncio.ensure_future(resolve_activity(ctx)))  # noqa: E731
+    try:
+        raw = await _fetched(ctx.serial, deadline, begin)
+        if raw.get("error"):
+            return raw
+        return await _observed(ctx, raw, probes[0] if probes else None)
+    finally:
+        for probe in probes:
+            _settle(probe)
+
+
+def _settle(probe: asyncio.Future) -> None:
+    """Cancel a focus probe nobody awaited; never leave its error unretrieved."""
+    if not probe.done():
+        probe.cancel()
+    elif not probe.cancelled():
+        probe.exception()
 
 
 def _cut() -> dict:
@@ -54,7 +71,7 @@ def _cut() -> dict:
     return {"error": DUMP_CUT_DETAIL, "content": None}
 
 
-async def _fetched(serial: str, deadline: float | None) -> dict:
+async def _fetched(serial: str, deadline: float | None, begin: Any = None) -> dict:
     if deadline is None:
         await dump_latency.join(serial)
     elif not await dump_latency.join(serial, deadline - time.monotonic()):
@@ -64,6 +81,8 @@ async def _fetched(serial: str, deadline: float | None) -> dict:
         step_timing.mark("dump_cut_served")
         return kept
     under = dump_reuse.token(serial)
+    if begin is not None:
+        begin()
     task = dump_latency.start(serial, _raw_dump(serial))
     try:
         raw = await _awaited(task, deadline)
@@ -83,7 +102,9 @@ async def _awaited(task: asyncio.Future, deadline: float | None) -> dict:
     )
 
 
-async def _observed(ctx: Context, raw: dict) -> dict:
+async def _observed(
+    ctx: Context, raw: dict, probe: asyncio.Future | None = None
+) -> dict:
     # The display is a DEVICE fact, so it is read from the device rather than
     # inferred from the dump; `display_size` caches it per serial and never
     # refuses, so this costs one round trip per session and cannot fail a dump.
@@ -92,7 +113,7 @@ async def _observed(ctx: Context, raw: dict) -> dict:
     sized, dpi, activity = await asyncio.gather(
         adb.display_size(ctx.serial),
         adb.display_density(ctx.serial),
-        resolve_activity(ctx),
+        probe if probe is not None else resolve_activity(ctx),
     )
     observed = composite.observe(
         raw.get("content"),
