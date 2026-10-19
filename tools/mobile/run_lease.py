@@ -131,7 +131,7 @@ def touch_lease(run_id: str, session_id: str, *, now: float | None = None) -> di
         if status.get("error"):
             return status
         content = dict(status["content"] or {})
-        if content.get("state") == run_consts.HELD:
+        if content.get("state") == run_consts.HELD and not content.get("released"):
             refreshed = acquire_lease(
                 run_id, session_id, run_lease_core.LeaseOpts(now=now)
             )

@@ -39,12 +39,8 @@ def _line(template: dict, at: int) -> str:
     steps = template.get("steps") or []
     after = (template.get("meta") or {}).get("after") or []
     land = after[at] if at < len(after) else ""
-    return "%d. %s %s -> %s" % (
-        at + 1,
-        steps[at].get("op"),
-        _target(steps[at]),
-        short(land),
-    )
+    head = "%d. %s %s" % (at + 1, steps[at].get("op"), _target(steps[at]))
+    return head + (" -> " + short(land) if land else "")
 
 
 def done_lines(head: Head, pos: int) -> list:

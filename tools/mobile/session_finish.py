@@ -157,8 +157,9 @@ async def _restore_run_state(owner: str) -> tuple[dict, dict, dict]:
     ):
         await ime.disarm(serial_of(owner) or "")
     if locks.is_provisioning_owner(owner):
-        # Only the early a11y reader can be owned here (a no-op without a record).
-        return {}, {}, await a11y.restore(owner)
+        # Only the early keyboard and reader can be owned here (no-ops without a record).
+        restored = await ime_session.restore(owner)
+        return restored, {}, await a11y.restore(owner)
     restored = await ime_session.restore(owner)
     # The run's animation scales go back too, on the same chokepoint and for the
     # same reason: every teardown path reaches this function.

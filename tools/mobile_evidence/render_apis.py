@@ -6,7 +6,7 @@ from collections import Counter
 
 from tools.mobile_evidence.render_esc import MAX_ROWS, ev_esc, status_label
 from tools.mobile_evidence.render_html import empty
-from tools.mobile_evidence.render_view import content_of, has_evidence
+from tools.mobile_evidence.render_view import content_of, has_evidence, no_log_lead
 
 
 def _endpoint_path(b: dict) -> str:
@@ -88,7 +88,8 @@ def apis_section(loaded: object) -> str:
     content = content_of(loaded)
     if not has_evidence(loaded):
         return empty(
-            "no app log captured, so no endpoint is known: "
+            no_log_lead(content)
+            + ", so no endpoint is known: "
             + str(content.get("reason") or "")
         )
     rows = endpoint_rows(content)

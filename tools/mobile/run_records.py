@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from tools.mobile import run_io, run_store
+from tools.mobile import locks_state, run_io, run_list, run_store
 
 PathFn = Callable[[str], Path]
 
@@ -35,7 +35,7 @@ class StaleScan:
 
 
 def record_path(run_id: str, record_file: str) -> Path:
-    return run_store.run_path(str(run_id)) / record_file
+    return run_store.run_path(locks_state.record_segment(run_id)) / record_file
 
 
 def read_record(site: RecordSite, run_id: str) -> dict:
@@ -63,6 +63,7 @@ def clear_record(site: RecordSite, run_id: str) -> None:
             target.unlink()
     except Exception:
         site.log.exception("%s.clear_record failed", site.prefix)
+    drop_empty_prerun(run_id)
 
 
 def _matches(scan: StaleScan, run_id: str) -> dict | None:
@@ -75,9 +76,10 @@ def _matches(scan: StaleScan, run_id: str) -> dict | None:
 def _scan_runs(scan: StaleScan) -> list:
     out: list = []
     listed = run_store.list_runs(scan.scan_limit, gc=False) or {}
-    for row in listed.get("content") or []:
-        run_id = str((row or {}).get("run_id") or "")
-        if not run_id or run_id == str(scan.skip_run_id or ""):
+    ids = [str((row or {}).get("run_id") or "") for row in listed.get("content") or []]
+    mine = locks_state.record_segment(scan.skip_run_id)
+    for run_id in ids + run_list.prerun_ids():
+        if not run_id or run_id == mine:
             continue
         found = _matches(scan, run_id)
         if found is not None:
@@ -94,3 +96,31 @@ def stale_records(scan: StaleScan) -> list:
     except Exception:
         scan.log.exception("%s.stale_records failed", scan.prefix)
     return out
+
+
+def move_record(site: RecordSite, owner: str, run_id: str) -> bool:
+    """Move *owner*'s record to *run_id*. ``False`` when there was none, or the
+    copy was not written (then the owner keeps it, so a restore still finds it)."""
+    body = read_record(site, owner)
+    if not body:
+        return False
+    if write_record(site, run_id, body).get("error"):
+        site.log.warning(
+            "%s: record of %s not handed to %s", site.prefix, owner, run_id
+        )
+        return False
+    clear_record(site, owner)
+    return True
+
+
+def drop_empty_prerun(owner: str) -> None:
+    """Remove a pre-run owner's ``runs/prerun-*`` folder once nothing is left in it."""
+    segment = locks_state.record_segment(owner)
+    if not segment.startswith(locks_state.PRERUN_DIR_PREFIX):
+        return
+    try:
+        folder = run_store.run_path(segment)
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+    except (OSError, ValueError):
+        logging.getLogger(__name__).warning("pre-run folder %s not removed", segment)

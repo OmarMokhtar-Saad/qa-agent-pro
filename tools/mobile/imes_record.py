@@ -6,7 +6,7 @@ import logging
 import time
 
 from config.settings_guard import never_raise
-from tools.mobile import run_io, run_records, run_store
+from tools.mobile import run_io, run_records
 
 logger = logging.getLogger("tools.mobile.ime_session")
 
@@ -37,6 +37,20 @@ def _site() -> run_records.RecordSite:
     return run_records.RecordSite(record_path, logger, "mobile.ime_session")
 
 
+def _fallback_path(run_id: str):
+    return run_records.record_path(run_id, FALLBACK_FILE)
+
+
+def adopt(owner: str, run_id: str) -> bool:
+    """Hand the keyboard record (and a memoised failure) the pre-run *owner* wrote
+    to *run_id*: the run's own ``ensure_ready`` finds the keyboard already
+    selected and remembers nothing, so the record must be on the run already."""
+    moved = run_records.move_record(_site(), owner, run_id)
+    fallback = run_records.RecordSite(_fallback_path, logger, "mobile.ime_session")
+    run_records.move_record(fallback, owner, run_id)
+    return moved
+
+
 def read_record(run_id: str) -> dict:
     """The run's IME record, or ``{}``. Never raises."""
     return run_records.read_record(_site(), run_id)
@@ -59,7 +73,7 @@ def read_fallback(run_id: str) -> dict:
     with never_raise(
         logger, "mobile.ime_session.read_fallback failed", exc_info=True
     ) as g:
-        body = run_io.read_json(run_store.run_path(str(run_id)) / FALLBACK_FILE)
+        body = run_io.read_json(run_records.record_path(run_id, FALLBACK_FILE))
     if g.failed:
         return {}
     if not isinstance(body, dict):
@@ -76,6 +90,6 @@ def write_fallback(run_id: str, reason: str) -> None:
         return
     with never_raise(logger, "mobile.ime_session.write_fallback failed", exc_info=True):
         run_io.write_json(
-            run_store.run_path(str(run_id)) / FALLBACK_FILE,
+            run_records.record_path(run_id, FALLBACK_FILE),
             {"error": str(reason)[:600], "at": time.time()},
         )

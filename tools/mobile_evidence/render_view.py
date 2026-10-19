@@ -18,6 +18,13 @@ def has_evidence(loaded: object) -> bool:
     return content_of(loaded).get("source") != "none"
 
 
+def no_log_lead(content: dict) -> str:
+    """Why a section has no app log: logcat-only runs still captured logcat."""
+    if content.get("events_source") == "logcat-only":
+        return "no app event log (no profile); logcat captured by pid"
+    return "no app log captured"
+
+
 def view_of(loaded: object, tc_id: object) -> dict | None:
     return content_of(loaded).get("by_case", {}).get(str(tc_id or ""))
 

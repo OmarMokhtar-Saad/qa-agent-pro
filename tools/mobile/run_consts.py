@@ -32,6 +32,10 @@ SECRET_VALUE_KEYS: tuple[str, ...] = (
     "secret_value",
 )
 
+#: The ``runs/`` folder prefix of a pre-run owner's records
+#: (see ``locks_state.record_segment``); run listings hide these folders.
+PRERUN_DIR_PREFIX = "prerun-"
+
 #: A lease whose heartbeat is older than this is up for grabs.
 LEASE_STALE_S = 120
 #: How long a cached (package, serial) resolution for one task/app is trusted

@@ -36,7 +36,8 @@ def trim_keeping(schema: dict, keep: tuple[str, ...]) -> dict:
     """:func:`trim_schema`, but each ``$defs`` entry named in *keep* keeps its
     ``description`` -- guidance the model has no other copy of."""
     out = trim_schema(schema)
-    assert isinstance(out, dict)
+    if not isinstance(out, dict):
+        raise TypeError("trim_keeping needs a schema object, got " + type(out).__name__)
     defs = schema.get("$defs") or {}
     for name in keep:
         text = (defs.get(name) or {}).get("description")

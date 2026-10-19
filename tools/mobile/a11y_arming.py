@@ -46,6 +46,19 @@ async def _parity(serial: str, xml: str) -> dict:
     return compare(xml, str(slow.get("content") or ""))
 
 
+#: Pre-run owner -> the run its record was handed to (``a11y_adopt.adopt``): a
+#: deferred check that fails after the hand-off restores the run's record.
+_HANDED: dict[str, str] = {}
+
+
+def handed_to(owner: str, run_id: str) -> None:
+    _HANDED[str(owner)] = str(run_id)
+
+
+def _holder(run_id: str) -> str:
+    return _HANDED.pop(run_id, run_id)
+
+
 def deferred(inner: Provider, run_id: str) -> Provider:
     """*inner*, holding back every tree until the first readable one passes parity."""
     step_timing.note(DEFERRED_NOTE)
@@ -57,9 +70,10 @@ def deferred(inner: Provider, run_id: str) -> Provider:
             return got
         checked = await _parity(str(serial), str(got["content"]))
         if checked.get("error"):
-            await restore(pending["run_id"])
+            await restore(_holder(pending["run_id"]))
             why = str(checked["error"])[:160]
             return {"error": FAILED_REFUSAL + " (" + why + ")", "content": None}
+        _holder(pending["run_id"])
         pending.clear()
         step_timing.note(CHECKED_NOTE)
         return got

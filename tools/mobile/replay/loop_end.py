@@ -62,6 +62,23 @@ def _no_done_reason(ended_verified: bool, summary: str, asserts_expected: bool) 
     return _REASON_EXPLORATORY
 
 
+def _rests_on_new_text(trace: list[dict]) -> bool:
+    """True when every passed assert was ``new_text`` -- the weakest check."""
+    kinds = [
+        str((item.get("action") or {}).get("kind") or "")
+        for item in trace
+        if item.get("outcome") == "assert_pass" and isinstance(item.get("action"), dict)
+    ]
+    return bool(kinds) and all(kind == "new_text" for kind in kinds)
+
+
+def _lead_word(reason: str, trace: list[dict]) -> str:
+    """ "Passed" for a pass that rests only on new text: it was not verified."""
+    if reason.startswith("Verified: ") and _rests_on_new_text(trace):
+        return "Passed: " + reason[len("Verified: ") :]
+    return reason
+
+
 # A script that never calls done() lands here. It used to hand back an
 # empty verdict, which `case_runner` reads as PASS -- so omitting one word
 # bypassed the whole verification rule the done() branch enforces. The same
@@ -85,6 +102,7 @@ def _end_of_script(run: _ReplayRun, screen: dict | None) -> dict:
     ended_verified = _has_verification(trace)
     summary = _verification_summary(trace)
     reason = _no_done_reason(ended_verified, summary, ctx.asserts_expected)
+    reason = _lead_word(reason, trace)
     inert = inert_ops(trace)
     if inert:
         reason = (NOTHING_MOVED_NOTE % ", ".join(inert)) + reason

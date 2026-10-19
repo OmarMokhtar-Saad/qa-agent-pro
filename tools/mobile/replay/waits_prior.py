@@ -9,6 +9,8 @@ The hash lives in ``ctx.env`` (per replay, so nothing leaks between runs).
 
 from __future__ import annotations
 
+import re
+
 from tools.mobile import a11y_events
 from tools.mobile.replay.context import Context
 
@@ -58,12 +60,22 @@ def clear_action(ctx: Context) -> None:
     env.pop(_GONE, None)
 
 
+_LOADING = re.compile(r"progress|spinner|loading|lottie|shimmer|skeleton", re.I)
+
+
+def _loading_row(row: object) -> bool:
+    """A node whose class, role or description names a generic loading indicator."""
+    if not isinstance(row, dict):
+        return False
+    return any(_LOADING.search(str(row.get(k) or "")) for k in ("cls", "role", "desc"))
+
+
 def _spinning(screen: object) -> bool:
-    """A screen showing a progress bar: a transient state, not the change we wait for."""
+    """A screen showing a loading indicator: a transient state, not the change we
+    wait for. Matches generic Android loading names (``ProgressBar`` subclasses,
+    spinner/Lottie/shimmer views, a ``progress``/``loading`` role or description)."""
     rows = screen.get("elements") if isinstance(screen, dict) else None
-    return any(
-        "ProgressBar" in str(r.get("cls")) for r in rows or [] if isinstance(r, dict)
-    )
+    return any(_loading_row(r) for r in rows or [])
 
 
 def already_changed(ctx: Context, now_hash: str, screen: object = None) -> bool:

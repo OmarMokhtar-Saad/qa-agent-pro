@@ -9,7 +9,7 @@ from tools.mobile_evidence import render_esc as esc
 from tools.mobile_evidence.render_block import Kpi, SecHead, gap_kpi, kpi, sec_block
 from tools.mobile_evidence.render_html import empty
 from tools.mobile_evidence.render_perf_models import perf_models_figure
-from tools.mobile_evidence.render_view import content_of, has_evidence
+from tools.mobile_evidence.render_view import content_of, has_evidence, no_log_lead
 
 _ENDPOINT_HEAD = (
     '<p class="hint">Sort any column. Typical is the middle time; slower runs is the time 19 calls in 20 came in under (p50 and p95).</p>'
@@ -158,7 +158,8 @@ def perf_extra(loaded: object) -> str:
     content = content_of(loaded)
     if not has_evidence(loaded):
         return empty(
-            "no app log captured, so nothing the app did could be timed: "
+            no_log_lead(content)
+            + ", so nothing the app did could be timed: "
             + str(content.get("reason") or "")
         )
     ev = content["evidence"]

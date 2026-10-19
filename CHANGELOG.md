@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.138.0] - 2026-10-19
+## [1.138.1] - 2026-10-19
 
 ### Added
 
@@ -33,28 +33,28 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- App Tester now reads the screen with the fast accessibility reader:
-  it is switched on before App Tester starts and handed to the run,
-  and switched off again if the run stops before it begins.
-- "App missing" and "app present but its version is unreadable" are
-  now two separate reasons.
-- An empty screen read is logged with details and tried once more
-  when the read was quick.
-- Start-up shows progress notes (accessibility on, App Tester scan,
-  hand-off).
-- A wait for the screen to change checks the fast reader against a
-  full screen read every few seconds.
-- A wait for text to appear now gives up early (not found) after 10 s
-  of a quiet screen, unless a loading spinner shows; a wait for text to
-  go away never ends early.
-- Fewer slow device calls while the screen stays the same.
-- A case whose only checks were "X is gone" now says so instead of
-  "asserted nothing".
-- A field that read back empty before the screen moved on counts as
-  unconfirmed, not verified, in the header tally.
-- Step labels no longer name the MCP middleware.
-- Later case packets are about a third smaller: the action schema
-  no longer carries internal docs and titles.
+- The fast accessibility reader now really comes on before App Tester:
+  the QA keyboard is selected first, then the reader is switched on,
+  and the log says why when it stays off.
+- Keyboard and accessibility records made before a run starts no
+  longer fail on the run label; they are moved to the run when it
+  starts, and a later run cleans them up if that run never started.
+- When a run stops before it begins, the keyboard is restored before
+  accessibility.
+- A replay step no longer counts screen furniture as "new text"; a
+  replay that ends without a verdict and rests only on new text says
+  "Passed:", not "Verified:".
+- A replay step that was not tapped because the screen did not match
+  says "Did not tap" and its outcome is "not run (screen not as
+  saved)"; the route line no longer ends in " -> ?".
+- A heartbeat no longer brings a released device lease back.
+- A failed screen-recording copy names the step and the reason
+  (copy failed, empty, or too big) in the evidence note.
+- For an app with no profile, evidence pages say the device log was
+  captured, instead of "no app log captured".
+- Granting app permissions is described as test setup.
+- A wait for text to appear also treats Lottie, shimmer and skeleton
+  placeholders as loading and does not end early on them.
 
 ### Known
 
@@ -73,8 +73,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
   longer saved; the pop-up is answered by the dialog handler on replay.
 - On a device without the QA keyboard, the first run's App Tester
   scan still uses the slower uiautomator dump.
-- A loading screen with no standard progress bar (custom animation
-  or splash image) can still end a wait for text early after 10 s.
+- A custom loading animation or splash image that is not marked as
+  progress, spinner, Lottie, shimmer or skeleton can still end a wait
+  for text early after 10 s.
+- A screen recording can still come back empty when the device has
+  not finished writing it; the evidence note now says so.
+- Replay steps can still be slow on screens that need several
+  probes; this is being profiled.
 - Old saved routes that do nothing are cleaned up only when a new
   route is saved.
 - The fallback keyboard cannot read the field back, so its fill proof

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from tools.mobile.a11y_arming import handed_to
 from tools.mobile.a11y_enable import _RUNS
 from tools.mobile.a11y_record import clear_record, read_record, write_record
 
@@ -23,6 +24,7 @@ def adopt(owner: str, run_id: str) -> bool:
         logger.warning("mobile.a11y: record of %s not handed to %s", owner, run_id)
         return False
     clear_record(owner)
+    handed_to(owner, run_id)
     serial = _RUNS.pop(str(owner), "") or str(record.get("serial") or "")
     if serial:
         _RUNS[str(run_id)] = serial

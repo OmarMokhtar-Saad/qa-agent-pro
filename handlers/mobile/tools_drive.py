@@ -62,13 +62,13 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
         confirm_destructive: bool = False,
         tester_inputs: str = "",
     ) -> list[ContentBlock]:
-        """Drive an Android device: an exploration run toward goal=..., or cases.
+        """Drive an Android device: explore toward goal=..., or run cases.
 
         ANY Android device action goes through this tool. Do NOT use raw adb or shell: it owns the destructive guard and evidence.
 
-        Pass the task as `goal` on the FIRST call. One call does the preflight itself (device, unlock, install); no list_devices/status unless asked. Install/launch/grants run by default; `dry_run=true` previews only; `grant_permissions=false` keeps permission prompts. Answer packets with qa_submit_mobile_step: taps settle; batch ops (fill, fill, tap; `tap_text_if_present` for popups). `source`: install key, `app`/`package`: its value; `device_id`: adb serial; `avd`: to boot; `charter`: JSON, no secrets; new_run=true only if asked. `note`: JSON {"text","kind":wait|avoid,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app.
+        Pass the task as `goal` on the FIRST call. One call does the preflight itself (device, unlock, install): no list_devices/status first. Install/launch/grants by default; `dry_run=true` previews only; grants are test setup, not a settings change; `grant_permissions=false` only for prompt tests. Answer packets with qa_submit_mobile_step: taps settle; batch ops (`tap_text_if_present` for popups). `source`: install key, `app`/`package`: its value; `device_id`: adb serial; `avd`: to boot; `charter`: JSON, no secrets; new_run=true only if asked. `note`: JSON {"text","kind":wait|avoid,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app.
 
-        Report only what a qa_* observation read. If the server cannot type or act, stop and name the blocker; no raw adb, no claimed result. Never mark an unexercised check passed; ask before skipping a step. Prove the destination positively, not only text_absent. Relay a finished run's verdict verbatim; device released: no status/stop. Never guess app, package or device."""
+        Report only what a qa_* observation read. If the server cannot type or act, stop and name the blocker; no raw adb, no claimed result. Never mark an unexercised check passed; ask before skipping a step. Prove the destination, not only text_absent. Relay a finished run's verdict verbatim; device released: no status/stop. Never guess app, package or device."""
         fields = {k: v for k, v in locals().items() if k not in _TEST_UNSENT}
         fields["serial"] = rt._device_ref(device_id, serial)
         blocks = await rt._mobile_reply(

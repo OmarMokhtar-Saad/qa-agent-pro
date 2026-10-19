@@ -7,7 +7,6 @@ from typing import Any, NamedTuple
 from tools.mobile import actions as actions_mod
 from tools.mobile.replay.elements import missing_element_detail
 from tools.mobile.replay.screen import (
-    _digit_shape,
     _is_furniture,
     _screen_has,
     _screen_id,
@@ -83,24 +82,18 @@ def _assert_element(action: Any, screen: Any) -> tuple[bool, str]:
 # 1. What this script TYPED. A chat composer echoes your question into
 #    the thread, so `[type, tap send, assert new_text]` passed on an app
 #    that never answered -- on the most ordinary screen there is.
-# 2. Furniture that only CHANGED. A clock going 10:42 -> 10:43 is a new
-#    string and is not new content. Recognised without a threshold: an
-#    added string whose digits normalise onto a string that was there
-#    before is a mutation of what was already on screen.
+# 2. Furniture. A clock going 10:42 -> 10:43, or a countdown that shows up
+#    after the tap, is a new string and is not new content. A string with
+#    no letter in it is something that ticks, so it is dropped whether or
+#    not the baseline held one.
 def _new_text_added(screen: Any, trace: list[dict], baseline: Any) -> list:
     """The strings on *screen* that count as a reply since *baseline*."""
     added = sorted(_texts(screen) - set(baseline))
     typed = _typed_by_script(trace)
     added = [item for item in added if item not in typed]
-    before_shapes = {
-        _digit_shape(item) for item in set(baseline) if _is_furniture(item)
-    }
-    # ONE condition, not two. The bound belongs on the BASELINE side -- only
-    # a string that was already furniture can be furniture that ticked -- and
-    # a second copy of it on the added side decided nothing, which mutation
-    # proved by deleting it and changing no result. A guard nothing can kill
-    # is not a guard.
-    return [item for item in added if _digit_shape(item) not in before_shapes]
+    # Furniture is never a reply, baseline or not: a countdown that appears
+    # AFTER the tap ('02:59' on an OTP screen) is a clock, not an answer.
+    return [item for item in added if not _is_furniture(item)]
 
 
 def _new_text_reply(added: list) -> str:

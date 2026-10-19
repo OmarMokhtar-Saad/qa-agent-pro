@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from tools.mobile.replay.screen_has import (  # noqa: F401
     _DIGITS_RE,
-    _digit_shape,
     _has_verification,
     _is_furniture,
     _screen_has,

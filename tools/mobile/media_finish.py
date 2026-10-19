@@ -123,6 +123,29 @@ async def _finish_step_pull(job: _PullJob) -> None:
     await _pull_into(job, await _stop_recorder(job.serial, job.held))
 
 
+def _pull_note(seq: object, pulled: dict, size: int) -> str:
+    """Step-numbered reason a pull gave no usable file: empty pull vs copy failed."""
+    body = pulled.get("content") or {}
+    rc = int(body.get("rc") or 0) if isinstance(body, dict) else 0
+    if pulled.get("error") or rc:
+        return "step %s: copy failed (rc=%s, error=%s)" % (seq, rc, pulled.get("error"))
+    if not size:
+        return (
+            "step %s: empty pull (rc=0, 0 bytes; recorder may not be finalised)" % seq
+        )
+    return "step %s: clip %d bytes exceeds the %d byte cap" % (
+        seq,
+        size,
+        MAX_CLIP_BYTES,
+    )
+
+
+def _set_pull_failed(clipped: dict, pulled: dict, size: int) -> None:
+    clipped["state"] = PULL_FAILED
+    clipped["note"] = _pull_note(clipped.get("seq"), pulled, size)
+    logger.warning("media pull failed: %s", clipped["note"])
+
+
 async def _pull_into(job: _PullJob, closed: bool) -> None:
     """Pull the (already stopped) clip to the target and set the clip record's state."""
     serial, held, target, clipped = job
@@ -130,11 +153,10 @@ async def _pull_into(job: _PullJob, closed: bool) -> None:
     pulled = await adb.pull(serial, remote, str(target))
     await adb.shell(serial, ["rm", "-f", remote], MAX_STOP_WAIT_S)
     size = target.stat().st_size if target.is_file() else 0
-    if _pull_failed(pulled, size):
-        clipped["state"] = PULL_FAILED
-    elif size > MAX_CLIP_BYTES:
+    if size > MAX_CLIP_BYTES:
         target.unlink(missing_ok=True)
-        clipped["state"] = PULL_FAILED
+    if _pull_failed(pulled, size) or size > MAX_CLIP_BYTES:
+        _set_pull_failed(clipped, pulled, size)
     else:
         clipped["state"] = OK if closed else TRUNCATED
         clipped["file"] = target.name

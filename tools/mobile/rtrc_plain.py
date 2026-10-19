@@ -152,9 +152,30 @@ def _element_of(target_id: object, screen: object) -> dict:
     return {}
 
 
+#: Outcomes of a step refused BEFORE anything was actuated.
+_NOT_RUN = ("route_mismatch", "screen_mismatch")
+
+_DID_NOT = {
+    "Tapped ": "Did not tap ",
+    "Long-pressed ": "Did not long-press ",
+    "Cleared ": "Did not clear ",
+}
+
+
+def _step_words(row: dict, library: object) -> list:
+    """The row's plain words; a step refused before actuation says it did not run."""
+    words = list(_named_words(row, library))
+    if str(row.get("outcome") or "") not in _NOT_RUN or not words:
+        return words
+    first = words[0]
+    if isinstance(first, str) and first in _DID_NOT:
+        return [_DID_NOT[first]] + words[1:]
+    return ["Did not run: "] + words
+
+
 # The row's plain words, naming its target from the before screen when
 # the trace itself recorded only the element's id.
-def _step_words(row: dict, library: object) -> list:
+def _named_words(row: dict, library: object) -> list:
     """The row's plain words, naming its target from the before screen when needed."""
     action: Any = row.get("act") if isinstance(row.get("act"), dict) else {}
     target = action.get("target") if isinstance(action.get("target"), dict) else {}

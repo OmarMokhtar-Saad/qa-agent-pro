@@ -12,6 +12,8 @@ import secrets
 import threading
 from dataclasses import dataclass
 
+from tools.mobile import run_consts
+
 
 class LockUnsupported(RuntimeError):
     """Neither locking primitive exists on this platform."""
@@ -65,6 +67,19 @@ def new_provisioning_owner() -> str:
     an identity.
     """
     return "%s%d:%s" % (PROVISIONING_PREFIX, os.getpid(), secrets.token_hex(4))
+
+
+#: The ``runs/`` folder prefix of a pre-run owner's records (see :func:`record_segment`).
+PRERUN_DIR_PREFIX = run_consts.PRERUN_DIR_PREFIX
+
+
+def record_segment(owner: object) -> str:
+    """The ``runs/`` folder name for *owner*'s records: a run id as is, a pre-run
+    owner made path-safe (its ``:`` is not a path character ``run_dir`` accepts)."""
+    label = str(owner or "")
+    if not is_provisioning_owner(label):
+        return label
+    return PRERUN_DIR_PREFIX + label[len(PROVISIONING_PREFIX) :].replace(":", "-")
 
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")

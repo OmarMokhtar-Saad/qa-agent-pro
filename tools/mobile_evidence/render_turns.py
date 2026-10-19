@@ -5,7 +5,12 @@ from __future__ import annotations
 from tools.mobile_evidence import render_esc as esc
 from tools.mobile_evidence.render_block import SecHead, sec_block
 from tools.mobile_evidence.render_html import empty, pill
-from tools.mobile_evidence.render_view import content_of, has_evidence, view_of
+from tools.mobile_evidence.render_view import (
+    content_of,
+    has_evidence,
+    no_log_lead,
+    view_of,
+)
 
 _TABLE_HEAD = (
     '<div class="tablewrap"><table class="cov turns"><thead><tr><th scope="col">#</th>'
@@ -85,7 +90,9 @@ def _missing(why: str, note: str) -> str:
 def turns_table(loaded: object, tc_id: object) -> str:
     content = content_of(loaded)
     if not has_evidence(loaded):
-        why = "no app log captured for this run: " + str(content.get("reason") or "")
+        why = (
+            no_log_lead(content) + " for this run: " + str(content.get("reason") or "")
+        )
         return _missing(why, "what the app did is not available")
     view = view_of(loaded, tc_id)
     if not view or not view["turns"]:

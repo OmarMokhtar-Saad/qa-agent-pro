@@ -103,18 +103,23 @@ def _list_files(run: Run) -> tuple[Any, dict | None]:
     return files, None
 
 
+def _no_profile(run: Run, package: str) -> dict:
+    """The no-profile refusal; a logcat-only capture is named, not denied."""
+    name = package or "(no package)"
+    if run.manifest.get("events_source") == "logcat-only":
+        reason = "no profile for " + name
+        return none_content(reason, run.cases, {"events_source": "logcat-only"})
+    reason = "no app log captured for " + name + ": no profile for this package"
+    return none_content(reason, run.cases)
+
+
 def evidence_files(run: Run) -> tuple[Any, dict | None]:
     """(files, None) when the run can be read, else (None, the refusal)."""
     package = str(run.manifest.get("package") or "")
     if not getattr(settings_port.get(), "qa_mobile_app_evidence", True):
         return None, none_content(esc.FLAG_OFF_REASON, run.cases)
     if run.profile is None:
-        return None, none_content(
-            "no app log captured for "
-            + (package or "(no package)")
-            + ": no profile for this package",
-            run.cases,
-        )
+        return None, _no_profile(run, package)
     return _list_files(run)
 
 

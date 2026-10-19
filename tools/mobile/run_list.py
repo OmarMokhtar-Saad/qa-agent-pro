@@ -41,12 +41,28 @@ def _run_row(child: Path) -> dict:
     }
 
 
+def _is_run_dir(child: Path) -> bool:
+    """A run's folder: a valid id that is not a pre-run owner's records."""
+    name = child.name
+    prerun = name.startswith(run_consts.PRERUN_DIR_PREFIX)
+    return child.is_dir() and run_io.valid_run_id(name) and not prerun
+
+
+def prerun_ids() -> list[str]:
+    """The ``runs/`` folders holding a pre-run owner's records (for stale sweeps)."""
+    root = paths.sub("runs")
+    if not root.is_dir():
+        return []
+    prefix = run_consts.PRERUN_DIR_PREFIX
+    return sorted(c.name for c in root.iterdir() if c.name.startswith(prefix))
+
+
 def _run_rows() -> list[dict]:
     root = paths.sub("runs")
     out: list[dict] = []
     if root.is_dir():
         for child in root.iterdir():
-            if child.is_dir() and run_io.valid_run_id(child.name):
+            if _is_run_dir(child):
                 out.append(_run_row(child))
     out.sort(key=lambda item: float(item.get("modified") or 0), reverse=True)
     return out
