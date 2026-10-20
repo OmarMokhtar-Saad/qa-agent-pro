@@ -8,7 +8,7 @@ from typing import NamedTuple
 from config.settings_guard import never_raise
 from handlers import mcp_srv_state
 from handlers.mcp_srv_client import _note_client
-from handlers.mcp_srv_drift import _inflight_enter, _inflight_exit
+from handlers.mcp_srv_drift import _inflight_enter
 from handlers.mcp_srv_state import logger
 from tools import audit_log, audit_port, dispatch_guard, telemetry, tool_status
 from tools.telemetry import ErrorReport, ToolCall
@@ -135,17 +135,21 @@ def _open_tool_call(name, ctx) -> tuple:
 
 
 async def _close_tool_call(name, start, run) -> None:
-    """Everything `_tracked` does after the handler: settle, log, audit, emit,
-    then release the dispatch and in-flight slots (LAST, see the comment)."""
-    ok, error_type, status_token, dispatch_token = run
+    """Everything `_tracked` does after the handler: settle, log, audit, emit.
+
+    The dispatch and in-flight slots are released by `_tracked` itself, LAST
+    and in its own task: releasing them earlier would let a drift restart fire
+    while telemetry and FastMCP's result serialization still had work to do,
+    and os._exit does not flush buffered stdout.
+
+    Runs shielded (fix/1520), i.e. in a COPY of the caller's context, so
+    `tool_status.finish` cannot reset the marks token there (it swallows the
+    ValueError) and the caller's context keeps its marks list until the next
+    `begin()` replaces it. Harmless, and known."""
+    ok, error_type, status_token = run
     duration_ms = int((time.monotonic() - start) * 1000)
     ok, error_type, degraded = _settle_outcome(ok, error_type, status_token)
     o = _ToolOutcome(name, ok, error_type, degraded, duration_ms)
     _log_tool_line(o)
     await _audit_tool_call(o)
     _emit_tool_telemetry(o)
-    # LAST in the finally: releasing the slot earlier would let a drift
-    # restart fire while telemetry and FastMCP's result serialization still
-    # had work to do, and os._exit does not flush buffered stdout.
-    dispatch_guard.exit_dispatched(dispatch_token)
-    _inflight_exit()

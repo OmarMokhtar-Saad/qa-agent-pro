@@ -6,6 +6,7 @@ import tools.mobile.device_lock as device_lock
 import tools.mobile.session_finish as session_finish
 from handlers.mobile.run_hooks import mobile_run
 from handlers.mobile.run_request import _MobileTestRequest
+from tools.mobile import prerun_inflight
 from tools.mobile import render as mobile_render
 
 # ---------------------------------------------------------------------------
@@ -118,22 +119,6 @@ async def _mobile_lock_device(owner: str, serial: str) -> tuple[str, str]:
     return idle_note, serial
 
 
-async def _mobile_finish_pre_run(owner: str) -> None:
-    """Give back this call's own pre-run hold, for a call that handed nothing off."""
-
-    # Only ever THIS call's own label, so a sibling call's hold
-    # cannot be released here. `as_holder` is stated because the
-    # placeholder has no lease to present -- this call minted the
-    # label and is unambiguously its owner.
-    # The pre-run placeholder never typed, but it may own the
-    # early a11y reader: the restore inside this gives that back
-    # (a no-op without a record). It goes through the
-    # same door anyway, so the "no direct release in this
-    # file" pin can be absolute rather than a list of
-    # exceptions somebody has to keep correct.
-    await session_finish.finish_device(owner, as_holder=True)
-
-
 async def _new_run_open(req: _MobileTestRequest) -> tuple[str, str, str]:
     """``(picked, owner, early_reply)``: pick the source, then take the select lock."""
 
@@ -145,6 +130,9 @@ async def _new_run_open(req: _MobileTestRequest) -> tuple[str, str, str]:
     taken = (session_finish.take_select_lock(owner) or {}).get("content") or {}
     if not taken.get("acquired"):
         return picked, owner, mobile_render.device_busy_block(taken)
+    # From here the hold is this call's and its setup call is RUNNING; the
+    # heal in `take_device_lock` leaves a running owner alone (fix/1520).
+    prerun_inflight.enter(owner)
     return picked, owner, ""
 
 

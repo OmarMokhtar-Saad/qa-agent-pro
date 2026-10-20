@@ -27,8 +27,10 @@ across both; that is a known cost, not a bug.
 
 from __future__ import annotations
 
+import time
+
 from config.settings_guard import never_raise
-from tools.mobile import locks, run_store, session_resolve
+from tools.mobile import locks, prerun_inflight, run_store, session_resolve
 from tools.mobile.session_core import STATE_REPORT
 
 _NO_LOCK_TEXT = (
@@ -44,10 +46,27 @@ _ONE_LOCK_NOTE = (
     "chosen and booted before any serial exists, so there is nothing to key "
     "a per-device lock on at the moment it matters most."
 )
-_PROVISIONING_TAIL = (
-    " — the device is being picked, booted or the app installed. "
-    "That step finishes within the call that started it, so call "
-    "`qa_mobile_test` again in a moment."
+_PROVISIONING_HEAD = "A run is being set up on this device right now"
+_PROVISIONING_RUNNING = (
+    " in this same server, started {age} s ago — the device is being picked, "
+    "booted or the app installed, and that setup call is still running. "
+    "`qa_mobile_status` shows it; call `qa_mobile_test` again once it ends. "
+    "Restarting the editor's MCP server ends it."
+)
+_PROVISIONING_STALE = (
+    "A run was being set up on this device in this same server, but that "
+    "setup call has ended: the hold is stale and is given back on the next "
+    "`qa_mobile_test`, so call it again now."
+)
+_PROVISIONING_TOOL = (
+    " in this same server by another tool call (a capture setup or teardown); "
+    "it gives the device back when that call ends, so call `qa_mobile_test` "
+    "again then."
+)
+_PROVISIONING_OTHER = (
+    " by another chat (server pid {pid} on this machine). It ends when that "
+    "setup call ends or that server exits; quitting that editor frees the "
+    "device at once."
 )
 _UNKNOWN_HOLDER = (
     "Another process on this machine holds it. `qa_mobile_status` lists "
@@ -96,12 +115,33 @@ def _holder_finished(who: str) -> bool:
     return False
 
 
-def _provisioning_text(same: bool) -> str:
-    return (
-        "A run is being set up on this device right now"
-        + (" in this same server" if same else " by another chat")
-        + _PROVISIONING_TAIL
-    )
+def _hold_age(who: str) -> int:
+    """Seconds since THIS process took a lock under *who*; ``0`` when unknown."""
+    with locks._MUTEX:
+        since = [h.since for h in locks._HELD.values() if h.owner == who]
+    return max(0, int(time.time() - min(since))) if since else 0
+
+
+def _holder_pid(who: str) -> str:
+    """The pid inside a ``provisioning:<pid>:<hex>`` label, else ``"?"``."""
+    parts = who.split(":")
+    return parts[1] if len(parts) >= 2 and parts[1].isdigit() else "?"
+
+
+# THREE TRUTHS, not one promise (fix/1520). This used to say the step
+# "finishes within the call that started it, so call again in a moment";
+# a cancelled call left the hold for the life of the server, and every
+# retry read that line. Now the same-server hold says whether its call is
+# still running (and how old it is), a stale one says it is healed on the
+# next call, and another process's hold says which pid and what ends it.
+def _provisioning_text(who: str, same: bool) -> str:
+    if not same:
+        return _PROVISIONING_HEAD + _PROVISIONING_OTHER.format(pid=_holder_pid(who))
+    if prerun_inflight.is_inflight(who):
+        return _PROVISIONING_HEAD + _PROVISIONING_RUNNING.format(age=_hold_age(who))
+    if prerun_inflight.has_ended(who):
+        return _PROVISIONING_STALE
+    return _PROVISIONING_HEAD + _PROVISIONING_TOOL
 
 
 def _finished_text(who: str) -> str:
@@ -133,7 +173,7 @@ def _held_text(who: str) -> str:
 def _holder_paragraph(who: str, same: bool, finished: bool) -> str:
     """The paragraph that says who holds the device and what the tester can do."""
     if locks.is_provisioning_owner(who):
-        return _provisioning_text(same)
+        return _provisioning_text(who, same)
     if who and finished:
         return _finished_text(who)
     if who:

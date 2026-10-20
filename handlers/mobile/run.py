@@ -43,12 +43,12 @@ from handlers.mobile.run_locale import (
 )
 from handlers.mobile.run_new import (
     _mobile_claim_device,
-    _mobile_finish_pre_run,
     _new_run_open,
     _new_run_start,
 )
 from handlers.mobile.run_permission_hint import with_hint
 from handlers.mobile.run_prepare import _prepare_tail
+from handlers.mobile.run_prerun_end import _mobile_end_pre_run
 from handlers.mobile.run_request import (  # noqa: F401
     _app_call,
     _AppCall,
@@ -178,5 +178,4 @@ async def _mobile_new_run(req: _MobileTestRequest) -> str:
         reply, handed_off = await _new_run_start(req, (picked, owner, serial), prepared)
         return idle_note + await _start_notes(serial) + reply
     finally:
-        if not handed_off:
-            await _mobile_finish_pre_run(owner)
+        await _mobile_end_pre_run(owner, handed_off)

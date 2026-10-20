@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from handlers import _lane
+from handlers.mcp_srv_drift import _inflight_exit
 from handlers.mcp_srv_toolcall import _capture_error, _close_tool_call, _open_tool_call
-from tools import tool_briefs
+from tools import dispatch_guard, tool_briefs
 
 # Await a tool handler while emitting a best-effort telemetry
 # ``tool_called`` event (name, duration, ok/error_type, host client) and, on
@@ -39,15 +42,39 @@ async def _tracked(name, ctx, coro):
     error_type = None
     try:
         return await coro
+    except asyncio.CancelledError:
+        ok = False
+        error_type = "cancelled"
+        raise
     except Exception as exc:
         ok = False
         error_type = type(exc).__name__
         _capture_error(exc, name)
         raise
     finally:
-        await _close_tool_call(
+        await _close_then_release(
             name, start, (ok, error_type, status_token, dispatch_token)
         )
+
+
+# A cancelled call is NOT an Exception, so `_tracked` used to log it "ok"; it
+# now logs "error cancelled" (fix/1520). Under anyio's level-triggered cancel
+# every later await raises again, so an unshielded close died at its audit
+# await and the dispatch/in-flight slots never came back. The close runs as
+# its own task; the slots are released in `_tracked`'s own task (this
+# coroutine is awaited there, in the same context) because the dispatch token
+# is a ContextVar token and resets only in the context that made it, which a
+# shielded task (a context copy) is not.
+async def _close_then_release(name, start, run) -> None:
+    """Close the call in a task that outlives a cancel, then give the slots back."""
+    ok, error_type, status_token, dispatch_token = run
+    try:
+        await asyncio.shield(
+            _close_tool_call(name, start, (ok, error_type, status_token))
+        )
+    finally:
+        dispatch_guard.exit_dispatched(dispatch_token)
+        _inflight_exit()
 
 
 async def _tracked_noted(name, ctx, coro):

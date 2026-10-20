@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import locks, run_store
+from tools.mobile import device_lock_heal, locks, run_store
 from tools.mobile.device_lock_hold import DeviceRelease, _release_names  # noqa: F401
 from tools.mobile.device_lock_relabel import _move_all, _roll_back  # noqa: F401
 
@@ -108,7 +108,13 @@ def take_device_lock(owner: str, *, serial: str = "", lease: str = "") -> dict:
     name = _serial_for(label, serial)
     if not name:
         return _no_device(label)
-    return _take_checked(label, name, lease)
+    took = _take_checked(label, name, lease)
+    # A same-process pre-run hold whose setup call has ENDED can never be
+    # released by anyone else (fix/1520): heal it once, then retake once.
+    orphan = device_lock_heal.orphan_holder(took, label)
+    if orphan and device_lock_heal.release_orphan(name, orphan):
+        took = _take_checked(label, name, lease)
+    return took
 
 
 def release_device_lock(owner: str, opts: DeviceRelease | None = None) -> dict:

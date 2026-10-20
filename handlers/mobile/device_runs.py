@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from config.settings_guard import never_raise
+from handlers.mobile import device_setup_rows
 from tools.mobile import session_runs
 
 logger = logging.getLogger("tools.mcp_handlers")
@@ -13,11 +14,17 @@ logger = logging.getLogger("tools.mcp_handlers")
 def _mobile_status_listing() -> str:
     """The status reply when no run id was given: the newest runs on disk."""
 
+    # A device being set up has no run dir yet (fix/1520): list it first.
+    setting_up = "\n".join(device_setup_rows.setup_rows())
+    if setting_up:
+        setting_up += "\n\n"
     runs = (session_runs.list_runs(10) or {}).get("content") or []
     if not runs:
-        return "## No mobile runs yet\n\nCall `qa_mobile_test` to start one."
+        return (
+            setting_up + "## No mobile runs yet\n\nCall `qa_mobile_test` to start one."
+        )
     listed = "\n".join(_mobile_run_row(row) for row in runs)
-    return "## Mobile runs on this machine\n\n" + listed
+    return setting_up + "## Mobile runs on this machine\n\n" + listed
 
 
 def _run_row_head(row: object) -> tuple[str, str]:

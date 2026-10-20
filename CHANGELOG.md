@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.142.0] - 2026-10-20
+## [1.143.0] - 2026-10-20
 
 ### Added
 
@@ -33,36 +33,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Mobile steps are much faster. The server no longer sleeps a fixed
-  time between actions: it watches the QA keyboard's screen-event
-  counter, waits up to 1.5 s for the screen to start changing (none:
-  it answers at once), then until it has been still for 200 ms, with
-  a 3 s cap. At the cap the step still answers, with a note that the
-  screen is still changing so the chat can use wait-until-text.
-  Without the QA keyboard the same rule runs on screen-tree compares.
-  The picture-compare probe is gone from the wait loops.
-- The server talks to the adb server over one socket opened per run
-  instead of starting an adb process per command; it falls back to
-  the adb command when the socket is not available.
-- The app in front is read from the screen tree itself; the extra
-  window query runs only on the fallback path, once per poll.
-- No screenshot per step any more, neither in the reply nor in the
-  media clip. One PNG goes to the report at done, at a failed assert,
-  when a step asks for one, and when a screen has no readable
-  elements; the step text names the file. A reply never carries an
-  image.
-- The screen list is one short line per element (number, kind, text,
-  short id; bounds only when there is no text and no id), for the
-  visible part of the screen only, ending with "… N more below
-  (scroll)". The chat acts by the line number (#n); a number that is
-  not on the list is refused with a message that says how many lines
-  were shown.
-- The tool brief goes out once per chat and the response schema once
-  per run; later packets carry a one-line pointer. Tool descriptions
-  are shorter, with the details in that brief.
-- Packet guidance now asks the chat to do everything it can on the
-  current screen in one step (an action list) and not to guess across
-  screens.
+- A mobile setup call the chat cancels (device being picked, booted
+  or the app installed) gives the device back at once. Its clean-up
+  (accessibility and keyboard restore) finishes in the background, so
+  the next `qa_mobile_test` in the same chat is not refused with
+  "another run is using the device".
+- A setup hold left by this same server after its setup call ended
+  (a stale hold) is given back on the next `qa_mobile_test` instead
+  of blocking until the editor restarts.
+- `qa_mobile_status` lists a device this server is setting up (no run
+  id yet): the serial, the owner, how old the hold is, and whether
+  its setup call is still running or has ended.
+- The "another run is using the device" text says how old the hold
+  is and what ends it: the running setup call finishing, that server
+  exiting, or quitting the other editor.
+- The tool-call log marks a cancelled call "error cancelled" (it was
+  logged "ok"), and a cancelled call no longer keeps its dispatch and
+  in-flight slot, so later calls are not refused as busy.
 
 ### Known
 
