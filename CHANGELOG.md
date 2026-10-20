@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.145.0] - 2026-10-20
+## [1.145.1] - 2026-10-20
 
 ### Added
 
@@ -61,6 +61,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
   three-minute recording limit is no longer cut short.
 - Nothing is recorded while a step types a password or other
   credential, so the run video has a gap there.
+- A device recorder that ignores its stop is now killed on the device,
+  not left recording the steps that follow.
+- Deleting a recording segment on the device is retried once, and a
+  delete that still fails is logged.
+- A step clip recorded again under the same name is joined into the
+  run video again, instead of the old video being reused.
 
 ### Known
 

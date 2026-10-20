@@ -34,6 +34,23 @@ async def signal_recorder(serial: str, pid: object = None) -> None:
     await adb.shell(serial, ["pkill", "-INT", "screenrecord"], MAX_STOP_WAIT_S)
 
 
+async def kill_recorder(serial: str, pid: object = None) -> None:
+    """Kill, on the device, a recorder that ignored its interrupt (pid only)."""
+    if isinstance(pid, int) and pid > 0:
+        await adb.shell(serial, ["kill", "-9", str(pid)], MAX_STOP_WAIT_S)
+
+
+async def delete_on_device(serial: str, remote: str) -> bool:
+    """``rm -f`` a clip on the device, once more if the first try failed."""
+    for _ in range(2):
+        done = await adb.shell(serial, ["rm", "-f", remote], MAX_STOP_WAIT_S)
+        body = done.get("content")
+        if not done.get("error") and not (isinstance(body, dict) and body.get("rc")):
+            return True
+    logger.warning("mobile.media: could not delete %s on the device", remote)
+    return False
+
+
 # A killed screenrecord leaves an unplayable file, which is why this sends an
 # interrupt on the device FIRST and gives the recorder a window to close its
 # container, rather than killing the adb client outright.

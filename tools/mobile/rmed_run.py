@@ -89,14 +89,33 @@ def _concat(clips: list, listing: str, media_dir: Path) -> bool:
     return True
 
 
-def join_run(clips: list, media_dir: Path) -> bool:
-    """Whether :data:`RUN_CLIP` holds exactly *clips*, joining them when it does not."""
-    listing = "".join("file '" + p.name + "'\n" for p in clips)
+def _listing(clips: list) -> str:
+    """The concat list; a ``#`` line (ignored by ffmpeg) stamps each file's size and mtime."""
+    stamps = [(p.name, p.stat()) for p in clips]
+    return "".join(
+        "file '%s'\n# %d %d\n" % (name, st.st_size, st.st_mtime_ns)
+        for name, st in stamps
+    )
+
+
+def _kept(listing: str, media_dir: Path) -> bool:
+    """Whether :data:`RUN_CLIP` was joined from exactly *listing*."""
     kept = media_dir / RUN_LIST
-    if (media_dir / RUN_CLIP).is_file() and kept.is_file():
-        if kept.read_text(encoding="utf-8") == listing:
-            return True
+    if not ((media_dir / RUN_CLIP).is_file() and kept.is_file()):
+        return False
+    return kept.read_text(encoding="utf-8") == listing
+
+
+def join_run(clips: list, media_dir: Path) -> bool:
+    """Whether :data:`RUN_CLIP` holds exactly *clips*, joining them when it does not.
+
+    A clip re-recorded under the same name changes its size or mtime stamp, so
+    the stale join is redone rather than reused.
+    """
     try:
+        listing = _listing(clips)
+        if _kept(listing, media_dir):
+            return True
         return _concat(clips, listing, media_dir)
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("mobile.report: could not join the run's clips: %s", exc)

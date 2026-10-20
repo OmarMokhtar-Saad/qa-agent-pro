@@ -38,7 +38,7 @@ from tools.mobile.media_consts import (
     _safe,
     media_dir,
 )
-from tools.mobile.media_stop import signal_recorder
+from tools.mobile.media_stop import delete_on_device, kill_recorder, signal_recorder
 
 logger = logging.getLogger("tools.mobile.media")
 
@@ -121,7 +121,7 @@ async def _close(run: _Run, live: dict) -> None:
         size = target.stat().st_size if target.is_file() else 0
         if not size or size > MAX_SEGMENT_BYTES:
             target.unlink(missing_ok=True)
-    await adb.shell(run.serial, ["rm", "-f", remote], MAX_STOP_WAIT_S)
+    await delete_on_device(run.serial, remote)
 
 
 async def _end_live(run: _Run) -> None:
@@ -138,6 +138,8 @@ async def _end_live(run: _Run) -> None:
         await asyncio.wait_for(live["exited"].wait(), MAX_STOP_WAIT_S)
         return
     live["secret"] = True
+    with never_raise():
+        await kill_recorder(run.serial, live.get("pid"))
     with never_raise():
         live["proc"].kill()
 
