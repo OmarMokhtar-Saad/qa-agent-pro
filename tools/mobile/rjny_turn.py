@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from tools.mobile.rcrd_verdict import _crash_block
-from tools.mobile.report_media import _clip_html, _media_key
 from tools.mobile.report_text import esc, fmt_ms
 from tools.mobile.report_trace import _step_html, _StepSlot
 from tools.mobile.report_verdict import DONE_VERDICTS, _app_logged, _unify_verdict
@@ -36,15 +33,6 @@ def _turn_extra(f: dict, loaded: dict | None) -> str:
         + (ev_render.turns_table(loaded, f["tc_id"]) if _app_logged(loaded) else "")
         + ev_render.case_network(f.get("network"))
         + ev_render.case_capture(f.get("capture"))
-    )
-
-
-def _turn_clips(f: dict, media_map: Any) -> str:
-    """The recordings stored for a turn's case."""
-    return "".join(
-        _clip_html(rec)
-        for rec in ((media_map or {}).get("clips") or {}).get(_media_key(f["tc_id"]))
-        or []
     )
 
 
@@ -118,7 +106,6 @@ def _turn_tech(f: dict, loaded: dict | None) -> str:
 def _turn_html(turn: _TurnIn, f: dict, page: _PageData) -> str:
     return (
         _turn_head(turn, f)
-        + _turn_clips(f, page.media_map)
         + _turn_steps(f, page)
         + _turn_tech(f, page.loaded)
         + "</article>"

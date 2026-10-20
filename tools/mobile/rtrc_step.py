@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from tools.mobile.report_text import esc
 from tools.mobile.report_widgets import _outcome_pill, _PageData
-from tools.mobile.rfrm_pic import _step_pics
 from tools.mobile.rtrc_plain import _parts_html, _step_words
 
 #: A trace outcome in plain words. Anything unlisted reads as its own name.
@@ -40,14 +39,13 @@ class _StepSlot:
     pos: int
 
 
-def _step_facts(row: dict, page: _PageData) -> tuple:
-    """The outcome word, the pictures, and the (detail, notes applied) pair of a step."""
+def _step_facts(row: dict) -> tuple:
+    """The outcome word and the (detail, notes applied) pair of a step."""
     outcome = str(row.get("outcome") or "-")
     word = OUTCOME_WORDS.get(outcome.lower(), outcome.replace("_", " "))
-    pics = _step_pics(row, page, row.get(_AFTER_LOOK) or ())
     detail = str(row.get("detail") or "")
     applied = str(row.get("notes_applied") or "")
-    return word, pics, (detail, applied)
+    return word, (detail, applied)
 
 
 def _step_text(row: dict, page: _PageData) -> str:
@@ -55,11 +53,12 @@ def _step_text(row: dict, page: _PageData) -> str:
     return _parts_html(_step_words(row, page.library))
 
 
-# One step: its words, its outcome, what the server said about it, and
-# the screen before and after (see :data:`_AFTER_LOOK`).
+# One step: its words, its outcome and what the server said about it. NO
+# picture: a goal shows ONE screenshot, its end state, and the run ONE
+# recording -- per-step Before/After pairs buried both under dozens of frames.
 def _step_html(slot: _StepSlot, row: dict, page: _PageData) -> str:
-    """One step: its words, outcome, the server's notes and the screens around it."""
-    word, pics, (detail, applied) = _step_facts(row, page)
+    """One step: its words, outcome and the server's notes."""
+    word, (detail, applied) = _step_facts(row)
     pos = int(slot.pos)
     top = '<li class="step" id="step-' + slot.slug + "-" + str(pos) + '">'
     head = '<div class="stephead"><span class="stepn">' + str(pos + 1) + "</span>"
@@ -69,5 +68,4 @@ def _step_html(slot: _StepSlot, row: dict, page: _PageData) -> str:
         for line in (detail, applied, row.get("replayed"))
         if line
     )
-    shots = ('<div class="steppics">' + pics + "</div>") if pics else ""
-    return top + head + act + _outcome_pill(word) + "</div>" + notes + shots + "</li>"
+    return top + head + act + _outcome_pill(word) + "</div>" + notes + "</li>"

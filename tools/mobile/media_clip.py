@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from config.settings_guard import never_raise
-from tools.mobile import adb
+from tools.mobile import adb, media_run
 from tools.mobile.media_args import ClipRef
 from tools.mobile.media_consts import (
     CLIP,
@@ -59,6 +59,7 @@ async def _launch(ref: ClipRef, handle: dict, remote: str) -> None:
         handle["state"] = REFUSED
         return
     handle["proc"] = started["content"]["proc"]
+    handle["pid"] = started["content"].get("pid")
     handle["remote"] = remote
     handle["state"] = OK
 
@@ -78,6 +79,7 @@ async def start_clip(ref: ClipRef, script: object) -> dict:
     ):
         handle["seq"] = seq = _clip_count(ref)
         refused = _refusal(script, seq)
+        await media_run.follow(ref, refused == WITHHELD)
         if refused is None:
             await _launch(ref, handle, _remote_path(ref, seq))
         else:

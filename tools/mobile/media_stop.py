@@ -22,8 +22,15 @@ logger = logging.getLogger("tools.mobile.media")
 wait_for = asyncio.wait_for
 
 
-async def signal_recorder(serial: str) -> None:
-    """Interrupt every ``screenrecord`` on the device (bounded by the stop window)."""
+# With the pid the spawn read (fix/1560) the interrupt reaches THIS recorder
+# only, so a step's stop leaves the run-long recorder of ``media_run`` running.
+# Without one it falls back to every ``screenrecord`` on the device; a run
+# segment it closes that way is pulled and the next one starts.
+async def signal_recorder(serial: str, pid: object = None) -> None:
+    """Interrupt one recorder by pid, else every ``screenrecord`` on the device."""
+    if isinstance(pid, int) and pid > 0:
+        await adb.shell(serial, ["kill", "-INT", str(pid)], MAX_STOP_WAIT_S)
+        return
     await adb.shell(serial, ["pkill", "-INT", "screenrecord"], MAX_STOP_WAIT_S)
 
 
@@ -37,14 +44,13 @@ async def signal_recorder(serial: str) -> None:
 # step for the full adb default -- thirty seconds of a tester's wall clock,
 # every step, for a picture that is already lost.
 #
-# ``pkill -INT screenrecord`` is device-GLOBAL (see the module docstring):
-# there is no pid to target, and the per-device lock is what keeps that from
-# reaching another run.
+# The interrupt targets the handle's pid; only a handle without one falls back
+# to the device-global ``pkill -INT screenrecord``.
 async def _stop_recorder(serial: str, handle: dict) -> bool:
     """Interrupt the recorder so it CLOSES its container, then reap it."""
     if handle.get("proc") is None:
         return False
-    await signal_recorder(serial)
+    await signal_recorder(serial, handle.get("pid"))
     return await reap_recorder(handle)
 
 

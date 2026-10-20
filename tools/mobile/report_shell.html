@@ -1440,8 +1440,8 @@
   .goalmeta,.turnmeta{color:var(--ink-2);font-size:.85rem}
   .film{list-style:none;margin:0 0 20px;padding:0 0 6px;display:flex;gap:10px;overflow-x:auto}
   .film li{flex:0 0 auto}
-  .thumb{display:grid;gap:4px;width:110px;color:var(--ink-2);font-size:.8rem;text-decoration:none}
-  .thumb img{width:110px;height:auto;border:1px solid var(--line);border-radius:6px;cursor:zoom-in}
+  .thumb{display:grid;gap:4px;width:220px;color:var(--ink-2);font-size:.8rem;text-decoration:none}
+  .thumb img{width:220px;height:auto;border:1px solid var(--line);border-radius:6px;cursor:zoom-in}
   .thumbgap{display:grid;place-items:center;aspect-ratio:9/19;border:1px dashed var(--line);border-radius:6px;font-size:.75rem}
   .turn{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:16px;margin:0 0 16px;scroll-margin-top:calc(var(--bar-h) + 16px)}
   .turnhead{display:flex;gap:6px 12px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px}
@@ -1767,6 +1767,17 @@
     }
   }, true);
   window.addEventListener('beforeprint', function () { hydrate(document); });
+
+  /* -- playlist: the run recording when its clips could not be joined ---------
+     The player starts on the first clip and moves to the next one when a clip ends. */
+  $$('video[data-playlist]').forEach(function (v) {
+    var list = v.getAttribute('data-playlist').split(' ').filter(Boolean), at = 0;
+    v.addEventListener('ended', function () {
+      at = (at + 1) % list.length;
+      v.src = list[at];
+      if (at) v.play();                       /* after the last clip it rewinds and stops */
+    });
+  });
 
   /* -- lanes: filter a run sequence by what kind of thing happened -------------
      A sequence is a log, and a log with a hundred rows needs a way to see only the model

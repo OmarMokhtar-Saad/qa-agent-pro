@@ -20,7 +20,15 @@ from tools.mobile.report_shell import _fill as fill
 from tools.mobile.report_text import esc
 from tools.mobile.report_verdict import _derive_goals
 from tools.mobile.report_widgets import _PageData, _Run
-from tools.mobile.rpt_ids import ABOUT_ID, CASES_ID, DIAG_ID, ISSUES_ID, JOURNEY_ID
+from tools.mobile.rmed_run import run_video_html
+from tools.mobile.rpt_ids import (
+    ABOUT_ID,
+    CASES_ID,
+    DIAG_ID,
+    ISSUES_ID,
+    JOURNEY_ID,
+    RECORDING_ID,
+)
 from tools.mobile.rpt_input import _DocInput, _merged_library
 from tools.mobile.rpt_meta import (
     _build_label,
@@ -64,9 +72,10 @@ def _fill_page(make_slots: Callable[[], dict]) -> str:
 
 
 class _Bodies(NamedTuple):
-    """The four section bodies a page may carry."""
+    """The section bodies a page may carry."""
 
     issues: str
+    recording: str
     journey: str
     cases_body: str
     diagnostics: str
@@ -76,9 +85,10 @@ def _present_parts(bodies: _Bodies) -> list:
     """The top-level parts that were emitted. The nav is built from these and
     only from these, so it can never offer a section this page does not have.
     """
-    issues, journey, cases_body, diagnostics = bodies
+    issues, recording, journey, cases_body, diagnostics = bodies
     parts = [
         (ISSUES_ID, "Issues", "what failed or was blocked", issues),
+        (RECORDING_ID, "Recording", "the whole run on the device", recording),
         (JOURNEY_ID, "Journey", "what the explorer did, turn by turn", journey),
         (CASES_ID, "Scripted cases", "every planned case and how it ended", cases_body),
         (DIAG_ID, "Diagnostics", "technical detail, collapsed", diagnostics),
@@ -158,13 +168,14 @@ def _document_body(doc: _DocInput) -> str:
     run, app, page = _prep(doc)
     kinds, turns, scripted = _split_cases(run)
     groups = _derive_goals(run.cases, run.manifest)
-    issues = _issues_html(run.facts, kinds)
+    issues, recording = _issues_html(run.facts, kinds), run_video_html(run.cases)
     journey = _journey_html(
         groups, _JourneyData(turns, _cases_by_id(run.cases), run.manifest), page
     )
     cases_body = _cases_html(scripted, page, doc.observations) if scripted else ""
     diagnostics = _diagnostics_html(run, _DiagIn(doc.screens, doc.lease, doc.partial))
-    present = _present_parts(_Bodies(issues, journey, cases_body, diagnostics))
+    bodies = _Bodies(issues, recording, journey, cases_body, diagnostics)
+    present = _present_parts(bodies)
     return _fill_page(
         lambda: {
             **_page_slots(_Shell(run, app, present, doc.partial)),

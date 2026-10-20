@@ -91,6 +91,7 @@ END_ID = "qa-report-end"
 
 #: Section ids, top to bottom. The nav lists only the ones this run fills.
 ISSUES_ID = "issues"
+RECORDING_ID = "recording"
 JOURNEY_ID = "journey"
 CASES_ID = "cases"
 DIAG_ID = "diagnostics"

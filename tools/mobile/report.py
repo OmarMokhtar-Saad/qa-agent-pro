@@ -135,6 +135,7 @@ from tools.mobile.rpt_ids import (  # noqa: F401
     ISSUES_ID,
     JOURNEY_ID,
     KNOWLEDGE_ID,
+    RECORDING_ID,
 )
 from tools.mobile.rpt_input import (  # noqa: F401
     _DocInput,

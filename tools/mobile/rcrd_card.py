@@ -9,7 +9,6 @@ from tools.mobile.rcrd_attrs import _card_attrs, _card_bits, _card_snippet
 from tools.mobile.rcrd_facts import _case_facts
 from tools.mobile.rcrd_steps import _card_steps, _card_tech
 from tools.mobile.rcrd_verdict import _ended_block, _vstrip
-from tools.mobile.report_media import _video_html
 from tools.mobile.report_text import esc
 from tools.mobile.report_verdict import _tone
 from tools.mobile.report_widgets import RAIL, _PageData, _pill
@@ -64,14 +63,13 @@ def _card_head(facts: dict, tone: tuple, parts: _HeadParts) -> str:
     )
 
 
-def _card_body(facts: dict, parts: _BodyParts, media_map: object) -> str:
+def _card_body(facts: dict, parts: _BodyParts) -> str:
     """The card's body: expected result, strips, steps, end state, tech fold."""
     return (
         '\n  <div class="cbody"><p class="cexp"><b>Expected</b> — '
         + parts.expected
         + "</p>"
         + _vstrip(facts)
-        + _video_html(facts["tc_id"], media_map)
         + parts.steps
         + _ended_block(facts)
         + '<details class="tech"><summary>Technical detail</summary>'
@@ -101,7 +99,7 @@ def _card_html(facts: dict, page: _PageData) -> str:
         _card_steps(facts, page.library, page.app),
         _card_tech(facts, page.library, page.loaded),
     )
-    return head + _card_body(facts, parts, page.media_map) + "</div>\n</details>"
+    return head + _card_body(facts, parts) + "</div>\n</details>"
 
 
 def _case_card(case: object, page: _PageData, manifest: dict | None = None) -> str:

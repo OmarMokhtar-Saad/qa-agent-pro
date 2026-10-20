@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from config.settings_guard import never_raise
 from tools.mobile import platform_info
 from tools.mobile.adb_host import host
 from tools.mobile.adb_reply import refuse_device_id
+from tools.mobile.media_consts import MAX_STOP_WAIT_S
 
 logger = logging.getLogger("tools.mobile.adb")
+
+_PID = re.compile(r"[1-9][0-9]{0,7}")
 
 
 def _bad_remote() -> dict:
@@ -31,6 +35,9 @@ def _record_refusal(serial: str, remote: str) -> dict | None:
     return None
 
 
+# The device shell prints its own pid, then ``exec`` turns itself into the
+# recorder, so that pid IS the recorder's: a stop can ``kill -INT`` this one
+# recording instead of every ``screenrecord`` on the device (fix/1560).
 def _record_cmd(serial: str, remote: str, seconds: int) -> list[str]:
     """The ``adb shell screenrecord`` argv for one bounded recording."""
     return [
@@ -38,6 +45,9 @@ def _record_cmd(serial: str, remote: str, seconds: int) -> list[str]:
         "-s",
         str(serial),
         "shell",
+        "echo",
+        "$$;",
+        "exec",
         "screenrecord",
         "--time-limit",
         str(int(seconds)),
@@ -59,7 +69,18 @@ async def _spawned(serial: str, remote: str, seconds: int) -> dict:
         stderr=asyncio.subprocess.PIPE,
         **platform_info.no_window_kwargs(),
     )
-    return {"error": None, "content": {"proc": proc}}
+    return {"error": None, "content": {"proc": proc, "pid": await _pid_of(proc)}}
+
+
+async def _pid_of(proc: asyncio.subprocess.Process) -> int | None:
+    """The recorder's device pid from its first output line, or None unread."""
+    if proc.stdout is None:
+        return None
+    with never_raise():
+        line = await asyncio.wait_for(proc.stdout.readline(), MAX_STOP_WAIT_S)
+        text = line.decode("ascii", "replace").strip()
+        return int(text) if _PID.fullmatch(text) else None
+    return None
 
 
 # The ONE function in this module that hands a process back instead of a

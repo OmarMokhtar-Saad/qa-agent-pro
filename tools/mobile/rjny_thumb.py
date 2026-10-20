@@ -59,7 +59,7 @@ def _thumb_html(f: dict, thumb: _Thumb) -> str:
         + f["slug"]
         + '">'
         + (img or '<span class="thumbgap">no picture</span>')
-        + "<span>Turn "
+        + "<span>End of goal · turn "
         + str(int(thumb.n))
         + "</span></a></li>"
     )

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from tools.mobile.report_frames import _Caption, _look_pic, _seq_frames
-from tools.mobile.report_trace import _AFTER_LOOK, _step_html, _StepSlot
+from tools.mobile.report_frames import _Caption, _look_pic
+from tools.mobile.report_trace import _step_html, _StepSlot
 from tools.mobile.report_verdict import _app_logged
 from tools.mobile.report_widgets import _PageData, _sec_block, _SecBlock
 from tools.mobile_evidence import exchanges as ev_exchanges
@@ -19,36 +19,35 @@ def _last_substitution(facts: dict) -> tuple:
     )
 
 
-# THE SAME STEP LIST AS A JOURNEY TURN. Each step shows the screen before
-# and after it, resolved through `_look_pic`, so the ambiguous-look and
-# not-captured notes stand in place of a picture exactly as they do there.
-# The phone pair, the element maps and the lane-only sequence repeated those
-# same screens two and three times per card.
+# THE SAME STEP LIST AS A JOURNEY TURN, and like a turn's goal it carries ONE
+# picture: the screen the case ended on, after its steps. Per-step Before and
+# After pairs drew dozens of frames per goal.
 #
 # THE END STATE KEEPS ITS SUBSTITUTION. When the last action's own after
 # look was not captured again, `_case_facts` names the last look this case
-# recorded at that screen, and the last step's After shows it -- with the
-# caption saying so, because the right picture under a caption claiming it
-# is the end state would be the same defect in better clothes.
+# recorded at that screen, and the end picture shows it -- with the caption
+# saying so, because the right picture under a caption claiming it is the
+# end state would be the same defect in better clothes.
 def _card_steps(facts: dict, screens: object, app: str) -> str:
-    """The case's step list, or the honest note that none was replayed."""
+    """The case's step list then its end screen, or the note that none was replayed."""
     rows = facts["rows"]
     page = _PageData(screens, app)
     if not rows:
         return _card_steps_none(facts, page)
-    last = _last_substitution(facts)
-    return (
-        '<ol class="steplist">'
-        + "".join(
-            _step_html(
-                _StepSlot(facts["slug"], i),
-                {**row, _AFTER_LOOK: last} if last and i == len(rows) - 1 else row,
-                page,
-            )
-            for i, row in enumerate(rows)
-        )
-        + "</ol>"
+    steps = "".join(
+        _step_html(_StepSlot(facts["slug"], i), row, page) for i, row in enumerate(rows)
     )
+    return '<ol class="steplist">' + steps + "</ol>" + _card_end_shot(facts, page)
+
+
+def _card_end_shot(facts: dict, page: _PageData) -> str:
+    """The case's one screenshot: the screen it ended on, or ``""`` when unknown."""
+    last = _last_substitution(facts)
+    key = last[0] if last else facts["last_obs"] or facts["last"]
+    if not key:
+        return ""
+    cap = _Caption("End of goal", note=last[1] if last else "")
+    return '<div class="steppics">' + _look_pic(key, page, cap) + "</div>"
 
 
 def _card_steps_none(facts: dict, page: _PageData) -> str:
@@ -61,7 +60,7 @@ def _card_steps_none(facts: dict, page: _PageData) -> str:
     )
 
 
-def _card_sequence(facts: dict, screens: object, loaded: dict | None) -> str:
+def _card_sequence(facts: dict, loaded: dict | None) -> str:
     """The app's records and the lane's actions on one clock, or ``""`` without evidence."""
     rows = facts["rows"]
     if not loaded:
@@ -70,7 +69,7 @@ def _card_sequence(facts: dict, screens: object, loaded: dict | None) -> str:
         ev_render.sequence_items(
             loaded,
             facts["tc_id"],
-            ev_render.Trace(rows, _seq_frames(rows, screens)),
+            ev_render.Trace(rows, {}),
         )
     )
 
@@ -78,7 +77,7 @@ def _card_sequence(facts: dict, screens: object, loaded: dict | None) -> str:
 def _card_run_sequence(facts: dict, screens: object, loaded: dict | None) -> str:
     """The folded "Run sequence" section, or ``""`` when there is nothing to merge."""
     rows = facts["rows"]
-    merged = _card_sequence(facts, screens, loaded)
+    merged = _card_sequence(facts, loaded)
     note = "the app's records and the lane's actions on one clock"
     block = _SecBlock("Run sequence", merged, len(rows) if rows else None, note)
     return _sec_block(block) if merged else ""

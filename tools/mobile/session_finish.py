@@ -14,6 +14,7 @@ from tools.mobile import (
     ime_session,
     lock_reaper,
     locks,
+    media_run,
     preflight,
     restore_outcomes,
     run_finalize,
@@ -113,6 +114,7 @@ async def release_restoring(serial: str, run_id: str) -> dict:
     on and the animation scales at 0 on the tester's device.
     """
     keyboard_hold.forget(run_id)
+    await media_run.stop(run_id)
     if locks.names_held_by(run_id):
         with never_raise(
             logger, "mobile.session.release: restore skipped", exc_info=True
@@ -131,6 +133,7 @@ async def release_restoring(serial: str, run_id: str) -> dict:
 # forwarded verbatim so no copy of the lock function's defaults can drift.
 async def finish_device(owner: str, **release_kwargs) -> dict:
     """Give the tester's keyboard back, THEN give the emulator back."""
+    await media_run.stop(str(owner))
     restores = await _restore_run_state(str(owner))
     restore_outcomes.record(str(owner), restores)
     stale = await _sweep_stale_state(str(owner))

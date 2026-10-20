@@ -5,9 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from tools.mobile.report_text import esc, fmt_ms
-from tools.mobile.report_widgets import _outcome_pill, _PageData
-from tools.mobile.rfrm_phone import _phone_html, _PhoneHead
-from tools.mobile.rtrc_rows import _changed
+from tools.mobile.report_widgets import _outcome_pill
 
 #: The row kind a trace op is drawn as. The kinds are the shell's own vocabulary
 #: (``.seq.is-<kind>`` is what the stylesheet colours by).
@@ -42,8 +40,8 @@ class _SeqParts:
     detail: str
 
 
-# A row whose screen CHANGED carries the new screen's frame in its fold, so
-# the sequence reads as what the tester would have seen, step by step.
+# The case shows ONE picture, the screen it ended on (fix/1550), so a row
+# carries no frame of its own; ``screens`` and ``app`` stay for the callers.
 def _seq_rows(rows: list, screens: object = None, app: str = "") -> str:
     """The run sequence: one row per action, in the order it ran."""
     if not rows:
@@ -54,9 +52,7 @@ def _seq_rows(rows: list, screens: object = None, app: str = "") -> str:
     for row in rows:
         kind = OP_KIND.get(row["op"].lower(), "step")
         label = "0.0s" if clock == 0 else "+%.1fs" % (clock / 1000.0)
-        parts = _SeqParts(
-            _seq_head(row), _seq_bar(row, longest), _seq_detail(row, screens, app)
-        )
+        parts = _SeqParts(_seq_head(row), _seq_bar(row, longest), _seq_detail(row))
         out.append(_seq_item(kind, label, parts))
         clock += row["ms"] or 0
     return '<ul class="seqlist">' + "".join(out) + "</ul>"
@@ -93,18 +89,8 @@ def _seq_head(row: dict) -> str:
     )
 
 
-def _after_phone(row: dict, screens: object, app: str) -> str:
-    """The phone showing the screen a step left behind."""
-    look = _PhoneHead(
-        "Screen after",
-        "what this action left on screen",
-        row["after_obs"] or row["after"],
-    )
-    return _phone_html(look, _PageData(library=screens, app=app))
-
-
-def _seq_detail(row: dict, screens: object, app: str) -> str:
-    """The folded detail of a step: full text, screen change, new screen frame."""
+def _seq_detail(row: dict) -> str:
+    """The folded detail of a step: full text and screen change (fix/1550: no frame)."""
     detail = ""
     if row["detail"]:
         detail = '<p class="seqfull" dir="auto">' + esc(row["detail"]) + "</p>"
@@ -116,8 +102,6 @@ def _seq_detail(row: dict, screens: object, app: str) -> str:
             + (esc(row["after"], 40) or "—")
             + "</div>"
         )
-    if row["after"] and _changed(row):
-        detail += '<div class="phonewide">' + _after_phone(row, screens, app) + "</div>"
     return detail
 
 

@@ -40,6 +40,22 @@ MAX_CLIPS_PER_CASE = 40
 #: cap with no ceiling.
 MAX_STOP_WAIT_S = 4
 
+#: Seconds of one segment of the run-long recording (``media_run``). The
+#: device's own screenrecord limit is 180 s, so a segment ends under it and the
+#: next one starts.
+MAX_RUN_SEGMENT_SECONDS = 170
+
+#: Segments of one run: about 57 minutes of recording. Past it the recording
+#: stops; the tail is missing, never invented.
+MAX_RUN_SEGMENTS = 20
+
+#: Bytes of one KEPT segment: 170 s at the 2 Mbit/s bit rate is about 42 MB.
+MAX_SEGMENT_BYTES = 64 * 1024 * 1024
+
+#: Segments in a row whose recorder failed before the run recorder gives up
+#: (a gone device would otherwise respawn until :data:`MAX_RUN_SEGMENTS`).
+MAX_RESPAWN_FAILURES = 2
+
 OK = "ok"
 TRUNCATED = "truncated"
 REFUSED = "refused"

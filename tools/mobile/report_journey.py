@@ -35,7 +35,6 @@ from tools.mobile.rjny_goals import _goal_meta, _journey_html  # noqa: F401
 from tools.mobile.rjny_results import _issues_html, _results_html  # noqa: F401
 from tools.mobile.rjny_thumb import _thumb_html  # noqa: F401
 from tools.mobile.rjny_turn import (  # noqa: F401
-    _turn_clips,
     _turn_extra,
     _turn_html,
     _turn_meta,

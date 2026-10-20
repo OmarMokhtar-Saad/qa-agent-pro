@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from config.settings_guard import never_raise
-from tools.mobile import adb
+from tools.mobile import adb, media_run
 from tools.mobile.media_args import ClipRef, _PullJob, _Step
 from tools.mobile.media_consts import (
     CLIP,
@@ -42,7 +42,7 @@ async def _recorded_clip(step: _Step, clipped: dict) -> dict | None:
     if not step.ref.defer:
         await _finish_step_pull(job)
         return clipped
-    await signal_recorder(step.ref.serial)
+    await signal_recorder(step.ref.serial, step.held.get("pid"))
     defer(step.ref, _pull_deferred(step.ref, job))
     return None
 
@@ -84,6 +84,7 @@ async def finish_step(ref: ClipRef, handle: object, screen_id: str = "") -> dict
         step = _Step(ref, held, directory, screen_id)
         clip = await _clip_part(step)
         records.extend([clip] if clip else [])
+    await media_run.reveal(ref.run_id)
     remember(ref.run_id, ref.tc_id, records)
     return {"error": None, "content": records}
 

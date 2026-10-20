@@ -37,12 +37,13 @@ and the only remaining question is how long the run pays for it. The worst case
 is therefore about two times :data:`MAX_STOP_WAIT_S` per step, and it is stated in
 the plan's risk table as a number rather than as "bounded by adb's timeout".
 
-**``pkill -INT screenrecord`` is device-GLOBAL, and that is not fixable here.**
-There is no pid to target: the recorder is spawned by the shell adb runs, and
-its pid is not ours. So this interrupts EVERY ``screenrecord`` on that serial.
-What makes it tolerable is the per-device lock in ``tools/mobile/locks.py`` --
-one run owns a serial at a time -- so the only other recording that can exist
-is one a human started by hand on the same device.
+**The interrupt targets ONE recorder by its device pid.** The spawn runs
+``echo $$; exec screenrecord ...``, so the first output line is the recorder's
+own pid and ``kill -INT <pid>`` stops it alone: a step clip and the run-long
+recording of :mod:`tools.mobile.media_run` run side by side. Only a handle
+without a pid falls back to the device-global ``pkill -INT screenrecord``;
+the per-device lock in ``tools/mobile/locks.py`` keeps that inside one run.
+Never ``pkill -f <path>``: it matches the adb shell's own command line.
 
 Every public function returns ``{"error", "content"}`` and never raises: a
 picture is not a verdict, and nothing here may cost a tester a step.

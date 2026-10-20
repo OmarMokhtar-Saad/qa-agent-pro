@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.144.0] - 2026-10-20
+## [1.145.0] - 2026-10-20
 
 ### Added
 
@@ -54,6 +54,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - The tool-call log marks a cancelled call "error cancelled" (it was
   logged "ok"), and a cancelled call no longer keeps its dispatch and
   in-flight slot, so later calls are not refused as busy.
+- The mobile HTML report shows one screenshot at the end of each goal
+  instead of a picture per step, and one video of the whole run.
+- The whole run is recorded in segments of under three minutes that
+  are joined into that one video, so a run longer than the device's
+  three-minute recording limit is no longer cut short.
+- Nothing is recorded while a step types a password or other
+  credential, so the run video has a gap there.
 
 ### Known
 

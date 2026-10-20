@@ -19,8 +19,12 @@ _CLIP = re.escape(REMOTE_DIR) + r"/qa-agents-[A-Za-z0-9_.-]+\.mp4"
 #: Device shell bodies (after ``shell``) that only start, stop or delete a clip.
 _BODIES = (
     re.compile(r"pkill -INT screenrecord"),
+    re.compile(r"kill -INT [1-9][0-9]{0,7}"),
     re.compile(r"rm -f " + _CLIP),
-    re.compile(r"screenrecord --time-limit \d+ --bit-rate \S+ --size \S+ " + _CLIP),
+    re.compile(
+        r"(?:echo \$\$; exec )?screenrecord --time-limit \d+ --bit-rate \S+ --size \S+ "
+        + _CLIP
+    ),
 )
 
 _PULL = re.compile(_CLIP)

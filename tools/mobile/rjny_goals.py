@@ -32,19 +32,14 @@ def _goal_facts(group: dict, facts_by_id: dict) -> list:
     ]
 
 
+# ONE picture per goal: the screen its LAST turn left behind. A thumbnail per
+# turn plus pictures per step drew dozens of frames for one goal; the run's
+# single recording carries the moments in between.
 def _goal_film(slot: _GoalSlot, data: _JourneyData, page: _PageData) -> str:
-    """The goal's film strip: one thumbnail per turn."""
-    return "".join(
-        _thumb_html(
-            f,
-            _Thumb(
-                slot.order[f["tc_id"]],
-                _turn_frame(f["tc_id"], data.cases_by_id),
-                page.library,
-            ),
-        )
-        for f in slot.facts
-    )
+    """The goal's end screenshot: the thumbnail of its last turn."""
+    last = slot.facts[-1]
+    frame = _turn_frame(last["tc_id"], data.cases_by_id)
+    return _thumb_html(last, _Thumb(slot.order[last["tc_id"]], frame, page.library))
 
 
 def _goal_turns(slot: _GoalSlot, data: _JourneyData, page: _PageData) -> str:
