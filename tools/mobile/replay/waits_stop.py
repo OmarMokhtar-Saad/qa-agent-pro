@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 
 from tools.mobile import step_timing
-from tools.mobile.replay.changed_settle import settle_changed
 from tools.mobile.replay.context import ReplayStop, _append, _ReplayRun, _result
 from tools.mobile.replay.context_consts import STATUS_NEEDS_MODEL
 from tools.mobile.replay.screen import _stamp_after
@@ -17,6 +16,7 @@ from tools.mobile.replay.waits_changed import (
     _wait_until_changed,
     _watch_after_wait,
 )
+from tools.mobile.replay.waits_gen import hold_still
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_late import CHANGED, SAME, late_detail, late_verdict
 from tools.mobile.replay.waits_spec import _secs, _unchanged_detail, stamp_early
@@ -122,6 +122,14 @@ async def _settle_wait(run: _ReplayRun, step: ChangedStep, seen: tuple) -> tuple
     return screen, (None if stop is None else {"error": None, "content": stop})
 
 
+async def _hold_changed(run: _ReplayRun, entry: dict, screen: object) -> object:
+    """The first change, held still; stamps ``still_changing`` on *entry* at the cap."""
+    held = await hold_still(run.ctx, screen)
+    if held.still_changing:
+        entry["still_changing"] = True
+    return screen if held.tree is None else held.tree
+
+
 # `redump=not reusable`: only a wait whose LAST poll dumped the unchanged
 # screen hands back a post-wait screen (`_wait_until_changed` says when).
 # Every other path holds a screen from before the wait ended, and skipping
@@ -142,7 +150,7 @@ async def _changed_wait(run: _ReplayRun, step: ChangedStep, screen: object) -> t
     if stop is not None:
         return screen, stop
     if changed:
-        screen = await settle_changed(run.ctx, screen)  # the first change, held still
+        screen = await _hold_changed(run, entry, screen)
     if step.op == "wait" or changed:
         return _changed_finish(run, StopView(entry, screen), False)
     return _unchanged_verdict(run, step, (before_wait, screen))

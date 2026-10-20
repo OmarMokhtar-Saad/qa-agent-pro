@@ -4,30 +4,6 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 
-#: THIS CALL's captured screens, as ``_image_content_blocks`` specs.
-#:
-#: A ContextVar rather than a module list, and that is not a style choice: two
-#: chats can drive two runs through this process at once (which is why
-#: ``mcp_server._inflight_enter`` exists), and a module-level accumulator would
-#: attach one run's screen to the other run's reply. Each ``*_content`` entry
-#: point below sets its OWN empty list, so a spec can only ever be read by the
-#: call that produced it.
-#:
-#: ``None`` -- the default -- is a THIRD state and it is meaningful: it says
-#: "this caller cannot carry image content", which is true of every caller of the
-#: ``str``-returning names. ``_mobile_packet_text`` reads that as "do not even
-#: ask the device", so the ~100 existing callers of those names pay no extra adb
-#: round trip and see no behaviour change at all.
-#:
-#: WHY A SINK AT ALL, rather than returning tuples: the packet text is produced
-#: deep inside ``_mobile_next`` and ``handle_submit_mobile_step``, behind roughly
-#: forty ``return`` statements between them -- the lease check, the takeover
-#: path, the device-lock refusal, the kill-switch refusal, the never-raise exit.
-#: Threading a tuple back would have rewritten every one of those, for a value
-#: only the outermost frame uses. ONE producer writes here and exactly two
-#: readers drain it.
-_MOBILE_IMAGE_SPECS: ContextVar = ContextVar("_MOBILE_IMAGE_SPECS", default=None)
-
 #: The run-level ``env=`` the tester declared on THIS ``qa_mobile_test`` call,
 #: parsed and validated. ``_mobile_hand_off`` stores it once in the manifest;
 #: a ContextVar because the value has to cross frames that do not carry it.

@@ -131,6 +131,7 @@ from tools.mobile.perception_limits import (  # noqa: F401
     MIN_USABLE_ELEMENTS,
 )
 from tools.mobile.perception_line import (  # noqa: F401
+    Slot,
     _eid,
     _field_part,
     _head_parts,
@@ -163,7 +164,9 @@ from tools.mobile.perception_prune import (  # noqa: F401
 from tools.mobile.perception_render import (  # noqa: F401
     _anchor_label,
     _field_refs,
+    plain_lines,
     render_lines,
+    slots_of,
 )
 from tools.mobile.perception_role import (  # noqa: F401
     _UNREADABLE_RE,

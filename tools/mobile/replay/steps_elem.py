@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, NamedTuple
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import fill_fallback
+from tools.mobile import fill_fallback, shown_refs
 from tools.mobile.replay.context import STATUS_NEEDS_MODEL, _ReplayRun, _result
 from tools.mobile.replay.elements import _screen_elements, missing_element_detail
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
@@ -94,9 +94,14 @@ def _target_element(
     if element is None and aim.op == "type":
         element = _type_fallback(aim.ref, at)
     if element is None and aim.op not in ("scroll", "assert"):
-        seen = {**resolution, "op": aim.op}
+        seen = {**resolution, "op": aim.op, "ref_note": _ref_note(run, aim)}
         return element, scroll_missed, _missing_stop(run, at, seen)
     return element, scroll_missed, None
+
+
+def _ref_note(run: _ReplayRun, aim: Aim) -> str:
+    """The index-specific miss message when the target named a ``#n`` that did not map."""
+    return shown_refs.unknown_ref_note(aim.ref, str(run.ctx.run_id or ""))
 
 
 # Per ACTION, not per replay: a scroll whose target missed must not

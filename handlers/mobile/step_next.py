@@ -10,6 +10,7 @@ from handlers.mobile.step_packet import (
     PacketAsk,
     _mobile_packet_header,
     _mobile_packet_text,
+    still_changing_note,
 )
 from handlers.mobile.step_report import _mobile_report_text
 from tools.mobile import render as mobile_render
@@ -51,16 +52,16 @@ def _gate_counts(body: dict) -> dict:
 
 async def _next_packet_text(turn: NextTurn, body: dict, bounded: Any) -> str:
     """The step heading plus the packet, with this turn's screen captured."""
-    return _mobile_packet_header(turn.run_id, body, turn.first_packet) + (
-        await _mobile_packet_text(
-            PacketAsk(
-                body.get("packet"),
-                turn.token,
-                resolved=body.get("resolved"),
-                budget=bounded,
-            )
+    shown = await _mobile_packet_text(
+        PacketAsk(
+            body.get("packet"),
+            turn.token,
+            resolved=body.get("resolved"),
+            budget=bounded,
         )
     )
+    header = _mobile_packet_header(turn.run_id, body, turn.first_packet)
+    return header + shown + still_changing_note(body)
 
 
 async def _next_body(turn: NextTurn, body: dict, bounded: Any) -> str:

@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import screen_anchor
 from tools.mobile.replay.context import _ReplayRun, _Step
 from tools.mobile.replay.device_ops import _perform
 from tools.mobile.replay.elements import _clamp_source
@@ -15,7 +14,6 @@ from tools.mobile.replay.loop_field_empty import reconcile_empty_field
 from tools.mobile.replay.loop_settle import (
     Acted,
     _device_error_stop,
-    _next_observes,
     _settle_device,
 )
 from tools.mobile.replay.screen import _screen_hash
@@ -96,8 +94,6 @@ async def _device_step(
     entry = step.entry
     touch = TouchSpec(step.op, step.action, step.element, _clamp_source(screen))
     note_action(run.ctx, _screen_hash(screen))
-    if not _next_observes(run, step, screen):
-        await screen_anchor.ready(run.ctx.serial)
     outcome = await _perform(touch, run.ctx)
     outcome = await reconcile_empty_field(run, Acted(outcome, entry, screen))
     read = outcome.get("read_screen")
@@ -121,7 +117,7 @@ async def _dispatch_op(
     if (skipped := await skip_if_done(run, step, seen.screen)) is not None:
         return skipped
     if step.op == "assert":
-        return seen.screen, _assert_step(run, step, seen)
+        return seen.screen, await _assert_step(run, step, seen)
     if step.op in actions_mod.WAIT_OPS:
         return await _wait_step(run, step, seen.screen)
     return await _device_step(run, step, seen.screen)

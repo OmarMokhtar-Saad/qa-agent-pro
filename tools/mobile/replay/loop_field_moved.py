@@ -1,7 +1,7 @@
 """Replay engine: did the app move on after a typed field read empty?
 
-A wait-until-condition, never a sleep: poll the cheap focus probe, then a dump,
-until the app is proved to have moved on or the deadline passes. The deadline
+A wait-until-condition, never a sleep: the dump is the poll (and the cheap focus
+probe for a masked field), until the app is proved to have moved on or the deadline passes. The deadline
 is the settle bound already configured (``AUTO_SETTLE_MAX_S``), stretched by the
 device's dump latency. Moving on is STRUCTURAL: another package or activity, a
 different structural screen key (anchor resource ids, never text), or fewer
@@ -15,10 +15,10 @@ import time
 from typing import Any, NamedTuple
 
 from tools.mobile import dump_latency, latency_scale
-from tools.mobile.replay.context import Context, _sleep
-from tools.mobile.replay.context_consts import AUTO_SETTLE_MAX_S, WAIT_POLL_S
+from tools.mobile.replay.context import Context
+from tools.mobile.replay.context_consts import AUTO_SETTLE_MAX_S
 from tools.mobile.replay.dump import _dump, _focus_probe
-from tools.mobile.replay.waits_changed import _changed_poll, _focus_moved
+from tools.mobile.replay.dump_stamp import live_focus
 from tools.mobile.screen_key import screen_key
 
 
@@ -69,20 +69,29 @@ def _deadline(ctx: Context) -> float:
 
 
 async def _focus_left(ctx: Context, focus: str, deadline: float) -> bool:
-    """Poll the cheap focus probe (no dump) until the window changes or the cut."""
+    """Probe the focus (no dump; the probe is the poll) until the window changes or the cut."""
     while time.monotonic() < deadline:
-        if await _focus_moved(ctx.serial, focus, deadline):
+        now = await live_focus(ctx, deadline)
+        if now and now != focus:
             return True
-        await _sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
     return False
 
 
-async def moved_on_masked(ctx: Context, before: object) -> Moved:
-    """A masked field cannot be read back: focus probes, then a dump as proof.
+async def _read_moved(ctx: Context, before: object, deadline: float) -> Moved:
+    """Dump (the dump is the poll) until the app moved on or *deadline*; a failed
+    dump (no window while the app transitions) is retried, not read as "did not move"."""
+    while time.monotonic() < deadline:
+        dumped = await _dump(ctx, deadline=deadline)
+        content = dumped.get("content")
+        if not dumped.get("error") and _moved_on(before, content):
+            return Moved(True, content)
+    return Moved(False)
 
-    ONE dump when it reads (the screen is the proof either way); only a dump
-    that FAILED (no window while the app transitions) is retried, bounded by
-    the same deadline, so a transition does not read as "did not move".
+
+async def moved_on_masked(ctx: Context, before: object) -> Moved:
+    """A masked field cannot be read back: focus probes, then ONE dump as proof.
+
+    Only a dump that FAILED is retried (bounded by the same deadline).
     """
     deadline = _deadline(ctx)
     focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
@@ -90,8 +99,7 @@ async def moved_on_masked(ctx: Context, before: object) -> Moved:
         return Moved(True)
     dumped = await _dump(ctx)
     while dumped.get("error") and time.monotonic() < deadline:
-        await _sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
-        dumped = await _dump(ctx)
+        dumped = await _dump(ctx, deadline=deadline)
     content = dumped.get("content")
     if dumped.get("error") or not _moved_on(before, content):
         return Moved(False)
@@ -104,14 +112,4 @@ async def moved_on_by_deadline(ctx: Context, before: object) -> Moved:
     The read that proved it is returned: it is the screen after the action, so
     the caller's settle need not dump it again.
     """
-    deadline = _deadline(ctx)
-    focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
-    while time.monotonic() < deadline:
-        if focus and await _focus_moved(ctx.serial, focus, deadline):
-            return Moved(True)
-        kind, content = await _changed_poll(ctx, deadline)
-        if kind == "cut":
-            return Moved(False)
-        if kind == "read" and _moved_on(before, content):
-            return Moved(True, content)
-    return Moved(False)
+    return await _read_moved(ctx, before, _deadline(ctx))

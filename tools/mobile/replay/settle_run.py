@@ -13,12 +13,12 @@ from tools.mobile.replay.context_consts import (
     STATUS_NEEDS_MODEL,
 )
 from tools.mobile.replay.dump import _dump
+from tools.mobile.replay.dump_stamp import stamp_step
 from tools.mobile.replay.screen import _stamp_after
 from tools.mobile.replay.settle_auto import (
     Settled,
     _auto_settle,  # noqa: F401  (public-names shim)
     _auto_settle_seen,
-    _probe_skip,
 )
 from tools.mobile.replay.settle_cut import (
     Cut,
@@ -73,6 +73,7 @@ async def _settle(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
     # on. No handler registered: this returns the screen untouched.
     view = CutView(screen, opts.op, opts.extra_expected)
     screen = await _answer_dialogs(job, view)
+    await stamp_step(job.ctx, screen)
     # BOTH halves (hash and id), through the one producer, never re-derived.
     _stamp_after(job.entry, screen)
     screen, outcome = await _settle_unchanged(job, screen, opts)
@@ -89,20 +90,8 @@ def _no_auto_settle(screen: Any, opts: SettleOpts) -> bool:
     return skip or _target_in_hand(opts.next_target, screen)
 
 
-def _skip_eligible(screen: Any, opts: SettleOpts) -> bool:
-    """True when the settle would auto-settle after its dump (the same cases)."""
-    return opts.mark_no_change and not _no_auto_settle(screen, opts)
-
-
 async def _settle_redump(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
-    """``_settle``'s re-dump half: ``(screen, stop)``, ``stop`` set on a failed dump.
-
-    The dump is skipped, and the screen in hand kept, when the frame probe stayed
-    equal to that screen's trusted pre-action baseline for the whole settle window.
-    """
-    if _skip_eligible(screen, opts) and await _probe_skip(job.ctx, screen):
-        job.entry["probe_skip"] = True
-        return screen, None
+    """``_settle``'s re-dump half: ``(screen, stop)``, ``stop`` set on a failed dump."""
     dumped = await _dump(job.ctx)
     if dumped.get("error"):
         job.entry["outcome"] = "dump_failed"
@@ -140,15 +129,14 @@ async def _settle_unchanged(job: SettleJob, screen: Any, opts: SettleOpts) -> tu
     """``(screen, outcome)``: did the action change nothing, after auto-settle."""
     before = _mark_of(job.entry, "before")
     unchanged = opts.mark_no_change and _unchanged(before, _mark_of(job.entry, "after"))
-    # AUTO-SETTLE only on a read this call took itself: a skipped redump
-    # (`launch` brought to front) already decided nothing moved, and a wait's
-    # own poll (`mark_no_change=False`) is its own settle.
-    # A script whose next op waits for the screen to change observes it anyway.
-    skip = _no_auto_settle(screen, opts) or job.entry.get("probe_skip") is True
+    # AUTO-SETTLE only on a read this call took itself: a wait's own poll
+    # (`mark_no_change=False`) is its own settle. A script whose next op waits
+    # for the screen to change observes it anyway.
+    skip = _no_auto_settle(screen, opts)
     if not (unchanged and opts.redump and before.content_hash and not skip):
         return screen, NO_CHANGE if unchanged else ""
     seen = await _auto_settle_seen(job.ctx, screen, before.content_hash)
-    return seen.screen, _settled_outcome(job, screen, seen)
+    return seen.tree, _settled_outcome(job, screen, seen)
 
 
 def _record_outcome(entry: dict, outcome: str) -> None:
@@ -161,14 +149,16 @@ def _record_outcome(entry: dict, outcome: str) -> None:
 
 def _settled_outcome(job: SettleJob, screen: Any, seen: Settled) -> str:
     """Stamp the settle's read; ``""``, ``"no_change"`` or ``"unverified"``."""
-    _stamp_after(job.entry, seen.screen)
+    _stamp_after(job.entry, seen.tree)
+    if seen.still_changing:
+        job.entry["still_changing"] = True
     if not _unchanged(_mark_of(job.entry, "before"), _mark_of(job.entry, "after")):
         job.entry["settled_unchanged"] = False
         return ""
-    doubt = seen.frame_moved or seen.read_failed
+    doubt = seen.changed or seen.failed
     # PROVEN only when the settle took a fresh read nothing contradicts: the
     # learner never calls a tap dead otherwise.
-    job.entry["settled_unchanged"] = not doubt and seen.screen is not screen
+    job.entry["settled_unchanged"] = not doubt and seen.tree is not screen
     return UNVERIFIED if doubt else NO_CHANGE
 
 

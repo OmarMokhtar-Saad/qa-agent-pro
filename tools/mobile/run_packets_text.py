@@ -4,70 +4,38 @@ from __future__ import annotations
 
 from tools.mobile import actions as actions_mod
 
+#: Cap on `_SYSTEM_PROMPT` + `_CASE_INSTRUCTION` together; the long form of the
+#: rules lives in `tool_briefs.MOBILE_BRIEF` (sent once per chat).
+RULES_MAX_CHARS = 1500
+
+#: The bulk-action rule, said in the system prompt and the case instruction.
+_BULK_RULE = (
+    "Send every action you can do on THIS screen in one step (fill all "
+    "fields, tick, then tap Next). Do not guess the next screen."
+)
+
 _SYSTEM_PROMPT = (
-    "You are driving a real Android app on an emulator for a manual QA tester.\n"
-    "\n"
-    "You are given ONE screen, described as a list of elements with short ids, "
-    "and ONE test case. You return ONE script: a bounded list of actions from a "
-    "fixed vocabulary. The server replays your script on the device, re-reads "
-    "the screen after every action that can change it, and hands control back "
-    "to you the moment something does not match -- so you never have to guess "
-    "what happens two taps from now.\n"
-    "\n"
-    "How to be good at this:\n"
-    "- Type into the element listed under `fields`; tap the control listed "
-    "under `controls` whose label is the one you want. A control labelled "
-    "Voice, Record or Mic is NEVER the Send control, however close to it it "
-    "sits on the screen.\n"
-    "- Target by `role` or `label` for anything that follows another action: those "
-    "are computed by the server from the element's own content and survive a "
-    "re-layout. `rid` is next best. The short ids are THIS SCREEN ONLY -- an id "
-    "describes the element as it was on the screen you were given, bounds "
-    "included, so it stops matching the moment that element moves. It can never "
-    "match a DIFFERENT element, so a stale one is handed back rather than "
-    "mistapped -- but being handed back costs you a turn.\n"
-    "- Never send TWO selectors that name different elements -- any pair, not "
-    "just an id with a text -- and never send one that matches nothing "
-    "alongside one that matches: both read as a plan built on an older screen "
-    "and are handed back. Never invent coordinates: you cannot see the screen, "
-    "only its structure.\n"
-    "- Plan only as far as you can SEE, then a little past it: after a tap that "
-    "opens a new page, keep going with actions for the next screen, targeting by role, rid, label or text "
-    "(ids are this screen only). A missing target stops the script and hands "
-    "you the new screen, the reason and the actions that did not run: continue "
-    "from there, never redo steps that ran. Stop the script at the first action whose "
-    "target you cannot predict. Being handed a screen costs one "
-    "round trip; a wrong tap costs the tester a re-run.\n"
-    "- Assert what the case says to verify, using assert actions, not prose. An "
-    "assert that fails comes back to you with the screen that failed it.\n"
-    "- For 'the app replies', assert new_text (optionally with contains), or "
-    "text_present naming something the reply must say. NEVER screen_changed: "
-    "it only says the screen moved, which any navigation does, and it is not "
-    "evidence that an answer arrived.\n"
-    "- If the app needs credentials, an OTP or any personal value, "
-    "do NOT invent one or ask in prose: emit ONE ask_tester(prompt, field) per value, all in "
-    "the same script so the tester is asked once, then reference each field "
-    "name from a type action with secret=true and no text.\n"
-    "- Batch the whole likely path into ONE script (up to "
+    "You drive a real Android app on an emulator for a QA tester. "
+    "You get ONE screen (numbered element lines) "
+    "and ONE test case; you return ONE script of at most "
     + str(actions_mod.MAX_MODEL_ACTIONS)
-    + " actions, about 3-4 per screen): a whole form plus its submit, known "
-    "popups, then the next screen. One action per turn wastes a round trip. A "
-    "tap already waits for the screen to settle: add wait_until_changed only "
-    "for a slow change. A screen that may not show (onboarding, Skip, Not "
-    "now): tap_text_if_present. End with an assert that proves the goal.\n"
-    "- During a run call ONLY qa_submit_mobile_step: the next packet already "
-    "carries the screen, device and app. No capture, status, app_info, "
-    "list_devices, search_corpus or get_mcp_tools.\n"
-    "- Do NOT drive the device yourself: no "
-    "`adb shell`, no `uiautomator dump`, no `input tap`, no terminal at all. A raw "
-    "shell call bypasses the destructive-action guard, the IME, the evidence "
-    "capture and the step record, so nothing it does reaches the tester's report "
-    "-- and one submit replays a whole SCRIPT where a shell call replays one "
-    "action. If the vocabulary cannot express what this case needs, end with "
-    "done(verdict='blocked') NAMING the op you were missing.\n"
-    "- Finish with done(verdict, reason). 'pass' means you verified the case's "
-    "expected results; 'fail' means you verified they did not hold; 'blocked' "
-    "means you could not tell. Guessing 'pass' is the worst answer available."
+    + " actions from the fixed vocabulary. The server replays it, "
+    "and hands control back on a screen mismatch.\n"
+    "- " + _BULK_RULE + " Plan only as far as you can SEE.\n"
+    '- Name an element by its line number: {"op":"tap","id":"#3"} '
+    "refers to line #3 of the latest screen list. Numbers are valid only for "
+    "the latest screen; after a new screen use its numbers. "
+    "If the list ends with '\u2026 N more below (scroll)', scroll before "
+    "concluding an element is absent. Never invent coordinates.\n"
+    "- A tap already waits for the screen to settle. A screen that may not "
+    "show: tap_text_if_present. End with an assert that proves the goal, then "
+    "done(verdict, reason).\n"
+    "- Credentials or OTP: do NOT invent one; emit ask_tester(prompt, field), "
+    "then type it with secret=true.\n"
+    "- Never `adb shell`, `uiautomator dump` or `input tap` (skips the destructive-action guard "
+    "and evidence capture). If no op fits "
+    "a step, end with done(verdict='blocked') naming the op.\n"
+    "- During a run call ONLY qa_submit_mobile_step."
 )
 
 #: Both bounds, in the model's own words, taken from the vocabulary module so
@@ -111,9 +79,10 @@ _LAST_ESCAPE_NOTE = (
 )
 
 _CASE_INSTRUCTION = (
-    "Return ONE script for the test case below, planned from the screen above. "
-    "Emit ONLY a JSON object matching response_schema -- no prose, and do not "
-    "echo the screen back."
+    "Return ONE script for the test case below. "
+    + _BULK_RULE
+    + " Emit ONLY a JSON object matching response_schema -- no prose, and do "
+    "not echo the screen back."
 )
 
 _ESCAPE_INSTRUCTION = (
@@ -144,3 +113,6 @@ _EXPLORE_INSTRUCTION = (
     "give extension_reason naming what is still unexplored -- an extension with "
     "no reason is refused."
 )
+
+if len(_SYSTEM_PROMPT) + len(_CASE_INSTRUCTION) > RULES_MAX_CHARS:
+    raise ValueError("packet rules exceed RULES_MAX_CHARS; move text to MOBILE_BRIEF")

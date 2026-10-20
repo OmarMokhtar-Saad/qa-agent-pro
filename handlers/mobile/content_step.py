@@ -96,21 +96,19 @@ async def _mobile_plan_flow_route(
 
 
 def _arm_step(kwargs: dict, route_plan: dict) -> tuple[dict, tuple]:
-    """Open the screenshot sink, image specs and held marker; ``(held, tokens)``."""
+    """Open the screenshot request and held marker; ``(held, tokens)``."""
     want = mobile_step._MOBILE_SHOT_WANT.set(
         {"asked": bool(kwargs.pop("screenshot", False))}
     )
-    token = mobile_step._MOBILE_IMAGE_SPECS.set([])
     held = {"held": False, "route_expect": list(route_plan.get("expect") or [])}
     held_token = mobile_step._MOBILE_STEP_HELD.set(held)
-    return held, (want, token, held_token)
+    return held, (want, held_token)
 
 
 def _disarm_step(tokens: tuple) -> None:
     """Close what ``_arm_step`` opened, in reverse order."""
-    want, token, held_token = tokens
+    want, held_token = tokens
     mobile_step._MOBILE_STEP_HELD.reset(held_token)
-    mobile_step._MOBILE_IMAGE_SPECS.reset(token)
     mobile_step._MOBILE_SHOT_WANT.reset(want)
 
 
@@ -128,9 +126,7 @@ async def _run_step(call: StepCall, plans: tuple, held: dict) -> tuple:
     body = await mobile_step.handle_submit_mobile_step(*args, **kwargs)
     note_line = await _mobile_note_line(held, _NoteCtx(note, earlier), call)
     plan_lines = await _mobile_plan_lines(plans[0], plans[1], held)
-    return plan_lines + note_line + body, list(
-        mobile_step._MOBILE_IMAGE_SPECS.get() or []
-    )
+    return plan_lines + note_line + body, []
 
 
 def _opt_out(args: tuple, kwargs: dict, flow_name: str) -> str:

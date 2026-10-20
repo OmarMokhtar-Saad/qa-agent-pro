@@ -12,7 +12,6 @@ that keeps changing. No fixed sleep: it is the watched poll in ``waits_poll``.
 from __future__ import annotations
 
 from tools.mobile.replay.context import Context, _ReplayState
-from tools.mobile.replay.probe_gate import CALM
 from tools.mobile.replay.screen import _screen_has, _screen_hash
 from tools.mobile.replay.waits_poll import _wait_for
 from tools.mobile.replay.waits_prior import calm_for, note_calm
@@ -38,9 +37,7 @@ async def _watch_text_or_calm(ctx: Context, screen: object, want: TextWait) -> t
         return bool(calm)
 
     label = "waiting for " + repr(str(want.text)[:40]) + " (optional)"
-    found, latest, _timed_out = await _wait_for(
-        ctx, screen, Probe(want.ms, met, label, CALM)
-    )
+    found, latest, _timed_out = await _wait_for(ctx, screen, Probe(want.ms, met, label))
     return found and _screen_has(latest, want.text), latest, bool(calm)
 
 

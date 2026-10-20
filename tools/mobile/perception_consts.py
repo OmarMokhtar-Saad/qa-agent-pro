@@ -11,11 +11,11 @@ from tools.safe_parse import XML_DECL_RE
 #: every packet and the system prompt, since the per-chat contract landed, is
 #: not.
 REFERENCE_LEGEND = (
-    "note: `text=@e7` means this element's text is the SAME string that element "
-    "e7 prints in full above -- printed once to keep this screen readable. To "
-    "act on such an element, target it by its own id (or its rid or role); to "
-    "target it by text, copy the string from the line it is printed on. A "
-    "`label=` is never abbreviated this way."
+    "note: `@#7` in place of a string means this element's text (or `(@#7)` its "
+    "desc) is the SAME string that line #7 prints in full above -- printed once "
+    "to keep this screen readable. To act on such an element, target it by its "
+    "own #n (or its id or role); to target it by text, copy the string from the "
+    "line it is printed on. A `label=` is never abbreviated this way."
 )
 
 #: The same fact in one line, for a block that cannot afford the paragraph.
@@ -28,8 +28,8 @@ REFERENCE_LEGEND = (
 #: cheap and degrading the notation is not, so this exists and is tried before
 #: either is abandoned.
 REFERENCE_LEGEND_SHORT = (
-    "note: `text=@e7` means the same string element e7 prints in full above; "
-    "target such an element by its id."
+    "note: `@#7` means the same string line #7 prints in full above; "
+    "target such an element by its #n."
 )
 
 

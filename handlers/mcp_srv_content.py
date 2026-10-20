@@ -98,13 +98,6 @@ def _prepare_payload_to_content(result):
     return blocks
 
 
-def _with_script_doc(fn):
-    """Append the step-script format (``script_help.SCRIPT_FORMAT_DOC``) to a
-    tool's description, so the model reads it before it writes a script."""
-    fn.__doc__ = (fn.__doc__ or "") + "\n\n" + _lane.script_help.SCRIPT_FORMAT_DOC
-    return fn
-
-
 class MobileReplySpec(NamedTuple):
     """The tool name and ``*_content`` handler of `_mobile_reply` (a parameter object)."""
 
@@ -120,20 +113,18 @@ def _device_of(fields: dict) -> str:
 async def _mobile_reply(spec: MobileReplySpec, ctx, fields: dict, **extra) -> list:
     """Run a mobile ``*_content`` handler under `_tracked` and shape its reply.
 
-    The qa_capture_screens shape, deliberately identical: one text block plus
-    one image block per captured screen, with `_image_content_blocks`'
-    NEVER-silent text fallback when the fastmcp Image API is unavailable. A
-    packet with no picture yields the text block alone and SAYS so in its own
-    `screen_image` note -- the reply never implies an image that is not there.
+    The reply is ONE text block and never an image (fast steps, WP-D): the
+    screen reaches the report only through `run_shots.write_shot`, at done and
+    at a failed assert.
     """
 
     # The keyboard idle clock waits while any mobile call is in flight.
     async with _lane.keyboard_idle.busy(str(fields.get("run_id") or "")):
-        text, specs = await _tracked(
+        text, _specs = await _tracked(
             spec.name,
             ctx,
             spec.handler(**fields, **extra, progress=_make_progress(ctx)),
         )
-    if not specs:  # a stop never leaves the host without a way on (fix/1490)
-        text = _lane.host_way_on.with_way_on(spec.name, text, _device_of(fields))
-    return [TextContent(type="text", text=text), *_image_content_blocks(specs)]
+    # a stop never leaves the host without a way on (fix/1490)
+    text = _lane.host_way_on.with_way_on(spec.name, text, _device_of(fields))
+    return [TextContent(type="text", text=text)]

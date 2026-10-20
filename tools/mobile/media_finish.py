@@ -1,4 +1,4 @@
-"""Finishing a step: stop the clip, pull it, capture a frame, index both."""
+"""Finishing a step: stop the clip, pull it, index the record."""
 
 from __future__ import annotations
 
@@ -6,18 +6,15 @@ import logging
 
 from config.settings_guard import never_raise
 from tools.mobile import adb
-from tools.mobile.media_args import ClipRef, _FrameJob, _PullJob, _Step
+from tools.mobile.media_args import ClipRef, _PullJob, _Step
 from tools.mobile.media_consts import (
     CLIP,
-    FRAME,
     MAX_CLIP_BYTES,
     MAX_STOP_WAIT_S,
     NOT_ATTEMPTED,
     OK,
     PULL_FAILED,
-    REFUSED,
     TRUNCATED,
-    WITHHELD,
     _safe,
     media_dir,
     record,
@@ -70,22 +67,10 @@ async def _pull_deferred(ref: ClipRef, job: _PullJob) -> None:
     remember(ref.run_id, ref.tc_id, [job.clipped])
 
 
-async def _frame_part(step: _Step) -> dict:
-    """Capture the one frame, unless a credential was withheld."""
-    state = str(step.held.get("state") or NOT_ATTEMPTED)
-    kept = state if state == WITHHELD else NOT_ATTEMPTED
-    framed = record(FRAME, kept, **_base(step))
-    if state != WITHHELD and step.screen_id:
-        serial, directory = step.ref.serial, step.directory
-        job = _FrameJob(serial, directory, step.screen_id, framed)
-        await _finish_step_frame(job)
-    return framed
-
-
 # ``content`` is the list of records written. Never raises, and no branch here
 # can change a verdict: the caller ignores the result by design.
 async def finish_step(ref: ClipRef, handle: object, screen_id: str = "") -> dict:
-    """Stop the clip, capture one frame, and store both records on the case."""
+    """Stop the clip and store its record on the case. No per-step frame (WP-D)."""
     held = handle if isinstance(handle, dict) else {}
     records = []
     with never_raise(
@@ -99,7 +84,6 @@ async def finish_step(ref: ClipRef, handle: object, screen_id: str = "") -> dict
         step = _Step(ref, held, directory, screen_id)
         clip = await _clip_part(step)
         records.extend([clip] if clip else [])
-        records.append(await _frame_part(step))
     remember(ref.run_id, ref.tc_id, records)
     return {"error": None, "content": records}
 
@@ -161,17 +145,3 @@ async def _pull_into(job: _PullJob, closed: bool) -> None:
         clipped["state"] = OK if closed else TRUNCATED
         clipped["file"] = target.name
         clipped["bytes"] = int(size)
-
-
-async def _finish_step_frame(job: _FrameJob) -> None:
-    """Capture one frame into the job's directory and set the frame record's state."""
-    serial, directory, screen_id, framed = job
-    shot = await adb.screencap(serial)
-    data = shot.get("content") if not shot.get("error") else None
-    if isinstance(data, (bytes, bytearray)) and data:
-        name = "frame-" + _safe(screen_id) + ".png"
-        (directory / name).write_bytes(bytes(data))
-        framed["state"] = OK
-        framed["file"] = name
-    else:
-        framed["state"] = REFUSED

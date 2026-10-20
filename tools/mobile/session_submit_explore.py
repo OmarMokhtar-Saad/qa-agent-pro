@@ -12,6 +12,7 @@ from tools.mobile.session_submit_parse import (
     _parse_explore_submission,
 )
 from tools.mobile.session_submit_turn import _replay_explore_turn
+from tools.mobile.shown_refs import map_refs
 
 
 # HAND-OVER TO THE TARGET APP (fix round 3, item 1). A multi-app goal
@@ -39,7 +40,9 @@ def _apply_handover(call: ExploreCall, payload: dict) -> ExploreCall:
 
 async def _submit_explore(call: ExploreCall) -> dict:
     """One exploratory turn: replay the actions, then fold the reply."""
-    payload, parsed, refusal = _parse_explore_submission(call.raw, call.resolved)
+    payload, parsed, refusal = _parse_explore_submission(
+        map_refs(call.raw, call.run_id), call.resolved
+    )
     if refusal is not None:
         return refusal
     call = _apply_handover(call, payload)

@@ -16,7 +16,6 @@ from typing import Any
 
 from tools.mobile.replay.context import _ReplayRun
 from tools.mobile.replay.context_consts import TARGET_WAIT_S
-from tools.mobile.replay.probe_gate import TEXT
 from tools.mobile.replay.steps_elem import Aim, _resolve_element
 from tools.mobile.replay.steps_notrun import WAITED_NO_ACTION
 from tools.mobile.replay.steps_stop import StepAt, _close
@@ -80,7 +79,7 @@ async def _poll(run: _ReplayRun, turn: Any, cur: Any) -> str:
     started = time.monotonic()
     label = "waiting for the next target (" + str(cur.aim.op) + ")"
     ms = max(1, int(_allowed_s(state.deadline) * 1000))
-    probe = Probe(ms, met, label, TEXT)
+    probe = Probe(ms, met, label)
     _ok, state.screen, _late = await _wait_for(run.ctx, state.screen, probe)
     at.entry["waited_for_target_s"] = round(time.monotonic() - started, 1)
     interruption, run.ctx.wait_interruption = run.ctx.wait_interruption, ""

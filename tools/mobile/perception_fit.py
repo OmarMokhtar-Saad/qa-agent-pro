@@ -5,6 +5,7 @@ from __future__ import annotations
 from tools.mobile import perception_limits
 from tools.mobile.perception_consts import _LEGEND_STAGES
 from tools.mobile.perception_notice import _block_notice, _last_resort_text
+from tools.mobile.perception_viewport import more_below_line
 
 
 # The (text, count) that shows the MOST element lines under `base`.
@@ -24,9 +25,10 @@ def _fit_stage(base: list, stage: tuple, content_drops: tuple) -> tuple:
     count = len(source)
     while True:
         body = source[:count]
-        legend = [legend_text] if legend_text and any("=@" in x for x in body) else []
+        legend = [legend_text] if legend_text and any("@#" in x for x in body) else []
         note = _block_notice(content, (*drops, count, len(source) - count))
-        text = "\n".join(base + legend + ([note] if note else []) + body)
+        below = more_below_line(content, count)
+        text = "\n".join(base + legend + ([note] if note else []) + body + below)
         if len(text) <= perception_limits.MAX_BLOCK_CHARS:
             return text, count
         if not count:

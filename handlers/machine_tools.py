@@ -28,7 +28,7 @@ def _register_wizard_tool(mcp, Context, rt) -> None:
 
     @mcp.tool()
     async def qa_wizard(ctx: Context) -> str:
-        """Guided entry point: pick a workflow (Test cases / Bug report / Exploratory); it walks you END-TO-END, asking where the feature comes from (description / Jira ticket / mobile screens / Jira + mobile), and returns the suite. Feature Analysis: `qa_feature_analysis`. No parameters; without MCP elicitation, a markdown menu."""
+        """Guided entry point: pick a workflow (Test cases / Bug report / Exploratory); it walks you END-TO-END and returns the suite. Feature Analysis: `qa_feature_analysis`. No parameters; without MCP elicitation, a markdown menu."""
         return await rt._tracked(
             "qa_wizard",
             ctx,
@@ -44,7 +44,7 @@ def _register_doctor_tool(mcp, Context, rt) -> None:
 
     @mcp.tool(name="qa-doctor")
     async def qa_doctor(ctx: Context, fix: bool = False) -> str:
-        """Is THIS machine ready? Verdict, environment, integrations (Jira/Atlassian), CLI tooling (adb/xcrun), features, action items. Reports NO model backend: every generative step runs in YOUR chat model. Read-only by default; fix=true repairs what it can (rewrites `.env` with a backup, writes the hosted `atlassian` entry into this client's MCP config). Run first on a new machine."""
+        """Is THIS machine ready? Verdict, environment, Jira/Atlassian, adb/xcrun, features, action items. Reports NO model backend (generation runs in YOUR chat model). Read-only by default; fix=true repairs what it can. Run first on a new machine."""
         progress = rt._make_progress(ctx)
         # Resolved BEFORE entering _tracked: this is a round trip back to the
         # client, not part of the report's own work, and _tracked owns the
@@ -105,7 +105,7 @@ def _register_selfcheck_tool(mcp, Context, rt) -> None:
 
     @mcp.tool(name=selfcheck_module.SELF_TOOL_NAME)
     async def qa_selfcheck(ctx: Context) -> str:
-        """Check whether THIS build's own replies still describe it: call every registered tool with defaults; report any reply naming a deleted setting or module, a model this server cannot call, or a tool this edition does not register. Read-only: no `apply=true`, outbound connections blocked. `qa-doctor` covers the MACHINE."""
+        """Check whether THIS build's own replies still describe it: calls every registered tool with defaults and reports stale references (deleted settings, modules, tools). Read-only: no `apply=true`, outbound connections blocked. `qa-doctor` covers the MACHINE."""
         return await rt._tracked_noted(
             selfcheck_module.SELF_TOOL_NAME,
             ctx,

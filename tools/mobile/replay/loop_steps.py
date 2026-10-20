@@ -45,7 +45,7 @@ async def _replay_steps_raw(script: Any, ctx: Context) -> dict:
             if reply is not None:
                 return with_not_run(run, reply, index)
 
-        return _end_of_script(run, state.screen)
+        return await _end_of_script(run, state.screen)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.executor.replay failed")
         return {"error": str(exc), "content": None}

@@ -14,7 +14,7 @@ from tools.mobile import (
     tree_optin,
     tree_source,
 )
-from tools.mobile.replay import dump_held
+from tools.mobile.replay import dump_activity, dump_held
 
 logger = logging.getLogger("tools.mobile.executor")
 
@@ -94,6 +94,8 @@ async def _raw_dump(serial: str) -> dict:
             result = None
         if result is not None and result.xml:
             step_timing.note_source(result.source)
+            dump_activity.note_source(serial, result.source)
             return {"error": None, "content": result.xml}
     step_timing.note_source(tree_source.FALLBACK_SOURCE)
+    dump_activity.note_source(serial, tree_source.FALLBACK_SOURCE)
     return await adb.uiautomator_dump(serial)

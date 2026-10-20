@@ -1,4 +1,4 @@
-"""Screen capture of the mobile step handlers: take, store and attach this turn's picture."""
+"""Screen capture of the mobile step handlers: the report PNG a step asked for."""
 
 from __future__ import annotations
 
@@ -6,13 +6,19 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from handlers.mobile.step_state import _MOBILE_IMAGE_SPECS, _MOBILE_SHOT_WANT
+from handlers.mobile.step_state import _MOBILE_SHOT_WANT
 from tools.mobile import adb as mobile_adb
-from tools.mobile import dump_reuse, step_timing
+from tools.mobile import run_io, step_timing
 from tools.mobile import run_store as mobile_run_store
 from tools.mobile import screenshot as mobile_screenshot
 
 logger = logging.getLogger("tools.mcp_handlers")
+
+BLIND_NOTE = (
+    "This screen has no readable elements (canvas or WebView). Use "
+    "wait-until-text or coordinates."
+)
+SAVED_NOTE = " A PNG of it was saved for the report at {path}; it is not shown to you."
 
 
 @dataclass(frozen=True)
@@ -75,62 +81,67 @@ async def _capture_and_pick_spec(serial: str, turn: ShotTurn) -> tuple:
     return note, spec
 
 
-# Keep the picture, so the HTML report can show the screen rather than
-# only a drawing of it. The SAME bytes the model was handed.
-#
-# Keyed on the packet's `observation_id` -- the look -- and never on a screen
-# id, which is invariant across the turns of a chat. Best-effort exactly like
-# `case_runner`'s `write_screen`: a failure is swallowed, because a lost
-# picture may never cost the tester the packet.
-def _store_mobile_shot(packet: object, body: dict, spec: dict) -> None:
-    """Store the picture the model was handed, best-effort."""
+# Keep the picture, so the HTML report can show the screen. Keyed on the
+# packet's `observation_id` -- the look -- and never on a screen id, which is
+# invariant across the turns of a chat. Best-effort: a lost picture may never
+# cost the tester the packet.
+def _store_mobile_shot(packet: object, body: dict, spec: dict) -> bool:
+    """Store the picture in the run folder, best-effort; True when it was written."""
     try:
-        mobile_run_store.write_shot(
+        wrote = mobile_run_store.write_shot(
             str(body.get("run_id") or ""),
             str(packet.get("observation_id") or "") if isinstance(packet, dict) else "",
             spec.get("data"),
         )
+        return not (wrote or {}).get("error")
     except Exception:  # never-raise: a picture is not a verdict
         logger.exception("mcp mobile screen store failed")
+        return False
 
 
-# Notes for the two early returns below. No image channel on this path: NOT an
-# attempt that failed -- so no device call is made and the note says exactly
-# that. A run with no device yet (an explore turn before provisioning): there
-# is nothing to capture FROM.
-async def _mobile_capture_screen_note(turn: ShotTurn, attach: bool) -> str:
-    """Capture this turn's screen and return the note that says what happened;
-    a captured picture is appended to the image sink when it is to be attached."""
-
-    sink = _MOBILE_IMAGE_SPECS.get()
-    serial = str(turn.body.get("serial") or "")
-    if sink is None:
-        return mobile_screenshot.NO_IMAGE_CHANNEL_NOTE
-    if not serial:
-        return mobile_screenshot.CAPTURE_FAILED_NOTE
-    if dump_reuse.consume_shot_skip(serial) and not attach:
-        return mobile_screenshot.NOT_ATTACHED_NOTE  # refused: screen unchanged
-    note, spec = await _capture_and_pick_spec(serial, turn)
-    if spec is None:
-        return note
-    _store_mobile_shot(turn.packet, turn.body, spec)
-    if not attach:
-        return mobile_screenshot.NOT_ATTACHED_NOTE
-    sink.append(spec)
-    return mobile_screenshot.ATTACHED_NOTE
+def _screen_blind(packet: object) -> bool:
+    """True when the packet says its screen has no usable element tree."""
+    return isinstance(packet, dict) and bool(packet.get("screen_unusable"))
 
 
-# DUMP FIRST (S1). The picture is still taken and stored every step -- the
-# report shows it -- but it goes to the model only when the element list is
-# not enough, or the model asked. A packet without the routing key (not
-# made by a `mobile_run` builder) reads as unusable: the safe direction.
-def _mobile_screen_attach(packet: object) -> tuple[str, bool]:
-    """(the packet's ``screen_unusable`` routing key, whether to attach the picture)."""
-    unusable = (
-        str(packet.get("screen_unusable", "unknown") or "")
-        if isinstance(packet, dict)
-        else "unknown"
-    )
+def _report_shot_wanted(turn: ShotTurn, serial: str) -> bool:
+    """True when a report PNG is due: asked for, a visual stop, or a blind screen."""
     want = _MOBILE_SHOT_WANT.get()
-    want = want if isinstance(want, dict) else {}
-    return unusable, bool(unusable or want.get("asked") or want.get("visual"))
+    asked = isinstance(want, dict) and (want.get("asked") or want.get("visual"))
+    return bool(serial and (asked or _screen_blind(turn.packet)))
+
+
+def _blind_note(turn: ShotTurn, stored: bool) -> str:
+    """The blind-screen line; it names the PNG path only when the PNG was written."""
+    if not stored:
+        return BLIND_NOTE
+    packet = turn.packet if isinstance(turn.packet, dict) else {}
+    folder = run_io.run_path(str(turn.body.get("run_id") or ""))
+    name = str(packet.get("observation_id") or "") + ".png"
+    return BLIND_NOTE + SAVED_NOTE.format(
+        path=folder / mobile_run_store.SHOTS_DIR / name
+    )
+
+
+# Fast steps (WP-D): a plain step takes NO picture and no reply carries one.
+# Only `screenshot=true`, a `visual` assert stop, or a screen with no readable
+# elements (canvas / WebView) writes ONE PNG into the run folder for the
+# report. The blind case also returns a text line, so the host can switch to
+# wait-until-text or coordinates instead of looking.
+async def _mobile_report_shot(turn: ShotTurn) -> str:
+    """Capture and store a report PNG when due; the blind-screen note, else ``""``."""
+    serial = str(turn.body.get("serial") or "")
+    if not _report_shot_wanted(turn, serial):
+        return ""
+    _note, spec = await _capture_and_pick_spec(serial, turn)
+    if spec is None:
+        return ""
+    stored = _store_mobile_shot(turn.packet, turn.body, spec)
+    return _blind_note(turn, stored) if _screen_blind(turn.packet) else ""
+
+
+def _screen_unusable(packet: object) -> str:
+    """The packet's ``screen_unusable`` routing key (unknown when absent)."""
+    if not isinstance(packet, dict):
+        return "unknown"
+    return str(packet.get("screen_unusable", "unknown") or "")

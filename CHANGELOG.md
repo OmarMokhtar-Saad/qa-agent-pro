@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.141.1] - 2026-10-19
+## [1.142.0] - 2026-10-20
 
 ### Added
 
@@ -33,15 +33,36 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- App Tester installs now get past the one-time consent page on
-  their own. The installer ticks the "I consent" box (only when it is
-  not ticked yet) and taps START TESTING ON THIS DEVICE, then carries
-  on. It stops with `consent_required` only if the page is still there
-  after 2 tries. The chat no longer has to ask the tester or open a
-  second run (with its own second report) to get past that page.
-- Mobile screen reads are a little faster: the check of which window
-  is in front now runs at the same time as the screen read instead of
-  after it.
+- Mobile steps are much faster. The server no longer sleeps a fixed
+  time between actions: it watches the QA keyboard's screen-event
+  counter, waits up to 1.5 s for the screen to start changing (none:
+  it answers at once), then until it has been still for 200 ms, with
+  a 3 s cap. At the cap the step still answers, with a note that the
+  screen is still changing so the chat can use wait-until-text.
+  Without the QA keyboard the same rule runs on screen-tree compares.
+  The picture-compare probe is gone from the wait loops.
+- The server talks to the adb server over one socket opened per run
+  instead of starting an adb process per command; it falls back to
+  the adb command when the socket is not available.
+- The app in front is read from the screen tree itself; the extra
+  window query runs only on the fallback path, once per poll.
+- No screenshot per step any more, neither in the reply nor in the
+  media clip. One PNG goes to the report at done, at a failed assert,
+  when a step asks for one, and when a screen has no readable
+  elements; the step text names the file. A reply never carries an
+  image.
+- The screen list is one short line per element (number, kind, text,
+  short id; bounds only when there is no text and no id), for the
+  visible part of the screen only, ending with "… N more below
+  (scroll)". The chat acts by the line number (#n); a number that is
+  not on the list is refused with a message that says how many lines
+  were shown.
+- The tool brief goes out once per chat and the response schema once
+  per run; later packets carry a one-line pointer. Tool descriptions
+  are shorter, with the details in that brief.
+- Packet guidance now asks the chat to do everything it can on the
+  current screen in one step (an action list) and not to guess across
+  screens.
 
 ### Known
 
@@ -67,8 +88,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
   for text early after 10 s.
 - A screen recording can still come back empty when the device has
   not finished writing it; the evidence note now says so.
-- Replay steps can still be slow on screens that need several
-  probes; this is being profiled.
+- A screen-list line longer than 400 characters is shortened.
+- An element off the left or right edge of the screen is counted in
+  the "more below" line even though scrolling down does not reach it.
 - Old saved routes that do nothing are cleaned up only when a new
   route is saved.
 - The fallback keyboard cannot read the field back, so its fill proof

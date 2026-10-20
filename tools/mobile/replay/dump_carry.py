@@ -11,9 +11,9 @@ from typing import Any
 from tools.mobile import (
     adb,
     dump_reuse,
-    screen_anchor,
     step_timing,
 )
+from tools.mobile.replay import dump_activity
 from tools.mobile.replay.context_ctx import Context
 
 #: How old a carried screen may be and still stand for the next call's first
@@ -50,7 +50,6 @@ def _drop_carried(serial: str) -> None:
 
 def _remember(ctx: Context, observed: Any) -> None:
     """Keep a successful observation for the next call when the context allows."""
-    screen_anchor.note_read(ctx.serial, observed)
     if not ctx.carry_screen:
         return
     content = observed.get("content") if isinstance(observed, dict) else None
@@ -61,7 +60,7 @@ def _remember(ctx: Context, observed: Any) -> None:
 
 
 def _carry(key: str, observed: dict, content: dict) -> None:
-    """Carry *observed* for *key* (least recently read first out) and anchor it."""
+    """Carry *observed* for *key* (least recently read first out)."""
     _CARRIED.pop(key, None)
     _CARRIED[key] = _Carried(
         copy.deepcopy(observed),
@@ -70,20 +69,15 @@ def _carry(key: str, observed: dict, content: dict) -> None:
         str(content.get("activity") or ""),
         dump_reuse.token(key),
     )
-    screen_anchor.schedule(key, dump_reuse.token(key))
     while len(_CARRIED) > MAX_CARRIED_SERIALS:
         del _CARRIED[next(iter(_CARRIED))]
 
 
 def _is_current(held: _Carried | None, ctx: Context) -> bool:
-    """Same package, nothing actuated since it was read, and young or probe-anchored.
-
-    Past the age cap it only stands when a probe reading was kept for its
-    generation; :func:`_take_carried` then requires a fresh probe to equal it.
-    """
+    """Same package, nothing actuated since it was read, and young."""
     if held is None:
         return False
-    if _aged(held) and not screen_anchor.anchored(ctx.serial, held.gen):
+    if _aged(held):
         return False
     if ctx.package and held.package != ctx.package:
         return False
@@ -109,9 +103,7 @@ async def _take_carried(ctx: Context) -> dict | None:
     if not _is_current(held, ctx):
         return None
     focus = await _focus_probe(ctx.serial, REUSE_PROBE_S)
-    if not focus or focus != held.activity:
-        return None
-    if _aged(held) and not await screen_anchor.unmoved(ctx.serial, held.gen):
+    if not focus or focus not in (held.activity, held.package):
         return None
     step_timing.mark("dump_carried")
     return held.result
@@ -122,8 +114,11 @@ async def _focus_probe(serial: str, budget: float) -> str:
 
     One short ``dumpsys window`` line, far cheaper than a dump. Bounded by the
     budget the polled wait has left, and never raises: an unknown focus is
-    never a change.
+    never a change. On a tree-source device (qa-ime) it is the latest dump's
+    root package and costs NO adb call (see `dump_activity`).
     """
+    if dump_activity.tree_path(serial):
+        return dump_activity.last_package(serial)
     if budget <= 0:
         return ""
     try:

@@ -17,6 +17,7 @@ from tools.mobile.case_run_types import Submission, _Case, _Intake, _Ref, _Step
 from tools.mobile.case_run_verdict import _outcome_checkpoint, _read_step
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.replay import replay
+from tools.mobile.shown_refs import map_refs
 
 # Same object as case_run_consts.logger (getLogger is a registry); a local
 # binding lets ruff see the handler below as logged (BLE001).
@@ -96,6 +97,7 @@ def _intake(run_id: str, case: object, raw_script: object) -> _Intake:
     if not run_store.valid_tc_id(tc_id):
         return _Intake({"error": "Invalid case id.", "content": None}, ours, None)
     queued_in = _prior_queue(run_id, tc_id)
+    raw_script = map_refs(raw_script, run_id)
     raw_script, fold_refusal = _fold_queue(raw_script, queued_in)
     if fold_refusal is not None:
         return _Intake(_refused_script(ours, fold_refusal, queued_in), ours, None)

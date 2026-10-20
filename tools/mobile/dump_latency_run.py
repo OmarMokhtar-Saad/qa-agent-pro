@@ -23,7 +23,7 @@ def _source() -> str:
 
 
 async def _timed(serial: str, awaitable: Awaitable[Any]) -> Any:
-    before_dump(serial)  # e.g. screen_anchor's "before" probe
+    before_dump(serial)  # hooks registered on BEFORE_DUMP
     step_timing.note_source("")  # so the source read below is THIS dump's
     take_aside(serial)
     started = time.monotonic()

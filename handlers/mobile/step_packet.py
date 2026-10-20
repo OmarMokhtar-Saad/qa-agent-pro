@@ -7,12 +7,12 @@ from typing import Any, cast
 
 from handlers.mobile.step_capture import (
     ShotTurn,
-    _mobile_capture_screen_note,
-    _mobile_screen_attach,
+    _mobile_report_shot,
+    _screen_unusable,
 )
 from handlers.mobile.step_memo import MemoCtx, _mobile_shown_packet
 from tools.mobile import render as mobile_render
-from tools.tool_briefs import MOBILE_BRIEF
+from tools.tool_briefs import MOBILE_BRIEF, MOBILE_REMINDER
 
 
 @dataclass(frozen=True)
@@ -59,12 +59,12 @@ def _packet_shown(packet: object, memo: MemoCtx) -> tuple[Any, bool]:
 
 
 def _packet_block(shown: Any, token: str, brief_needed: bool) -> str:
-    """The rendered packet, with the tool brief while the chat still needs it."""
+    """The rendered packet: the tool brief while the chat needs it, else the reminder."""
 
     text = mobile_render.packet_block(shown, session_token=token)
     if brief_needed:
-        text += "\n\n### Tool brief (sent once per chat)\n" + MOBILE_BRIEF.strip()
-    return text
+        return text + "\n\n### Tool brief (sent once per chat)\n" + MOBILE_BRIEF.strip()
+    return text + "\n\n" + MOBILE_REMINDER.strip()
 
 
 # THE ONE PLACE either mobile tool turns a packet into text. Both call sites
@@ -83,9 +83,25 @@ async def _mobile_packet_text(ask: PacketAsk) -> str:
     """The rendered packet, PLUS this turn's screen captured and recorded."""
     packet, session_token = ask.packet, ask.session_token
     body = ask.resolved if isinstance(ask.resolved, dict) else {}
-    unusable, attach = _mobile_screen_attach(packet)
-    note = await _mobile_capture_screen_note(ShotTurn(packet, body, ask.budget), attach)
+    note = await _mobile_report_shot(ShotTurn(packet, body, ask.budget))
     run_id = str(body.get("run_id") or "")
-    memo = MemoCtx(run_id, str(session_token or ""), note, unusable)
+    memo = MemoCtx(run_id, str(session_token or ""), _screen_unusable(packet), note)
     shown, brief_needed = _packet_shown(packet, memo)
     return _packet_block(shown, session_token, brief_needed)
+
+
+STILL_CHANGING_NOTE = "screen: still changing after 3 s; use wait-until-text"
+
+
+def still_changing_note(body: dict) -> str:
+    """The line telling the model the screen never settled, else ``""``.
+
+    Read from the last trace entry of the run body's case (the wait that
+    stopped at its cap stamped ``still_changing`` there).
+    """
+    case = body.get("case") if isinstance(body, dict) else None
+    trace = case.get("trace") if isinstance(case, dict) else None
+    last = trace[-1] if isinstance(trace, list) and trace else None
+    if isinstance(last, dict) and last.get("still_changing"):
+        return "\n" + STILL_CHANGING_NOTE
+    return ""

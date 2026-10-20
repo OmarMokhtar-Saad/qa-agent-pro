@@ -86,10 +86,10 @@ async def _target_step(
     return step, _guard_stop(run, step, at)
 
 
-def _terminal_stop(run: _ReplayRun, cur: Cur) -> dict | None:
+async def _terminal_stop(run: _ReplayRun, cur: Cur) -> dict | None:
     """The reply of a ``done`` or ``ask_tester`` step."""
     if cur.aim.op == "done":
-        return _done_stop(run, cur.aim.ref, cur.at)
+        return await _done_stop(run, cur.aim.ref, cur.at)
     return _ask_tester_step(run, cur.aim.ref, cur.at)
 
 
@@ -178,7 +178,7 @@ async def _replay_one(run: _ReplayRun, turn: Turn, item: tuple) -> dict | None:
     op = str(getattr(action, "op", "") or "")
     cur = Cur(Aim(op, action), StepAt(index, cast("dict", entry), turn.state.screen))
     if op in ("done", "ask_tester"):
-        return _terminal_stop(run, cur)
+        return await _terminal_stop(run, cur)
     if op == "tap_text_if_present":
         present = await _present_cur(run, turn, cur)
         if present is None or isinstance(present, dict):

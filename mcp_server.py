@@ -47,7 +47,6 @@ from handlers.mcp_srv_content import (  # noqa: E402, F401
     _image_content_blocks,
     _mobile_reply,
     _prepare_payload_to_content,
-    _with_script_doc,
 )
 from handlers.mcp_srv_driftloop import _drift_watch  # noqa: E402, F401
 from handlers.mcp_srv_elicit import (  # noqa: E402, F401

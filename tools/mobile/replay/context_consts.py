@@ -29,29 +29,17 @@ STATUS_ERROR = "error"
 #: change is not evidence of anything -- see ``_has_verification``.
 STATUS_UNVERIFIED = "unverified"
 
-#: How often a polling ``wait`` re-dumps the screen.
-#:
-#: THE DUMP IS THE RATE LIMITER, not this value. ``uiautomator dump`` blocks
-#: until the accessibility layer goes idle, and that wait dominates a poll
-#: iteration by a wide margin -- no flag reduces it. So a sleep on top of it
-#: bought nothing and lengthened EVERY iteration by its own full value, on a
-#: loop that may run until :data:`DEFAULT_WAIT_UNTIL_TEXT_S`. What is left here
-#: is only what stops a tight loop against a device that answers instantly,
-#: which is a fake in a test rather than a phone.
-#:
-#: The dump's cost is a DEVICE fact this tree does not own and no number for it
-#: is written here; ``tests/live/test_mobile_adb_latency_sweep.py`` measures it
-#: and asserts the ordering this reasoning rests on.
-WAIT_POLL_S = 0.25
-
 #: How long a step waits for its target to appear after the previous action of
 #: the script changed the screen (``target_wait``); bounded by the submit budget.
 TARGET_WAIT_S = 6.0
 
-#: The longest pause a watched poll backs off to while the screen stays the
-#: same: the pause doubles per unchanged read from ``WAIT_POLL_S`` up to this,
-#: so a long wait on a static screen is not 13 dumps in 3 s. Any change resets it.
-WAIT_POLL_MAX_S = 0.5
+#: How long a settle waits for the screen to start moving after an action
+#: (phase 1 of :mod:`waits_gen`); a screen that never moves says so after this.
+MOVE_S = 1.5
+
+#: The longest a settle waits for a moving screen to go quiet (phase 2 of
+#: :mod:`waits_gen`); at the cap the result says ``still_changing``.
+PROBE_BUDGET_S = 3.0
 
 #: The longest :func:`_auto_settle` keeps reading after a screen-changing
 #: action whose first post-action read showed NO change (owner decision, batch
@@ -61,8 +49,8 @@ WAIT_POLL_MAX_S = 0.5
 AUTO_SETTLE_MAX_S = 2.0
 
 #: The longest an explore turn waits for the screen to change. The wait is
-#: event/probe driven and ends at the first change, then holds it still on the frame probe
-#: (:mod:`changed_settle`: no extra dump when it is quiet), so this is
+#: event driven and ends at the first change, then holds it still on the
+#: event clock (:mod:`waits_gen`: no extra dump when it is quiet), so this is
 #: only the bound of a change that never comes. It must outlast app timers
 #: (a splash that moves on after several seconds): a 3s cap reported a false
 #: "did not change" on a real Splash -> Onboarding move. Scripted runs keep the

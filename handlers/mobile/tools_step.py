@@ -15,7 +15,6 @@ def _register_mobile_submit_step_tool(mcp, kit, rt) -> None:
     ContentBlock: Any = kit.content_block
 
     @mcp.tool()
-    @rt._with_script_doc
     async def qa_submit_mobile_step(  # noqa: PLR0913 - MCP tool schema
         run_id: str,
         ctx: Context,
@@ -36,11 +35,7 @@ def _register_mobile_submit_step_tool(mcp, kit, rt) -> None:
         save_route: str = "",
         finding: str = "",
     ) -> list[ContentBlock]:
-        """Submit the action script YOU planned for a mobile packet.
-
-        The reply is the verdict plus the NEXT packet. For a credential, ask the TESTER for that field and pass it as tester_input with tester_input_field (several: tester_inputs='{"login_password": "...", "login_otp": "..."}'); it is typed into the app and stored nowhere. Pass confirm_destructive=true only after the TESTER confirms a guard stop.
-
-        `note`: as on `qa_mobile_test`. Report only what a qa_* observation read. If the server cannot type or act, stop and name the blocker; no raw adb, no claimed result. `finding`: explore runs only, one observation per turn."""
+        """Submit the action script YOU planned for the current mobile packet; the reply is the verdict plus the NEXT packet. `script`: {"actions":[...]}, at most 10 per step (ops and selectors: MOBILE RULES in the first reply). Credential: ask the TESTER, pass tester_input + tester_input_field. `finding`: explore runs only."""
         fields = {k: v for k, v in locals().items() if k not in _STEP_UNSENT}
         return await rt._mobile_reply(
             rt.MobileReplySpec(

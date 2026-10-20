@@ -11,8 +11,8 @@ from tools.mobile.perception_limits import (
     MAX_PACKET_HEADROOM,
     MIN_USABLE_ELEMENTS,
 )
-from tools.mobile.perception_line import _rows, element_line
-from tools.mobile.perception_render import render_lines
+from tools.mobile.perception_line import _rows
+from tools.mobile.perception_render import plain_lines, render_lines
 from tools.mobile.perception_summary import _summary_lines
 from tools.mobile.perception_text import _count
 from tools.untrusted import wrap_untrusted
@@ -90,7 +90,7 @@ def _rendered_pair(elements: list) -> tuple:
     """``(rendered, plain)`` element lines, each cut to the packet bound."""
     bound = MAX_ELEMENTS + MAX_PACKET_HEADROOM
     rendered = render_lines(elements)[:bound]
-    plain = [element_line(element) for element in elements][:bound]
+    plain = plain_lines(elements)[:bound]
     return rendered, plain
 
 

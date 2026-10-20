@@ -16,7 +16,6 @@ from tools.mobile.replay.context_consts import (  # noqa: F401
     STATUS_NEEDS_TESTER,
     STATUS_UNVERIFIED,
     SUBMIT_BUDGET_S,
-    WAIT_POLL_S,
     logger,
 )
 from tools.mobile.replay.context_ctx import (  # noqa: F401

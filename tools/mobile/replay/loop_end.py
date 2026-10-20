@@ -12,6 +12,7 @@ from tools.mobile.replay.context import (
 from tools.mobile.replay.guard import NOTHING_MOVED_NOTE, inert_ops
 from tools.mobile.replay.screen import _has_verification, _verification_summary
 from tools.mobile.replay.steps_stop import _reply
+from tools.mobile.replay.stop_shot import stop_shot
 
 _REASON_VERIFIED_TAIL = (
     ". The script ended without a done() action, so this verdict "
@@ -96,7 +97,7 @@ def _lead_word(reason: str, trace: list[dict]) -> str:
 # rather than folded into the ladder because it is orthogonal to all four:
 # a verified turn and an exploratory one are equally worth telling that
 # nothing moved.
-def _end_of_script(run: _ReplayRun, screen: dict | None) -> dict:
+async def _end_of_script(run: _ReplayRun, screen: dict | None) -> dict:
     """The reply of a script that never calls done() (why: above)."""
     ctx, trace = run.ctx, run.trace
     ended_verified = _has_verification(trace)
@@ -107,5 +108,6 @@ def _end_of_script(run: _ReplayRun, screen: dict | None) -> dict:
     if inert:
         reason = (NOTHING_MOVED_NOTE % ", ".join(inert)) + reason
     verdict = "" if ended_verified else STATUS_UNVERIFIED
+    await stop_shot(run, screen)
     stop = ReplayStop(STATUS_DONE, trace, screen, verdict, reason, len(run.items) - 1)
     return _reply(_result(stop))

@@ -129,6 +129,8 @@ from tools.mobile.run_memo import (  # noqa: F401
     last_screen,
     mark_briefed,
     mark_screen,
+    note_schema,
+    shown_ids,
 )
 from tools.mobile.run_observations import (  # noqa: F401
     _write_observation,

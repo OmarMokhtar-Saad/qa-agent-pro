@@ -55,20 +55,15 @@ def _flag_visual_check(case: dict) -> None:
         _want["visual"] = True
 
 
-# Forget the run's briefing when the replay needed the model.
-#
-# A script this server could not parse is the observable signal that the
-# model no longer has the static block in front of it -- a compacted chat, or
-# one that never received it. Forgetting the briefing is what makes the
-# omission self-healing: the very next packet carries the whole block again.
-# Constraint 5 of the contract.
+# The briefing is NOT cleared when the replay needed the model: the chat
+# still holds the block, and the screen memo is what `#n` selectors resolve
+# against. A chat that really lost them gets the brief again through its
+# session token changing. Only the visual check is flagged here.
 def _forget_briefing_if_needs_model(run_id: str, case: dict) -> None:
     """Forget the run's briefing when the replay needed the model."""
 
     if str(case.get("status") or "") != _case_runner.NEEDS_MODEL:
         return
-    run_store.clear_briefing(run_id)
-    run_store.clear_screen(run_id)
     _flag_visual_check(case)
 
 

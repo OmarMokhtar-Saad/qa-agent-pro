@@ -15,24 +15,7 @@ class Probe(NamedTuple):
     ms: int
     met: Any
     label: str
-    gate: str = ""
     early: bool = False
-
-
-class Pace(NamedTuple):
-    """One poll's timing: the monotonic *deadline* and the *pause* before its read."""
-
-    deadline: float
-    pause: float
-
-
-class Poll(NamedTuple):
-    """One gated poll: the probe gate (or ``None``), the deadline, the last read's seconds, the unchanged reads in a row."""
-
-    gate: Any
-    deadline: float
-    took: float
-    quiet: int = 0
 
 
 class TextWait(NamedTuple):

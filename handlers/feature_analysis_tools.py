@@ -64,7 +64,7 @@ def _register_fa_start_tool(mcp, kit, rt) -> None:
         jira_content_json: str = "",
         serial: str = "",
     ) -> list[ContentBlock]:
-        """Start a compact enterprise Feature Analysis Report. Chat-only: no model call; it returns a task envelope YOU answer, then call qa_submit_feature_analysis with the task_id and your JSON report. mode: jira (description or Jira URL), mobile (capture device screens) or jira_mobile; omit it and the server asks. A Jira URL may first return a DIRECTIVE: fetch with your own mcp__atlassian__getJiraIssue and call again with jira_content_json set to the raw result as a JSON STRING."""
+        """Start a compact Feature Analysis Report. Chat-only: returns a task envelope YOU answer, then call qa_submit_feature_analysis with the task_id and your JSON report. mode: jira | mobile | jira_mobile (omit: the server asks). A Jira URL may first return a DIRECTIVE: follow it."""
         args = (feature_or_url, mode, device_id, serial, jira_content_json)
         coro = feature_analysis.handle_feature_analysis(_fa_call(rt, ctx, args))
         reply = await rt._tracked_noted("qa_feature_analysis", ctx, coro)
@@ -78,7 +78,7 @@ def _register_fa_submit_tool(mcp, kit, rt) -> None:
     async def qa_submit_feature_analysis(
         task_id: str, report_json: str, ctx: Context
     ) -> str:
-        """Submit the Feature Analysis JSON YOU wrote for a task opened by qa_feature_analysis. Produce a SINGLE JSON object matching the envelope's response_schema and pass it with the task_id as `report_json`. The server validates it, renders the report, and, if the submission carried no usable object, gives ONE resubmit round against a new task_id."""
+        """Submit the Feature Analysis JSON YOU wrote for a task opened by qa_feature_analysis: ONE JSON object matching the envelope's response_schema, as `report_json` with the task_id. Invalid input gets ONE resubmit round against a new task_id."""
         return await rt._tracked(
             "qa_submit_feature_analysis",
             ctx,

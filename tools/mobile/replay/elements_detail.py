@@ -132,7 +132,7 @@ TYPE_HINT = (
 def missing_element_detail(resolved: Any) -> str:
     """Why a target resolved to nothing, in the model's own terms."""
     body = resolved if isinstance(resolved, dict) else {}
-    detail = _missing_reason(body)
+    detail = str(body.get("ref_note") or "") or _missing_reason(body)
     return detail + TYPE_HINT if body.get("op") == "type" else detail
 
 

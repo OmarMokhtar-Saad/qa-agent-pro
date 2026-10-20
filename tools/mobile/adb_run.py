@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 
-from tools.mobile import dump_reuse, step_timing
+from tools.mobile import adb_sock, dump_reuse, step_timing
 from tools.mobile.adb_host import host
 from tools.process_runner import ArunOpts, arun
 
@@ -34,7 +34,19 @@ def _cmd_for_log(cmd: list[str], stdin_data: bytes | None = None) -> str:
     return rendered
 
 
-async def _spawn(cmd: list[str], timeout: float, stdin_data: bytes | None):
+async def _via_socket(cmd: list[str], timeout: float, clock: list[float]):
+    """The adb-server socket's result for *cmd*, or ``None`` for the subprocess path."""
+    if not adb_sock.applicable(cmd):
+        return None
+    clock.append(host().time.monotonic())
+    r = await adb_sock.try_run(cmd, timeout)
+    if r is None:
+        clock.clear()
+        logger.debug("mobile.adb: socket fault, subprocess for %ss", adb_sock.RETRY_S)
+    return r
+
+
+async def _subprocess(cmd: list[str], timeout: float, stdin_data: bytes | None):
     # A single case makes dozens of adb calls. Without the no-window flag each
     # one flashes a console window on Windows, which reads as a broken editor.
     clock: list[float] = []
@@ -54,6 +66,15 @@ async def _spawn(cmd: list[str], timeout: float, stdin_data: bytes | None):
         ),
     )
     return r, clock
+
+
+async def _spawn(cmd: list[str], timeout: float, stdin_data: bytes | None):
+    clock: list[float] = []
+    if stdin_data is None:
+        r = await _via_socket(cmd, timeout, clock)
+        if r is not None:
+            return r, clock
+    return await _subprocess(cmd, timeout, stdin_data)
 
 
 def _warn_timed_out(cmd: list[str], timeout: float, stdin_data: bytes | None) -> None:

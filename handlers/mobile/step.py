@@ -16,10 +16,6 @@ from handlers.mobile.step_audit import (  # noqa: F401
 )
 from handlers.mobile.step_capture import (  # noqa: F401
     ShotTurn,
-    _capture_and_pick_spec,
-    _mobile_capture_screen_note,
-    _mobile_screen_attach,
-    _store_mobile_shot,
 )
 from handlers.mobile.step_memo import (  # noqa: F401
     MemoCtx,
@@ -55,7 +51,6 @@ from handlers.mobile.step_resume import (
     _mobile_resume_device_stage as mobile_resume_device_stage,  # noqa: F401
 )
 from handlers.mobile.step_state import (  # noqa: F401
-    _MOBILE_IMAGE_SPECS,
     _MOBILE_LEARN_TASKS,
     _MOBILE_RUN_ENV,
     _MOBILE_SAME_SCREEN_NOTE,

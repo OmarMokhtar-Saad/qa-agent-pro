@@ -5,13 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from handlers.mobile.step_state import _MOBILE_SAME_SCREEN_NOTE
 from tools.mobile import render as mobile_render
 from tools.mobile import run_store as mobile_run_store
-from tools.mobile import screenshot as mobile_screenshot
 
 logger = logging.getLogger("tools.mcp_handlers")
 
@@ -20,18 +20,36 @@ _POSITION_KEYS = ("kind", "tc_id", "turn", "escapes_used", "trace", "stopped_bec
 
 @dataclass(frozen=True)
 class MemoCtx:
-    """Who a memo is for (run, chat token) and what the capture said (note, unusable)."""
+    """Who a memo is for (run, chat token) and whether the screen is unusable."""
 
     run_id: str
     token: str
-    note: str
     unusable: str
+    note: str = ""
 
 
 def _without_briefed(shown: dict, block_hash: str = "") -> dict:
     """``shown`` without the static block and the goal (the chat has seen both)."""
 
     return mobile_render.without_goal(mobile_render.without_static(shown, block_hash))
+
+
+def _schema_pointer(schema: dict) -> str:
+    """The one-line stand-in for a response schema the chat already holds."""
+    required = [str(name) for name in schema.get("required") or []]
+    return "as in step 1 (required: " + ", ".join(required) + ")"
+
+
+def _schema_once(shown: dict, run_id: str) -> dict:
+    """*shown* with the response schema whole once per run, a pointer after."""
+    schema = shown.get("response_schema")
+    if not isinstance(schema, dict):
+        return shown
+    text = json.dumps(schema, sort_keys=True, default=str)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+    if not mobile_run_store.note_schema(run_id, digest):
+        return shown
+    return {**shown, "response_schema": _schema_pointer(schema)}
 
 
 def _same_hash(seen: dict, block_hash: str) -> bool:
@@ -66,6 +84,7 @@ def _mobile_briefing_memo(shown: dict, run_id: str, token: str) -> tuple[dict, b
             brief_needed = False
         else:
             mobile_run_store.mark_briefed(run_id, token, block_hash)
+        shown = _schema_once(shown, run_id)
     except Exception:
         logger.exception("mcp mobile static-block memo failed")
     return shown, brief_needed
@@ -94,8 +113,15 @@ def _same_screen(last: dict, ids: tuple, token: str) -> bool:
     )
 
 
+def _shown_ids(store: Any, memo: MemoCtx, block: str) -> tuple:
+    """Hashed ids behind the ``#n`` lines of *block*, in line order."""
+    shown = len(re.findall(r"^#\d+ ", block, re.MULTILINE))
+    rows = ((store.latest_screen(memo.run_id) or {}).get("elements")) or []
+    return tuple(str(r.get("id") or "") for r in rows[:shown] if isinstance(r, dict))
+
+
 def _mark_screen(store: Any, memo: MemoCtx, ids: tuple) -> None:
-    seen = store.ScreenMemo(memo.token, ids[1], ids[2])
+    seen = store.ScreenMemo(memo.token, ids[1], ids[2], _shown_ids(store, memo, ids[0]))
     store.mark_screen(memo.run_id, seen)
 
 
@@ -111,11 +137,7 @@ def _mobile_screen_memo(shown: dict, memo: MemoCtx) -> None:
         ids = _screen_ids(shown)
         block, fingerprint, position = ids
         last = (mobile_run_store.last_screen(memo.run_id) or {}).get("content") or {}
-        if (
-            _same_screen(last, ids, memo.token)
-            and not memo.unusable
-            and memo.note != mobile_screenshot.ATTACHED_NOTE
-        ):
+        if _same_screen(last, ids, memo.token) and not memo.unusable:
             shown["screen_block"] = _MOBILE_SAME_SCREEN_NOTE.format(fp=fingerprint)
         if block:
             _mark_screen(mobile_run_store, memo, ids)
@@ -144,10 +166,11 @@ def _mobile_shown_packet(packet: dict, memo: MemoCtx) -> tuple[dict, bool]:
     # A COPY: the packet is the caller's own dict, and a note written into
     # it would outlive this reply.
     shown = dict(packet)
-    shown["screen_image"] = memo.note
     if memo.run_id and memo.token:
         shown, brief_needed = _mobile_briefing_memo(shown, memo.run_id, memo.token)
         _mobile_screen_memo(shown, memo)
+    if memo.note:
+        shown["screen_image"] = memo.note
     shown.pop("observation_id", None)
     shown.pop("screen_unusable", None)
     return shown, brief_needed

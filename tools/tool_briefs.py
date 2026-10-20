@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from config.settings_guard import never_raise
+from tools import tool_details
 
 try:
     from tools.mobile import path_plan_text
@@ -25,8 +26,18 @@ except ModuleNotFoundError as _exc:  # a build with no mobile package: never ser
         raise
     path_plan_text = None
 
-TOOL_DESCRIPTION_MAX_CHARS = 1200
-TOOL_DESCRIPTIONS_TOTAL_MAX_CHARS = 15000
+TOOL_DESCRIPTION_MAX_CHARS = 350
+TOOL_DESCRIPTIONS_TOTAL_MAX_CHARS = 8000
+TOOL_LIST_JSON_MAX_CHARS = 20500
+MOBILE_REMINDER_MAX_CHARS = 300
+
+#: Rides every packet after the first of a chat, in place of ``MOBILE_BRIEF``.
+MOBILE_REMINDER = (
+    "Reminder (full rules in step 1): act from the element list by its #n "
+    "index. One step = every action possible on THIS screen (fill all fields, "
+    "tick, tap Next); do not guess the next screen. Answer in the step-1 "
+    "form, via qa_submit_mobile_step only."
+)
 
 MOBILE_BRIEF = """\
 MOBILE RULES (qa_mobile_test / qa_submit_mobile_step / qa_mobile_status)
@@ -45,7 +56,7 @@ If the tester already has an emulator running, pass its adb serial (e.g. `emulat
 
 If the same cases are already an unfinished run of the same app, qa_mobile_test answers with THAT run's id instead of starting another one. Pass new_run=true only when the tester has asked for a fresh run: a second run of the same cases produces a second report of the same work.
 
-DUMP FIRST: plan from the element list. A PNG of the screen is attached only when the list is not enough (no dump, too few elements, a WebView, mostly unlabelled controls), when you pass screenshot=true, or when your last script ended with {"op": "assert", "kind": "visual", "note": "..."}; when attached, LOOK AT IT. Each packet's screen_image note says which. Coordinates always come from the element list. A screen byte-identical to the one this chat was just sent is replaced by a one-line same-screen note: the list you already have is still exact.
+DUMP FIRST: plan from the element list. No image is attached. One PNG is written to the report at done, a failed assert, screenshot=true or a blind screen (no usable list); the packet text gives its path. Coordinates always come from the element list. A screen byte-identical to the one this chat was just sent is replaced by a one-line same-screen note: the list you already have is still exact.
 
 Submitting (qa_submit_mobile_step): the server validates the script against the action vocabulary, replays it on the device, and returns the verdict plus the NEXT packet. When a packet asked for a credential, ask the TESTER for that one field and pass it as tester_input with tester_input_field set to the field name: it is typed into the app and stored nowhere -- not in the report, the checkpoint or the audit log.
 
@@ -57,7 +68,7 @@ One script may carry SEVERAL actions, replayed in order until one needs the scre
 
 To type into a form field, prefer {"op": "fill", "label": "Email", "text": "user@example.com"} over a tap then a type: it finds the editable field by its hint, text or description, or the nearest field below or right of a matching label, taps it, types and checks the text landed. `field` is read only for a secret fill (a plain fill ignores it) and never replaces `text`: a plain fill needs `text`, as above. For a secret send "secret": true with "field" naming the tester input, never the value. If two fields match, the step is refused with the candidates named: resend with a narrower label.
 
-The NEXT packet carries a PNG of the screen only when the element list is not enough, when you pass screenshot=true, or when this script ENDS with {"op": "assert", "kind": "visual", "note": "<what to judge>"} (that stop is not charged as an escape, up to a cap). Its screen_image note says whether one is attached.
+No image is attached to the next packet; a PNG is written to the report only at done, a failed assert, screenshot=true or a blind screen, and the packet text gives its path.
 
 When the destructive guard stops a control and the TESTER confirms it, resubmit with confirm_destructive=true: it unlocks only the control THIS case's last stop named, not any control -- resubmit the SAME op against the SAME element the stop pointed at. A different op, a different element, or a submission before any stop was recorded, refuses by name and does NOT spend the confirm, so the next, correctly-aimed resubmission can still use it. A run whose charter says `destructive: none` still refuses.
 
@@ -78,6 +89,8 @@ SCREEN PEEK: `qa_capture_screens(peek=true)` returns the current Android screen'
 AVDS: never run `avdmanager`, `sdkmanager` or `emulator` yourself in a shell. Use `qa_mobile_test(emulator=...)`: `list` (read-only), `boot` (`avd=NAME`, `apply=true`), `create` (`avd=NAME`, `system_image=` an installed image id shown by `list`, `apply=true`) and `delete` (`avd=NAME`, `apply=true` AND `confirm_destructive=true`, only after the TESTER says yes). A name is letters, digits, `.`, `_`, `-`, not starting with `.` or `-`. Create uses only system images that are already installed and downloads nothing: if none is, relay the steps in the reply. If the reply says this computer cannot run the emulator (no hypervisor), relay its fix text and suggest a real device; do not look for another way to start one.
 
 Never sleep in a shell between calls: a shell sleep is a wait nobody watches; use a `wait` action with a condition. A `wait` waits for `ms`, for `until_text`, or for an element by resource id: `until_rid` (present), with `until_gone=true` (gone) or `until_rid_text` (its text or description contains it). `until_text` and `until_rid` never go together.
+
+PACKET RULES (moved from the packet's system prompt): a control labelled Voice, Record or Mic is NEVER the Send control. Short ids describe the element on the screen you were given; a stale one is handed back, never mistapped, but costs a turn. Never send TWO selectors that name different elements, nor one that matches nothing alongside one that matches. After a tap that opens a new page, the next packet hands you that screen: plan it then, targeting by role, rid, label or text; never redo steps that ran. For 'the app replies' assert new_text (optionally with contains) or text_present, NEVER screen_changed. A raw shell call bypasses the IME, the step record and the tester's report, and one submit replays a whole script where a shell call replays one action. No capture, status, app_info, list_devices, search_corpus or get_mcp_tools during a run. done(verdict): 'pass' = you verified the expected results, 'fail' = you verified they did not hold, 'blocked' = you could not tell; guessing 'pass' is the worst answer.
 """
 for _tok, _name in (
     ("@@PATH_PLAN@@", "PATH_PLAN"),
@@ -179,3 +192,8 @@ def append_tool_note(name: str, result: object) -> object:
             return cast("Any", type(result))(text, images)
         return text
     return result
+
+
+# Detail moved out of the tool descriptions (fix/1510 WP-G): once per chat.
+MOBILE_BRIEF += tool_details.MOBILE_TOOL_DETAIL
+FLOW_BRIEF += tool_details.FLOW_TOOL_DETAIL

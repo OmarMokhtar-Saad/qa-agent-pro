@@ -24,15 +24,6 @@ class _PullJob(NamedTuple):
     clipped: dict
 
 
-class _FrameJob(NamedTuple):
-    """Everything ``_finish_step_frame`` needs: device, folder, screen, record."""
-
-    serial: str
-    directory: Path
-    screen_id: str
-    framed: dict
-
-
 class _Step(NamedTuple):
     """One submitted step as ``finish_step`` sees it."""
 

@@ -28,8 +28,6 @@ SKIPS = frozenset(
         "dump_reused_raw",
         "dump_carried",
         "dump_cut_served",
-        "probe_skip",
-        "gate_skip",
     }
 )
 

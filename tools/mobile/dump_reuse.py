@@ -57,7 +57,6 @@ _GEN: dict[str, int] = {}
 _HELD: dict[str, tuple] = {}
 _LAST: dict[str, tuple] = {}
 _REFUSED: list[tuple[float, str]] = []
-_SHOT_SKIP: list[str] = []
 
 
 def _serial_of(cmd: list[str]) -> str:
@@ -178,15 +177,7 @@ def take_after_refusal(serial: str) -> dict | None:
         return None
     if held[2] != token(serial) or now - held[1] > 4 * REFUSED_MAX_AGE_S:
         return None
-    _SHOT_SKIP[:] = [str(serial or "")]
     return copy.deepcopy(held[0])
-
-
-def consume_shot_skip(serial: str) -> bool:
-    """True once when this serial's dump was just re-served after a refusal."""
-    hit = bool(_SHOT_SKIP) and _SHOT_SKIP[0] == str(serial or "")
-    _SHOT_SKIP.clear()
-    return hit
 
 
 def reset() -> None:
@@ -195,4 +186,3 @@ def reset() -> None:
     _HELD.clear()
     _LAST.clear()
     _REFUSED.clear()
-    _SHOT_SKIP.clear()

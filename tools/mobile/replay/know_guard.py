@@ -7,6 +7,7 @@ from typing import Any, NamedTuple
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import app_knowledge, appk_consts
+from tools.mobile.replay import dump_activity
 from tools.mobile.replay.context import Context, _ReplayRun
 from tools.mobile.replay.dump import _focus_probe
 from tools.mobile.replay.guard import NON_ACTUATING_OPS
@@ -59,13 +60,20 @@ def _fired_note(guard: dict, kind: str, fired: Fired) -> dict:
     }
 
 
+async def _guard_focus(serial: str, budget: float) -> str:
+    """The focus an activity-scoped note is judged on; a tree device needs no adb."""
+    if dump_activity.tree_path(serial):
+        return dump_activity.hint(serial)
+    return await _focus_probe(serial, budget)
+
+
 async def _live_guards(ctx: Context, matched: list, deadline: float) -> list:
     """The matched guards whose activity condition holds on the live focus."""
     know = _known(ctx)
     probe = ""
     if any((g.get("when") or {}).get("activity") for g in matched):
         began = time.monotonic()
-        probe = await _focus_probe(ctx.serial, min(2.0, max(0.0, deadline - began)))
+        probe = await _guard_focus(ctx.serial, min(2.0, max(0.0, deadline - began)))
         know["spent_ms"] = int(know.get("spent_ms") or 0) + int(
             max(0.0, time.monotonic() - began) * 1000
         )

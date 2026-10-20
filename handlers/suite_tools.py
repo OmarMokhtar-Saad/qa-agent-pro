@@ -26,11 +26,7 @@ def _register_submit_suite_tool(mcp, kit, rt) -> None:
         step_assertion_ack: bool = False,
         quality_gate_ack: bool = False,
     ) -> str:
-        """Submit a host-generated suite to be validated, finalized, exported and persisted (the BACK half of host mode). Call AFTER qa_prepare_test_cases with its `prep_id` and `suite_json`: one JSON object with a merged `test_cases` array per the payload's response_schema (an object, or a JSON string).
-
-        Path A (after qa_submit_category): pass a small review SIDECAR, a JSON object with `duplicate_groups` (empty list if none) and NO `test_cases`; suite_json="" also finalizes but forfeits this review.
-
-        The reply is the finished suite plus the exported file path (relay it, do not ask which format), OR refusals and gaps: fix just those and call again with the SAME prep_id. The acks (volume_floor_ack, image_relevance_ack, step_assertion_ack, quality_gate_ack) work only after that refusal and only on the USER's word, never your own judgement."""
+        """Submit the host-generated suite (BACK half of host mode): `prep_id` from qa_prepare_test_cases and `suite_json` (merged test_cases), or a review sidecar after qa_submit_category. Reply: the finished suite + file path (relay it), or refusals: fix them and call again with the SAME prep_id. *_ack args only on the USER's word."""
         return await rt._tracked(
             "qa_submit_suite",
             ctx,
@@ -62,7 +58,7 @@ def _register_prep_status_tool(mcp, kit, rt) -> None:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def qa_prep_status(ctx: Context, prep_id: str = "") -> str:
-        """Show which categories are staged for a host-mode prep_id and whether the per-category (Path A) finalize is allowed yet. Use while staging with qa_submit_category. ready=yes means you may call qa_submit_suite with a small review SIDECAR carrying duplicate_groups, or suite_json="" (no review). Path B (full merged suite_json) does not need ready=yes."""
+        """Show which categories are staged for a host-mode prep_id and whether the finalize is allowed yet. ready=yes: call qa_submit_suite with a review sidecar or suite_json="". A full merged suite_json does not need ready=yes."""
         return await rt._tracked(
             "qa_prep_status",
             ctx,
@@ -78,7 +74,7 @@ def _register_category_job_tool(mcp, kit, rt) -> None:
     async def qa_get_category_job(
         ctx: Context, prep_id: str = "", category_name: str = ""
     ) -> str:
-        """Return ONE self-contained category generation job for a prep_id (system_prompt + user_context + instruction + response_schema). category_name should match orchestration.expected_categories; pass "all" (or "*") for EVERY job in ONE call, always preferred. Generation runs 6.5-24 minutes per category in your own chat model: tell the tester a short status line -- "Generating <category>..." -- before you start writing each category, so a long gap is never silent."""
+        """Return ONE category generation job for a prep_id. category_name must match orchestration.expected_categories; "all" returns EVERY job in ONE call (preferred). Tell the tester a short status line ("Generating <category>...") before writing each category."""
         _cache_key = ("qa_get_category_job", prep_id, category_name)
         _cached = rt._recent_call_cached(_cache_key)
         if _cached is not None:
@@ -112,7 +108,7 @@ def _register_category_and_export_tools(mcp, kit, rt) -> None:
         suite_json: str | dict = "",
         replace_smaller: bool = False,
     ) -> str:
-        """Submit ONE category's cases (Path A, recommended): stage each category as soon as it is written. Pass the `prep_id` from qa_prepare_test_cases, the category name and `suite_json` for THAT category (a JSON object, or a string). Re-submitting REPLACES that category; do not re-submit a staged one unless a reply asked (check `qa_prep_status`). Fewer cases than staged is REFUSED; replace_smaller=true only when deliberate. When all are staged, call qa_submit_suite with the same prep_id and an empty suite_json or a review SIDECAR."""
+        """Submit ONE category's cases (Path A): `prep_id`, category name, `suite_json` for it. Re-submitting REPLACES it; check `qa_prep_status` first. When all are staged call qa_submit_suite with the same prep_id and an empty suite_json or a review sidecar."""
         return await rt._tracked(
             "qa_submit_category",
             ctx,
@@ -133,7 +129,7 @@ def _register_category_and_export_tools(mcp, kit, rt) -> None:
         output_dir: str = "",
         prep_id: str = "",
     ) -> str:
-        """Export a stored suite (by suite_id) to csv | xlsx | gherkin | playwright | testrail; returns the written file path. Writes files only, never pushes to a TMS. `output_dir` is optional: a FULL path (`~/Desktop`); a bare relative word is refused. `prep_id` is NOT an export key: only the suite_id `qa_submit_suite` returns is."""
+        """Export a stored suite (by suite_id) to csv | xlsx | gherkin | playwright | testrail; returns the file path. Writes files only, never pushes. `output_dir` is optional: a FULL path (`~/Desktop`). `prep_id` is NOT a key: only the suite_id from qa_submit_suite."""
         return await rt._tracked(
             "qa_export_suite",
             ctx,

@@ -9,6 +9,7 @@ from tools.mobile.perception_content import _audit, _cap_and_label, _screen_cont
 from tools.mobile.perception_display import _display_rect
 from tools.mobile.perception_fields import _geometry_fields
 from tools.mobile.perception_nodes import _collect_elements, _parse_dump
+from tools.mobile.perception_viewport import more_below
 
 logger = logging.getLogger("tools.mobile.perception")
 
@@ -37,6 +38,7 @@ def _pruned_content(root: Any, request: tuple) -> dict:
     elements, truncated, drops = _cap_and_label(elements, selected)
     geometry = _geometry_fields((selected, frame), panel_axes, drops)
     extras = {**geometry, "truncated": truncated, "considered": considered}
+    extras["more_below"] = more_below(root, frame)
     content = _screen_content(elements, (texts, package, activity), extras)
     content["accessibility"] = _audit(content, density)
     return content

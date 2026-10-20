@@ -12,7 +12,7 @@ import sys
 #: Module-name prefixes (last dotted part) that are dump plumbing, never the site.
 #: ``mcp_`` frames are the MCP middleware wrapped around EVERY tool call (it
 #: awaits the whole step, replay time included), so it names no phase.
-_PLUMBING = ("step_", "dump", "screen_anchor", "screen_probe", "mcp_")
+_PLUMBING = ("step_", "dump", "mcp_")
 _NAME_CHARS = 40
 
 

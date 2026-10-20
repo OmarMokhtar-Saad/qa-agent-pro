@@ -11,7 +11,11 @@ from handlers.mobile.step_audit import (
     _parse_tester_inputs,
 )
 from handlers.mobile.step_hooks import mobile_step
-from handlers.mobile.step_packet import PacketAsk, _mobile_packet_text
+from handlers.mobile.step_packet import (
+    PacketAsk,
+    _mobile_packet_text,
+    still_changing_note,
+)
 from handlers.mobile.step_state import _mobile_route_kwargs
 from tools.mobile import render as mobile_render
 from tools.mobile import run_store, session_submit, step_timing
@@ -64,7 +68,7 @@ async def _step_tail(turn: StepTurn, body: dict) -> str:
         tail = await mobile_step.mobile_next(
             run_id, token, mobile_step.NextOpts(progress=progress, budget=budget)
         )
-    return tail
+    return tail + still_changing_note(body)
 
 
 async def _step_reply(turn: StepTurn, body: dict, previous_screen_id: str) -> str:

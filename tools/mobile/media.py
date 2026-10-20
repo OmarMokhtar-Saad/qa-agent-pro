@@ -58,7 +58,7 @@ from typing import Any  # noqa: F401
 
 from tools.mobile import actions as actions_mod  # noqa: F401
 from tools.mobile import adb, paths, run_store  # noqa: F401
-from tools.mobile.media_args import ClipRef, _FrameJob, _PullJob, _Step  # noqa: F401
+from tools.mobile.media_args import ClipRef, _PullJob, _Step  # noqa: F401
 from tools.mobile.media_clip import start_clip  # noqa: F401
 from tools.mobile.media_consts import (  # noqa: F401
     _UNSAFE,
@@ -85,7 +85,6 @@ from tools.mobile.media_consts import (  # noqa: F401
 )
 from tools.mobile.media_defer import flush, open_clips  # noqa: F401
 from tools.mobile.media_finish import (  # noqa: F401
-    _finish_step_frame,
     _finish_step_pull,
     finish_step,
 )

@@ -2,47 +2,96 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
 
-# One pruned element as a single compact line.
+from tools.mobile.perception_kind import IMPLIED_FLAGS, kind_of
+
+
+class Slot(NamedTuple):
+    """Where an element sits in the shown list, and how its rid is printed."""
+
+    n: int = 0
+    full_rid: bool = False
+
+
+# One pruned element as a single compact line:
+# ``#n kind "text" (desc) id=short_rid [label=".."] [role=..] [bounds] [flags]``.
 #
-# ``refs`` maps a FIELD NAME to the id of the element that already printed
-# that field's value, and only :func:`render_lines` passes it. With the
-# default ``None`` this function is byte-for-byte what it always was, which is
-# what lets the pins that grade it keep grading it.
+# ``refs`` maps a FIELD NAME (text / desc) to the ``#n`` of the element that
+# already printed that field's value, and only :func:`render_lines` passes it.
+# *slot* is the element's place in the shown list; without one the ``#n`` is
+# left off and the line is the bare per-element form.
 #
 # THE SUBSTITUTION HAPPENS ON THE PART, NEVER ON THE FINISHED LINE. Replacing
-# ``desc="V"`` in the joined string finds the FIRST occurrence of that
-# substring, and no attribute is escaped -- so an element whose *text* value
-# happens to read ``desc="V"`` had its TEXT rewritten to ``desc=@e1`` while
-# the duplicate desc was still printed in full. The model was handed a value
-# the app never displayed, on exactly the kind of screen this feature targets:
-# a chat carrying markup. Found by EXECUTING, in the adversarial review of the
-# commit that introduced it.
-def element_line(element: dict, refs: dict | None = None) -> str:
+# a value in the joined string finds the FIRST occurrence of that substring,
+# and no attribute is escaped -- so an element whose *text* happens to read
+# like a desc had its TEXT rewritten while the duplicate was still printed in
+# full. Found by EXECUTING, in the adversarial review of the commit that
+# introduced the dedupe.
+def element_line(
+    element: dict, refs: dict | None = None, slot: Slot | None = None
+) -> str:
     """One pruned element as a single compact line."""
     pointers = refs if isinstance(refs, dict) else {}
-    return " ".join(_head_parts(element, pointers) + _tail_parts(element))
+    where = slot or Slot()
+    head = ["#" + str(where.n)] if where.n else []
+    parts = head + [kind_of(element)] + _head_parts(element, pointers, where)
+    line = " ".join(parts + _tail_parts(element))
+    return line if len(line) <= LINE_CAP else _shrunk_line(element, pointers, where)
+
+
+def _shrunk_line(element: dict, pointers: dict, slot: Slot) -> str:
+    """The line again with text, desc and label cut, flags and role kept."""
+    cut = {
+        key: capped(str(element.get(key) or "")) for key in ("text", "desc", "label")
+    }
+    shrunk = {**element, **cut}
+    parts = ["#" + str(slot.n)] if slot.n else []
+    parts += [kind_of(shrunk)] + _head_parts(shrunk, pointers, slot)
+    return " ".join(parts + _tail_parts(shrunk))
+
+
+#: A whole list line longer than this is shrunk by cutting its long fields.
+LINE_CAP = 400
+
+#: Most characters of one text, desc or label kept when a line is shrunk.
+LINE_FIELD_CAP = 120
+
+
+def capped(value: str) -> str:
+    """*value* cut to :data:`LINE_FIELD_CAP` characters, ``…`` marking the cut."""
+    if len(value) <= LINE_FIELD_CAP:
+        return value
+    return value[: LINE_FIELD_CAP - 1] + "…"
+
+
+def field_text(name: str, value: str) -> str:
+    """How a field value is printed in full: ``"text"`` or ``(desc)``."""
+    return '"' + value + '"' if name == "text" else "(" + value + ")"
 
 
 def _field_part(name: str, value: str, pointers: dict) -> str:
-    """``name="value"``, or ``name=@id`` when an earlier element printed it."""
-    return (
-        name + "=@" + pointers[name] if name in pointers else name + '="' + value + '"'
-    )
+    """The value in full, or ``@#n`` when an earlier element printed it."""
+    if name not in pointers:
+        return field_text(name, value)
+    return "@" + pointers[name] if name == "text" else "(@" + pointers[name] + ")"
 
 
-def _head_parts(element: dict, pointers: dict) -> list[str]:
-    """Id, class, text, desc and rid."""
-    parts = [str(element.get("id") or "?"), str(element.get("cls") or "?")]
+def short_rid(rid: str) -> str:
+    """The part of a resource id after ``/``."""
+    return rid.rsplit("/", 1)[-1]
+
+
+def _head_parts(element: dict, pointers: dict, slot: Slot) -> list[str]:
+    """Text, desc and rid."""
     text = str(element.get("text") or "")
     desc = str(element.get("desc") or "")
     rid = str(element.get("rid") or "")
-    if text:
-        parts.append(_field_part("text", text, pointers))
+    parts = [_field_part("text", text, pointers)] if text else []
     if desc and desc != text:
         parts.append(_field_part("desc", desc, pointers))
     if rid:
-        parts.append("rid=" + rid)
+        parts.append("id=" + (rid if slot.full_rid else short_rid(rid)))
     return parts
 
 
@@ -57,20 +106,26 @@ def _label_parts(element: dict) -> list[str]:
 
 
 def _tail_parts(element: dict) -> list[str]:
-    """Label, role, bounds and the boolean flags."""
+    """Label, role, bounds (only when nothing else names it) and the flags."""
     parts = _label_parts(element)
     role = str(element.get("role") or "")
     if role:
         parts.append("role=" + role)
     bounds = element.get("bounds") or []
-    if len(bounds) == 4:
+    nameless = not (element.get("text") or element.get("desc") or element.get("rid"))
+    if len(bounds) == 4 and nameless:
         parts.append("at[" + ",".join(str(int(v)) for v in bounds) + "]")
-    parts.extend(
+    return parts + _flag_parts(element)
+
+
+def _flag_parts(element: dict) -> list[str]:
+    """The true flags the kind does not already imply."""
+    implied = IMPLIED_FLAGS.get(kind_of(element), ())
+    return [
         name
         for name in ("clickable", "editable", "checked", "scrollable")
-        if element.get(name)
-    )
-    return parts
+        if element.get(name) and name not in implied
+    ]
 
 
 # The element list as dicts, or ``[]`` -- never an exception.

@@ -1,4 +1,4 @@
-"""``qa_mobile_test`` content: the AVD actions, the note intake and the screenshot sink."""
+"""``qa_mobile_test`` content: the AVD actions, the note intake and the screenshot request."""
 
 from __future__ import annotations
 
@@ -105,37 +105,29 @@ async def _mobile_note_intake_line(args: tuple, kwargs: dict, note: object) -> s
 
 
 def _arm(kwargs: dict, run_env: dict) -> tuple:
-    """Open the screenshot sink and the run env; the tokens to hand to ``_disarm``."""
+    """Open the screenshot request and the run env; the tokens to hand to ``_disarm``."""
     want = mobile_step._MOBILE_SHOT_WANT.set(
         {"asked": bool(kwargs.pop("screenshot", False))}
     )
-    token = mobile_step._MOBILE_IMAGE_SPECS.set([])
     env_token = mobile_step._MOBILE_RUN_ENV.set(run_env)
-    return want, token, env_token
+    return want, env_token
 
 
 def _disarm(tokens: tuple) -> None:
     """Close what ``_arm`` opened, in reverse order."""
-    want, token, env_token = tokens
+    want, env_token = tokens
     mobile_step._MOBILE_RUN_ENV.reset(env_token)
-    mobile_step._MOBILE_IMAGE_SPECS.reset(token)
     mobile_step._MOBILE_SHOT_WANT.reset(want)
 
 
-# ``handle_mobile_test``'s text PLUS the image specs of the screens it took.
+# ``(markdown, [])``: the tuple shape is kept for the tool layer, but a mobile
+# reply never carries an image (fast steps, WP-D); the screen reaches the report
+# only through ``run_shots.write_shot``.
 #
-# ``(markdown, [{filename, mime, data}, ...])`` -- the shape
-# ``mcp_server._image_content_blocks`` consumes, and the shape
-# ``handle_capture_screens`` already returns. THE entry point for the tool
-# layer; the ``str``-returning name stays exactly what it was for every other
-# caller and is this function's text, projected.
-#
-# Opening the sink is what ARMS the capture: see ``_MOBILE_IMAGE_SPECS``.
-#
-# ``emulator`` (list/boot/create/delete an AVD) is answered BEFORE the sink
-# opens: it is not a run step, takes no screenshot and shares no state with one.
+# ``emulator`` (list/boot/create/delete an AVD) is answered BEFORE the run is
+# armed: it is not a run step and shares no state with one.
 async def handle_mobile_test_content(*args, **kwargs) -> tuple:
-    """``handle_mobile_test``'s text PLUS the image specs of the screens it took."""
+    """``handle_mobile_test``'s text and an empty image list."""
     avd = _pop_avd(kwargs)
     if avd.action:
         return await _mobile_avd_reply(avd, StepCall(args, kwargs)), []
@@ -147,6 +139,6 @@ async def handle_mobile_test_content(*args, **kwargs) -> tuple:
         note = kwargs.pop("note", "")
         note_line = await _mobile_note_intake_line(args, kwargs, note)
         text = note_line + await mobile_run.handle_mobile_test(*args, **kwargs)
-        return text, list(mobile_step._MOBILE_IMAGE_SPECS.get() or [])
+        return text, []
     finally:
         _disarm(tokens)

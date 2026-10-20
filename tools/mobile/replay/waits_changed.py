@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import time
 
-from tools.mobile import screen_probe, watch
-from tools.mobile.replay.changed_probe import Plan, probed_changed
-from tools.mobile.replay.context import Context, _sleep
-from tools.mobile.replay.context_consts import (
-    EXPLORE_CHANGED_WAIT_MAX_MS,
-    WAIT_POLL_S,
-)
-from tools.mobile.replay.dump import _dump, _focus_probe
+from tools.mobile import a11y_events, watch
+from tools.mobile.replay.context import Context
+from tools.mobile.replay.context_consts import EXPLORE_CHANGED_WAIT_MAX_MS
+from tools.mobile.replay.dump import _dump
 from tools.mobile.replay.fresh_read import unchanged
 from tools.mobile.replay.screen import _screen_hash, system_dialog_package
 from tools.mobile.replay.waits_dialog import answer_new_dialog
+from tools.mobile.replay.waits_gen import await_move
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_poll import _wait_deadline
 from tools.mobile.replay.waits_prior import _spinning, already_changed
@@ -31,122 +28,55 @@ def _capped_ms(ctx: Context, ms: int) -> int:
     )
 
 
-async def _focus_moved(serial: str, before_focus: str, deadline: float) -> bool:
-    """True when the focused window is a known one different from *before_focus*."""
-    focus = await _focus_probe(serial, deadline - time.monotonic())
-    return bool(focus and focus != before_focus)
-
-
-async def _change_reusable(ctx: Context, screen: object, focus: tuple) -> bool:
-    """True when a poll's changed screen may stand for the post-wait screen.
-
-    It must be no spinner (a transient state) and the focused window, probed
-    AFTER the read, must still be the one the wait started on: the app did not
-    move under the dump, so the settle need not dump the same screen again.
-    """
-    before_focus, deadline = focus
-    if not before_focus or _spinning(screen):
-        return False
-    now = await _focus_probe(ctx.serial, deadline - time.monotonic())
-    return now == before_focus
-
-
-async def _changed_poll(ctx: Context, deadline: float) -> tuple:
-    """Sleep one poll, then read: ``(kind, content)``, kind ``cut``, ``error`` or ``read``."""
-    await _sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
-    if time.monotonic() >= deadline:
-        # A dump started at the deadline has no budget and is cut before
-        # it reads anything; the last read, at most one WAIT_POLL_S old,
-        # stands for the post-wait screen instead.
-        return "cut", None
-    dumped = await _dump(ctx, deadline=deadline)
-    if dumped.get("error"):
-        # WHY THIS DOES NOT REPORT, where `_wait_until_text`'s same
-        # failure does: this returns to a branch that immediately calls
-        # `_settle(redump=True)`, whose OWN `_dump` runs against the same
-        # device -- a device still failing is reported there as
-        # `dump_failed`, and one that has recovered did not deserve a
-        # failed step. Graded by
-        # `test_a_dump_error_during_a_polled_wait_is_not_lost`.
-        return "error", None
-    return "read", dumped.get("content")
-
-
 # Notes on _wait_until_changed (kept here so the function stays short).
 #
 # A wait exists because the planner expects the screen to become something
 # else; sleeping through the whole ``ms`` after it already has is the cheapest
-# thing this lane was getting wrong -- observed on run mrun-20260908-061316-
-# a41b2a, where fixed sleeps sat between every action.
+# thing this lane was getting wrong.
 #
-# NO FIXED SLEEP (S17, owner decision). There is no floor below which the wait
-# is slept instead of polled, and nothing is slept after the last poll: an
-# unchanged screen ends the wait at its bound, a changed one at the poll that
-# sees it. Each poll's dump is cut at the deadline (``_dump(ctx,
-# deadline=...)``), so even a dump slower than its p90 cannot carry the wait
-# past the ms it was given.
-#
-# It does not decide the screen the model SEES on a change. The caller still
-# settles with ``redump=True`` after an early return, so an intermediate screen
-# -- a spinner replacing a button IS a change -- is re-read before it is handed
-# over.
+# NO FIXED SLEEP. The dump is the poll (``waits_gen.await_move``): it re-dumps
+# until the event clock's generation moves, or until the wait's own deadline,
+# and each dump is cut at that deadline, so a slow dump cannot carry the wait
+# past the ms it was given. Without an event clock the baseline is the content
+# hash and a differing hash is the move.
 #
 # WHICH IDENTITY, and why it is the hash. ``_screen_id`` is package + activity
-# + the top three texts, and ``perception._screen_id`` says so: it is
-# deliberately coarse because the report dedupes on it. A chat reply is
-# appended at the BOTTOM, so the top three texts never move and the id is
-# byte-identical -- which made this loop blind to the one event it exists to
-# catch. ``_settle`` was moved to the hash for the same reason.
+# + the top three texts and is deliberately coarse; a chat reply is appended at
+# the BOTTOM, so the id is byte-identical. A moved generation whose tree hash
+# equals the starting one is NOT a change (a blinking cursor, a clock): the
+# wait re-baselines and keeps looking.
 #
-# ``reusable`` is also True for a change a poll SAW when it is no spinner and the
-# focus, probed after the read, is still the one the wait started on.
-# Otherwise it is True in ONE case only: the screen never changed and the wait
-# ended on a poll whose dump SUCCEEDED, so that dump is the post-wait screen and
-# the caller's settle skips its own (``redump=not reusable``). Every early
-# return is ``reusable=False``. That screen can be up to one :data:`WAIT_POLL_S`
-# old: a poll whose sleep reached the deadline dumps nothing, so the last
-# successful read stands for the post-wait screen.
-#
-# FOCUS FIRST. Each iteration asks ``adb.current_activity`` -- bounded by the
-# time left -- before paying for a dump. A focused window different from the one
-# PROBED when the wait started (never ``ctx.activity``, which may be stale) is a change, returned at once and never reusable. An empty answer on
-# either side is unknown, never a change.
-#
-# The baseline is PROBED at the start, never read from `ctx.activity`: that can
-# be stale after the first navigation, when every later probe would differ from it and end every wait at
-# its first poll. An empty or failed probe is UNKNOWN: this wait skips the focus
-# check and the dump path alone decides.
+# The caller settles with ``redump=not reusable``. A change is reusable unless
+# it is a spinner (a transient state); an unchanged wait is reusable when its
+# last dump succeeded and the service is known fresh (``fresh_read.unchanged``).
 async def _wait_until_changed(ctx: Context, screen: object, ms: int) -> tuple:
-    """Poll until the screen is not the one we started on: ``(screen, changed, reusable)``."""
+    """Wait until the screen is not the one we started on: ``(screen, changed, reusable)``."""
     before = _screen_hash(screen)
     if already_changed(ctx, before, screen):
         return screen, True, True
     deadline = _wait_deadline(ctx, _capped_ms(ctx, ms) / 1000.0)
-    base = await screen_probe.baseline(ctx.serial, deadline - time.monotonic())
-    if base is not None:
-        return await probed_changed(ctx, screen, Plan(base, deadline))
-    return await _dumped_changed(ctx, screen, deadline)
+    return await _changed_by_events(ctx, (screen, before), deadline)
 
 
-async def _dumped_changed(ctx: Context, screen: object, deadline: float) -> tuple:
-    """The wait without a usable frame probe: a focus check and a dump per poll."""
-    before = _screen_hash(screen)
-    before_focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
-    current, fresh, focus = screen, False, (before_focus, deadline)
-    ticker = watch.Ticker("waiting for the screen to change")
+async def _changed_by_events(ctx: Context, start: tuple, deadline: float) -> tuple:
+    """Re-baselining move loop of :func:`_wait_until_changed`."""
+    screen, before = start
+    base = a11y_events.latest(ctx.serial) or before
+    ticker, look = watch.Ticker("waiting for the screen to change"), None
     while time.monotonic() < deadline:
         await ticker.tick()
-        if before_focus and await _focus_moved(ctx.serial, before_focus, deadline):
-            return current, True, False
-        kind, content = await _changed_poll(ctx, deadline)
-        if kind != "read":
-            return current, False, fresh and kind == "cut"
-        current, fresh = content, True
-        if _screen_hash(current) != before:
-            return current, True, await _change_reusable(ctx, current, focus)
-        if system_dialog_package(current):  # unchanged AND covered: stop polling
-            return current, False, False
-    return await unchanged(ctx, (current, fresh), deadline)
+        moved, look = await await_move(ctx, base, deadline)
+        if look is None or look.error:
+            return screen, False, False
+        screen = look.tree
+        if not moved:
+            break
+        if _screen_hash(screen) != before:
+            return screen, True, not _spinning(screen)
+        if system_dialog_package(screen):  # unchanged AND covered: stop waiting
+            return screen, False, False
+        base = look.clock or _screen_hash(screen)
+    return await unchanged(ctx, (screen, look is not None), deadline)
 
 
 def _changed_detail(op: str, wait_ms: int, changed: bool) -> str:

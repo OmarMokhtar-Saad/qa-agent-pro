@@ -54,11 +54,12 @@ NO_ECHO = (
 #:
 #: THREE FIELDS THAT ARE NOT HERE, and must never be added:
 #:
-#: * ``response_schema`` -- it has TWO forms. The explore lane's carries
+#: * ``response_schema`` -- it has TWO forms, so it is NOT elided here: it is
+#:   sent whole once per run and per form by ``step_memo._schema_once``. The explore lane's carries
 #:   ``goal_reached`` / ``request_extension`` / ``extension_reason`` /
 #:   ``finding`` under ``additionalProperties: false``, so a model handed the
 #:   scripted lane's copy cannot end its own session. That is the defect the
-#:   whole first attempt was reverted for; ``test_mobile_schema_always`` is the
+#:   whole first attempt was reverted for; ``test_mobile_schema_once`` is the
 #:   pin.
 #: * ``instruction`` and ``worker_instructions`` -- three forms each, and they
 #:   are what tell the model how big a script to send. About 250 tokens to keep
@@ -71,15 +72,16 @@ STATIC_FIELDS: tuple[str, ...] = (
 
 #: What stands in their place. It names the RECOVERY, because a model that has
 #: lost the block and is told only "it was sent earlier" has been handed a dead
-#: end -- see ``run_store.clear_briefing``.
+#: end. The block is re-sent only when the chat or session changes; a script the
+#: server cannot parse does not bring it back.
 STATIC_OMITTED_NOTE = (
     "The system prompt, the action vocabulary and the untrusted-data notice "
     "went out in full with the FIRST packet of this run and have not changed "
     "since. Read them there rather than asking for them again. If they are no "
-    "longer in front of you, send your best attempt anyway: a script this "
-    "server cannot parse is answered with the whole block again, so this is "
-    "never a dead end. The response schema below is always current -- plan "
-    "against it and not against a remembered one."
+    "longer in front of you, send your best attempt anyway. The whole block "
+    "is sent again only when the chat or session changes. The response schema goes out whole with the first "
+    "packet of the run; a later packet names it in one line and its "
+    "required fields."
 )
 
 

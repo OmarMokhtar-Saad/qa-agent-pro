@@ -4,22 +4,17 @@ from __future__ import annotations
 
 import time
 
-from tools.mobile import a11y_events, dump_latency, latency_scale, watch
-from tools.mobile.replay.context import Context, _sleep
-from tools.mobile.replay.context_consts import (
-    DEFAULT_WAIT_UNTIL_TEXT_S,
-    WAIT_POLL_MAX_S,
-    WAIT_POLL_S,
-)
+from tools.mobile import dump_latency, latency_scale, watch
+from tools.mobile.replay.context import Context
+from tools.mobile.replay.context_consts import DEFAULT_WAIT_UNTIL_TEXT_S
 from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
-from tools.mobile.replay.probe_gate import KEEPS_GATE, TEXT, open_gate, rebased
 from tools.mobile.replay.screen import _screen_has_element, absent_from
 from tools.mobile.replay.waits_dialog import answer_unless_met
-from tools.mobile.replay.waits_early import gate_is_noise, quiet_exit, rest_pause
+from tools.mobile.replay.waits_early import quiet_exit
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_prior import _spinning
 from tools.mobile.replay.waits_quiet import settled
-from tools.mobile.replay.waits_types import Pace, Poll, Probe
+from tools.mobile.replay.waits_types import Probe
 
 
 def _wait_deadline(ctx: Context, seconds: float) -> float:
@@ -46,64 +41,17 @@ async def _read_now(ctx: Context, current: object, deadline: float) -> tuple:
     return None, dumped.get("content")
 
 
-async def _next_read(ctx: Context, current: object, pace: Pace) -> tuple:
-    """Pause, then read: ``(final_or_None, content, read_s)``.
-
-    ``read_s`` is how long the dump took, so the next pause can shrink by it.
-    """
-    deadline = pace.deadline
+async def _next_read(ctx: Context, current: object, deadline: float) -> tuple:
+    """Read: ``(final_or_None, content)``. The dump is the poll, so there is no
+    pause before it; at the deadline the wait is over."""
     if time.monotonic() >= deadline:
-        return (False, current, True), None, 0.0
-    await _sleep(min(pace.pause, max(0.0, deadline - time.monotonic())))
-    if time.monotonic() >= deadline:
-        return (False, current, True), None, 0.0
-    started = time.monotonic()
-    final, content = await _read_now(ctx, current, deadline)
-    return final, content, time.monotonic() - started
+        return (False, current, True), None
+    return await _read_now(ctx, current, deadline)
 
 
-def _pause_after(took: float, quiet: int = 0, clocked: bool = False) -> float:
-    """The pause before the next read: a dump that already took a poll interval
-    or longer is itself the pause, so none is added. After *quiet* unchanged
-    reads the interval doubles each time, up to ``WAIT_POLL_MAX_S``; with an
-    event clock reads are cheap and it stays at ``WAIT_POLL_S``."""
-    cap = WAIT_POLL_S if clocked else WAIT_POLL_MAX_S
-    interval = min(WAIT_POLL_S * (2 ** max(0, quiet)), cap)
-    return 0.0 if took >= interval else interval
-
-
-def _read_pause(ctx: Context, took: float, quiet: int) -> float:
-    """The pause before an ungated read; a screen at rest is polled slowly (P3)."""
-    clocked = a11y_events.latest(ctx.serial) is not None
-    return rest_pause(ctx.serial, quiet, _pause_after(took, quiet, clocked))
-
-
-async def _poll(ctx: Context, current: object, poll: Poll) -> tuple:
-    """One poll: ``(final, content, took, verdict)``. Verdict ``"calm"`` means
-    the gate vouched for *current* and no dump was taken."""
-    gate, deadline, took, quiet = poll
-    verdict = await gate.verdict(current, deadline) if gate else ""
-    if verdict == "calm":
-        return None, current, took, verdict
-    pause = 0.0 if verdict else _read_pause(ctx, took, quiet)
-    final, content, took = await _next_read(ctx, current, Pace(deadline, pause))
-    return final, content, took, verdict
-
-
-async def _keep_gate(gate: object, shown: object, seen: tuple) -> object:
-    """*gate* re-anchored on *shown*, or ``None`` once it only costs time (P4)."""
-    verdict, quiet = seen
-    if verdict not in KEEPS_GATE or gate_is_noise(quiet):
-        return None
-    return await rebased(gate, shown)
-
-
-async def _advance(ticker: watch.Ticker, gate: object, seen: tuple) -> object:
-    """The gate for the next poll of a wait, after one progress tick."""
-    content, verdict, quiet = seen
-    gate = await _keep_gate(gate, content, (verdict, quiet))
+async def _advance(ticker: watch.Ticker) -> None:
+    """One progress tick between two polls of a wait."""
     await ticker.tick()
-    return gate
 
 
 def _ended(ctx: Context, probe: Probe, seen: tuple):
@@ -123,12 +71,11 @@ def _interrupted(ctx: Context, current: object, screen: object) -> bool:
 
 
 async def _begin(ctx: Context, screen: object, probe: Probe) -> tuple:
-    """``(deadline, ticker, gate, screen)`` a watched poll starts from."""
+    """``(deadline, ticker, screen)`` a watched poll starts from."""
     budget = (probe.ms / 1000.0) if probe.ms else DEFAULT_WAIT_UNTIL_TEXT_S
     deadline = _wait_deadline(ctx, budget)
-    gate = await open_gate(ctx, screen, probe.gate)
     screen = await settled(ctx, screen, deadline)
-    return deadline, watch.Ticker(probe.label), gate, screen
+    return deadline, watch.Ticker(probe.label), screen
 
 
 # ``probe.met(previous, current)`` is the condition; ``previous`` is ``None``
@@ -142,24 +89,19 @@ async def _wait_for(ctx: Context, screen: object, probe: Probe) -> tuple:
 
 async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
     """The poll loop of :func:`_wait_for` for a condition not yet met."""
-    deadline, ticker, gate, current = await _begin(ctx, screen, probe)
-    previous, took, quiet = None, 0.0, 0
+    deadline, ticker, current = await _begin(ctx, screen, probe)
+    previous, quiet = None, 0
     while True:
         current = await answer_unless_met(ctx, probe, (previous, current, screen))
         if ended := _ended(ctx, probe, (previous, current, screen)):
             return ended
-        final, content, took, verdict = await _poll(
-            ctx, current, Poll(gate, deadline, took, quiet)
-        )
-        if verdict == "calm":
-            previous = current
-            continue
+        final, content = await _next_read(ctx, current, deadline)
         if final:
             return final
         quiet, previous, current = (quiet + 1) * (content == current), current, content
         if _early_exit(ctx, probe, (quiet, current)):
             return False, current, True
-        gate = await _advance(ticker, gate, (content, verdict, quiet))
+        await _advance(ticker)
 
 
 def _early_exit(ctx: Context, probe: Probe, seen: tuple) -> bool:
@@ -189,5 +131,5 @@ async def _wait_until_element(ctx: Context, screen: object, want: tuple) -> tupl
     return await _wait_for(
         ctx,
         screen,
-        Probe(ms, _element_met(rid, text, gone), label, TEXT),
+        Probe(ms, _element_met(rid, text, gone), label),
     )

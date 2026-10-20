@@ -1,7 +1,7 @@
 """Tool descriptions of the submit MCP wrappers, attached as ``__doc__``."""
 
 # The description of `qa_submit_bug_report`, verbatim.
-SUBMIT_BUG_REPORT_DOC = """Submit the bug report YOU wrote for a task opened by qa_bug_report: pass the task_id and the full markdown as `report`, written exactly as the envelope's system_prompt specifies. The server validates the required sections, saves it to the corpus, and either returns the finished report or asks you to re-emit it against a NEW task id."""
+SUBMIT_BUG_REPORT_DOC = """Submit the bug report YOU wrote for a task opened by qa_bug_report: the task_id and the full markdown as `report`, as the envelope's system_prompt specifies. Returns the finished report or asks you to re-emit it against a NEW task id."""
 
 # The description of `qa_push_suite`, verbatim.
 PUSH_SUITE_DOC = """Push a stored test suite into TestRail or Xray. target="testrail" (needs the numeric project_id from the TestRail URL) or "xray". Defaults to a PREVIEW that sends nothing. A real push needs apply=true AND the target's kill-switch flag enabled in .env. Nothing here can delete the cases afterwards."""

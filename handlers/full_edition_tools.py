@@ -35,7 +35,7 @@ def _register_explore_step_tool(mcp, kit, rt) -> None:
     async def qa_explore_step(  # noqa: PLR0913 - MCP tool schema
         feature: str, session_id: str, ctx: Context, tester_response: str = ""
     ) -> str:
-        """Start the next step of an exploratory-testing coaching session. Chat-only: the server returns a task envelope that YOU answer, then call qa_submit_explore_step with the task_id and your coaching step. Pass a stable session_id to keep coverage memory across calls; include tester_response with what you observed after the previous step."""
+        """Start the next step of an exploratory-testing coaching session. Chat-only: returns a task envelope YOU answer, then call qa_submit_explore_step. Pass a stable session_id for coverage memory; tester_response = what you observed after the previous step."""
         opts = explore_bug.ExploreStepOpts(tester_response, rt._make_progress(ctx))
         return await rt._tracked(
             "qa_explore_step",
