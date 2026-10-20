@@ -101,6 +101,7 @@ def _node_flags(node: ElementTree.Element, full_class: str) -> dict:
         "secure": _flag(node, "password"),
         "checked": _flag(node, "checked"),
         "scrollable": _flag(node, "scrollable"),
+        "focused": _flag(node, "focused"),
     }
 
 

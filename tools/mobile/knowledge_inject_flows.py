@@ -15,10 +15,15 @@ _HOW = (
     "for no flow."
 )
 
+_ASK_ALL = (
+    " Ask the tester for ALL of these now, in one question, before the first step: %s."
+)
+
 
 def _text(row: dict) -> str:
     fields = row.get("fields") or []
     secret = "; secret fields: %s" % ", ".join(map(str, fields)) if fields else ""
+    ask = _ASK_ALL % ", ".join(map(str, fields)) if fields else ""
     covers = str(row.get("covers") or "")
     span = " It %s." % covers if covers else ""
     head = "known flow available: %s (%s steps%s).%s" % (
@@ -27,7 +32,7 @@ def _text(row: dict) -> str:
         secret,
         span,
     )
-    return head + _HOW % row["name"]
+    return head + ask + _HOW % row["name"]
 
 
 def _packet_text(rows: list) -> str:

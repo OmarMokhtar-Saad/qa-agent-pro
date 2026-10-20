@@ -15,10 +15,11 @@ from tools.mobile import (
     step_timing,
 )
 from tools.mobile.providers import composite
-from tools.mobile.replay import dump_activity
+from tools.mobile.replay import dump_activity, dump_focus
 from tools.mobile.replay.context_ctx import Context
 from tools.mobile.replay.dump_carry import _remember, _take_carried
 from tools.mobile.replay.dump_raw import DUMP_CUT_DETAIL, _raw_dump
+from tools.mobile.replay.screen_seen import note as note_seen
 
 logger = logging.getLogger("tools.mobile.executor")
 
@@ -95,6 +96,7 @@ async def _observed(ctx: Context, raw: dict) -> dict:
     )
     observed = await _observe(ctx, raw.get("content"), (sized, dpi))
     _remember(ctx, observed)
+    note_seen(ctx.serial, observed)
     return observed
 
 
@@ -104,6 +106,7 @@ async def _observe(ctx: Context, xml: Any, display: tuple) -> dict:
     `display` is the measured (size, density) pair; the ScreenView is built here
     so the density reaches every prune call below."""
     if not dump_activity.tree_path(ctx.serial):
+        dump_focus.note_screen(ctx.serial, xml)
         return composite.observe(
             xml,
             await resolve_activity(ctx),
@@ -161,8 +164,7 @@ async def resolve_activity(ctx: Any) -> str:
     # under a screen that later changed it. The key no longer hashes it, so the
     # probe is metadata and an empty answer is normal.
     serial = _serial_for_activity(ctx)
-    probed = await adb.current_activity(serial)
-    return str(probed.get("content") or "")
+    return await dump_focus.current(serial)
 
 
 def _serial_for_activity(ctx: Any) -> str:

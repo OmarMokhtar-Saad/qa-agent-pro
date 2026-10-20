@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import re
 
-from tools.mobile import adb, dump_reuse
+from tools.mobile import dump_reuse
+from tools.mobile.replay import dump_focus
 
 #: Seconds an older held dump may still stand when the live focus agrees with it.
 #: Nothing actuated on the device since it was read (the generation check), and
@@ -28,11 +29,11 @@ async def _focused_package(serial: str) -> str:
     """The focused package, or ``""`` when not known within the probe budget."""
     try:
         probed = await asyncio.wait_for(
-            adb.current_activity(serial, timeout=int(PROBE_S) + 1), PROBE_S
+            dump_focus.current(serial, timeout=int(PROBE_S) + 1), PROBE_S
         )
     except (TimeoutError, OSError, ValueError, KeyError):
         return ""
-    return str((probed or {}).get("content") or "").split("/", 1)[0]
+    return probed.split("/", 1)[0]
 
 
 async def take_held(serial: str) -> dict | None:

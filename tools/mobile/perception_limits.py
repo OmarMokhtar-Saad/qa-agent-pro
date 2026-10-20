@@ -59,7 +59,7 @@ MIN_DEDUPE_CHARS = 24
 MAX_SUMMARY_LABEL_CHARS = 48
 
 # Prompt-block cap handed to ``wrap_untrusted``.
-MAX_BLOCK_CHARS = 12000
+MAX_BLOCK_CHARS = 7000
 
 # The largest display dimension accepted from the device. `adb.display_size`
 # parses it out of `wm size`, which is device output rather than something this

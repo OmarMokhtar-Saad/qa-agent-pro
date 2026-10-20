@@ -30,11 +30,14 @@ def _abort_unsigned(context: str) -> bool:
 
 
 def _proceed_unsigned(context: str) -> bool:
-    """Proceed with an unsigned release, with a loud migration warning."""
-    logger.warning(
-        "%s: proceeding with an UNSIGNED release (no MANIFEST.sig / no embedded "
-        "public key). Set QA_UPDATE_REQUIRE_SIGNATURE=true once all releases are "
-        "signed.",
+    """Proceed with an unsigned release.
+
+    Releases ship unsigned by design (docs/DECISIONS.md, 2026-10-06), so this is
+    the normal path, not a fault: INFO, not a WARNING a tester reads as an alarm.
+    """
+    logger.info(
+        "%s: this release carries no MANIFEST.sig (releases ship unsigned by "
+        "design); proceeding. QA_UPDATE_REQUIRE_SIGNATURE=true would refuse it.",
         context,
     )
     return True

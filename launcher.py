@@ -450,6 +450,8 @@ class Supervisor:
         self.setup_held = None  # its withheld 'reloading now' reply
         self.setup_retries = 0
         self.setup_deadline = 0.0
+        self.setup_rearmed = False
+        self.setup_wake = threading.Event()  # resolve/rearm wakes the guard
         # Serialises EVERY writer to the client stdio: the output pump,
         # spawn()'s tools/list_changed notice and release_setup_check()'s
         # timeout thread. A JSON-RPC line above PIPE_BUF is NOT an atomic
@@ -485,6 +487,7 @@ class Supervisor:
         threading.Thread(
             target=self._pump_child_out, args=(self.child,), daemon=True
         ).start()
+        self.rearm_setup_check()
         if replay and self.handshake:
             # Tool schemas may have changed across the update — tell the
             # client to re-fetch tools/list, else it keeps stale cached
@@ -696,6 +699,19 @@ class Supervisor:
         self.setup_held = None
         self.setup_retries = 0
         self.setup_deadline = 0.0
+        self.setup_rearmed = False
+        self.setup_wake.set()  # the guard re-reads state at once
+
+    def rearm_setup_check(self) -> None:
+        """A successor child was just spawned: give it its own window, once.
+        The old child's exit + respawn can eat most of the first window, so
+        the clock restarts when the progress event (the spawn) happens."""
+        with self.setup_lock:
+            if self.setup_held is None or self.setup_rearmed:
+                return
+            self.setup_rearmed = True
+            self.setup_deadline = time.time() + SETUP_CHECK_TIMEOUT_S
+            self.setup_wake.set()
 
     def maybe_hold_setup_check(self, line) -> bool:
         """True when *line* is the tracked qa-doctor reply saying a
@@ -785,7 +801,9 @@ class Supervisor:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
-            time.sleep(min(0.25, remaining))
+            # Event-driven: wakes on resolve/rearm, else at the deadline.
+            self.setup_wake.wait(remaining)
+            self.setup_wake.clear()
         log.warning(
             "qa-doctor auto-retry timed out -- returning the notice."
         )

@@ -82,7 +82,13 @@ def _finalized(body: dict) -> dict | None:
         return None
     # The verdict is left as recorded: only the run's own done() turn earns
     # one, so a closed turn is "done" with no verdict, never a pass.
-    return {**body, "status": "done", "updated": time.time()}
+    closed_from = str(body.get("status") or "")
+    return {
+        **body,
+        "status": "done",
+        "closed_from": closed_from,
+        "updated": time.time(),
+    }
 
 
 def finalize_explore_cases(run_id: str) -> bool:

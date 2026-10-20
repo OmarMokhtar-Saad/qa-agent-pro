@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
-from tools.mobile import ime, step_timing
+from tools.mobile import ime, ime_cache, step_timing
 from tools.mobile.replay.device_ops_consts import QA_IME_NOT_ACTIVE, QA_IME_SEEN_CAP
 
 
 def _typer(fallback: str):
     """The typing function for this replay: the fallback one when the keyboard is down."""
     return ime.type_via_input if fallback else ime.type_text
+
+
+async def _current_ime(serial: str) -> dict:
+    """The active-keyboard read, at most once per step (``ime_cache``)."""
+    return await step_timing.timed(
+        "ime_check", ime_cache.current(serial, ime.current_ime)
+    )
 
 
 async def _qa_ime_blocker(serial: str) -> dict | None:
@@ -20,7 +27,7 @@ async def _qa_ime_blocker(serial: str) -> dict | None:
     and is left to the read-back verdict.
     """
     ours = str(((ime.manifest() or {}).get("content") or {}).get("ime_id") or "")
-    current = await step_timing.timed("ime_check", ime.current_ime(serial))
+    current = await _current_ime(serial)
     if current.get("error"):
         seen = "an unreadable setting: " + str(current["error"])[:120]
     else:

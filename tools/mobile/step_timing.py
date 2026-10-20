@@ -41,6 +41,11 @@ def begin() -> None:
     _PHASES.set({"start": time.monotonic(), "phases": {}})
 
 
+def armed_step() -> int | None:
+    """An id of the armed step's breakdown, or ``None`` when no step is armed."""
+    return None if (state := _PHASES.get()) is None else id(state)
+
+
 def _record(name: str, seconds: float) -> None:
     state = _PHASES.get()
     if state is None:

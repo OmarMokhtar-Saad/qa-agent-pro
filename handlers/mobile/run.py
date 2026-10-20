@@ -12,6 +12,7 @@ import logging
 from typing import Any
 
 from handlers import _common, _elicit, mobile_gate
+from handlers.mobile import run_background
 from handlers.mobile.run_app import _mobile_app_stage as mobile_app_stage
 from handlers.mobile.run_capture import _CaptureCall, _mobile_capture_stage
 from handlers.mobile.run_device import (  # noqa: F401
@@ -161,21 +162,35 @@ async def _start_notes(serial: str) -> str:
 
 
 async def _mobile_new_run(req: _MobileTestRequest) -> str:
-    """The new-run path: pick the source, claim a device, prepare, start."""
+    """The new-run path: adopt an abandoned setup, else pick, claim, prepare, start.
+
+    The setup body runs as a background job (fix/1530): when the host abandons
+    this call the setup goes on, and the next call for the same request adopts it.
+    """
+    adopted = await run_background.adopt(req)
+    if adopted is not None:
+        return adopted
     picked, owner, early = await _new_run_open(req)
     if early:
         return early
+    return await run_background.launch(req, _mobile_setup(req, picked, owner))
+
+
+async def _mobile_setup(
+    req: _MobileTestRequest, picked: str, owner: str
+) -> tuple[str, str, bool]:
+    """``(reply, serial, handed_off)``: claim a device, prepare, start."""
     handed_off = False
     try:
         idle_note, serial = await _mobile_claim_device(req, owner)
         if not serial:
-            return idle_note
+            return idle_note, "", False
         stopped, prepared = await _mobile_prepare_app(req, serial, owner)
         if stopped:
-            return await with_hint(req, serial, stopped)
+            return await with_hint(req, serial, stopped), serial, False
         if not picked:
-            return req.source_menu()
+            return req.source_menu(), serial, False
         reply, handed_off = await _new_run_start(req, (picked, owner, serial), prepared)
-        return idle_note + await _start_notes(serial) + reply
+        return idle_note + await _start_notes(serial) + reply, serial, handed_off
     finally:
         await _mobile_end_pre_run(owner, handed_off)

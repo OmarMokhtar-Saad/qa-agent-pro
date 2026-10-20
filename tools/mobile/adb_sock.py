@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from tools.prun_types import RunResult
 
@@ -24,6 +24,7 @@ _DEFAULT_PORT = 5037
 _VERBS = {"shell": "shell,v2,raw:", "exec-out": "exec:"}
 _STDOUT, _STDERR, _EXIT = 1, 2, 3
 _CLOSE_STDIN = bytes([4]) + (0).to_bytes(4, "little")  # kIdCloseStdin
+_CHUNK = 32768
 _UNHEALTHY_UNTIL = [0.0]
 
 
@@ -36,19 +37,25 @@ class Request:
     serial: str | None
     verb: str
     command: str
+    stdin: bytes | None = None
 
 
 def _now() -> float:
     return time.monotonic()
 
 
-def parse(cmd: list[str]) -> Request | None:
-    """``adb [-s S] shell|exec-out <args>`` as a request; anything else is None."""
+def parse(cmd: list[str], bare: bool = False) -> Request | None:
+    """``adb [-s S] shell|exec-out <args>`` as a request; anything else is None.
+
+    *bare* admits ``adb [-s S] shell`` alone (a script fed on stdin).
+    """
     rest = cmd[1:]
     serial = None
     if rest[:1] == ["-s"] and len(rest) > 1:
         serial, rest = rest[1], rest[2:]
-    if len(rest) < 2 or rest[0] not in _VERBS:
+    if len(rest) < (1 if bare else 2) or rest[0] not in _VERBS:
+        return None
+    if len(rest) == 1 and rest[0] != "shell":
         return None
     return Request(serial, rest[0], " ".join(rest[1:]))
 
@@ -58,8 +65,8 @@ def enabled() -> bool:
     return off in ("", "0", "false", "no") and _now() >= _UNHEALTHY_UNTIL[0]
 
 
-def applicable(cmd: list[str]) -> bool:
-    return enabled() and parse(cmd) is not None
+def applicable(cmd: list[str], stdin: bytes | None = None) -> bool:
+    return enabled() and parse(cmd, stdin is not None) is not None
 
 
 def mark_unhealthy() -> None:
@@ -117,7 +124,11 @@ async def _converse(
     await _send(w, r, _VERBS[req.verb] + req.command)
     if req.verb == "exec-out":
         return 0, await r.read(-1), b""
-    w.write(_CLOSE_STDIN)  # no stdin data: let `cat`-style commands see EOF
+    data = req.stdin or b""
+    for i in range(0, len(data), _CHUNK):
+        part = data[i : i + _CHUNK]
+        w.write(bytes([0]) + len(part).to_bytes(4, "little") + part)
+    w.write(_CLOSE_STDIN)  # EOF so `cat`-style commands finish
     await w.drain()
     return await _frames(r)
 
@@ -131,11 +142,15 @@ async def _talk(req: Request) -> tuple[int, bytes, bytes]:
         writer.close()
 
 
-async def try_run(cmd: list[str], timeout: float) -> RunResult | None:
+async def try_run(
+    cmd: list[str], timeout: float, stdin: bytes | None = None
+) -> RunResult | None:
     """Run *cmd* over the server socket; ``None`` means use the subprocess path."""
-    req = parse(cmd) if enabled() else None
-    if req is None:
+    req = parse(cmd, stdin is not None) if enabled() else None
+    if req is None or (stdin is not None and req.verb != "shell"):
         return None
+    if stdin is not None:
+        req = replace(req, stdin=stdin)
     try:
         rc, out, err = await asyncio.wait_for(_talk(req), timeout)
     except asyncio.TimeoutError as exc:

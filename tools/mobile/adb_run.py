@@ -34,16 +34,17 @@ def _cmd_for_log(cmd: list[str], stdin_data: bytes | None = None) -> str:
     return rendered
 
 
-async def _via_socket(cmd: list[str], timeout: float, clock: list[float]):
-    """The adb-server socket's result for *cmd*, or ``None`` for the subprocess path."""
-    if not adb_sock.applicable(cmd):
+async def _via_socket(cmd: list[str], timeout: float, stdin: bytes | None):
+    """The socket's result and spawn clock for *cmd*, or ``None`` for the subprocess path."""
+    args = (cmd,) if stdin is None else (cmd, stdin)
+    if not adb_sock.applicable(*args):
         return None
-    clock.append(host().time.monotonic())
-    r = await adb_sock.try_run(cmd, timeout)
+    clock = [host().time.monotonic()]
+    r = await adb_sock.try_run(cmd, timeout, stdin)
     if r is None:
-        clock.clear()
         logger.debug("mobile.adb: socket fault, subprocess for %ss", adb_sock.RETRY_S)
-    return r
+        return None
+    return r, clock
 
 
 async def _subprocess(cmd: list[str], timeout: float, stdin_data: bytes | None):
@@ -69,11 +70,9 @@ async def _subprocess(cmd: list[str], timeout: float, stdin_data: bytes | None):
 
 
 async def _spawn(cmd: list[str], timeout: float, stdin_data: bytes | None):
-    clock: list[float] = []
-    if stdin_data is None:
-        r = await _via_socket(cmd, timeout, clock)
-        if r is not None:
-            return r, clock
+    via = await _via_socket(cmd, timeout, stdin_data)
+    if via is not None:
+        return via
     return await _subprocess(cmd, timeout, stdin_data)
 
 

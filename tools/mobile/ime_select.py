@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tools.mobile import adb
+from tools.mobile import adb, ime_cache
 from tools.mobile.ime_component import same_component
 from tools.mobile.ime_consts import _IME_REFUSAL_RE
 from tools.mobile.ime_host import host
@@ -38,12 +38,21 @@ async def enable(serial: str) -> dict:
     return _enable_refusal(result) or {"error": None, "content": {}}
 
 
+async def _select_fresh(serial: str, ime_id: str) -> dict:
+    """``pm_select`` that drops the per-step keyboard read around the switch."""
+    ime_cache.invalidate(serial)
+    try:
+        return await adb.pm_select(serial, ime_id)
+    finally:
+        ime_cache.invalidate(serial)
+
+
 async def select(serial: str) -> dict:
     """Make the pinned IME the active one, by the id the device lists."""
     resolved = await host().resolve_installed_id(serial)
     if resolved.get("error"):
         return resolved
-    return await adb.pm_select(serial, str(resolved["content"]))
+    return await _select_fresh(serial, str(resolved["content"]))
 
 
 def _noop_restore(target: str, ours: str) -> dict | None:
@@ -69,7 +78,7 @@ async def _restore_target(serial: str, target: str) -> dict:
     # listing first would spend one on a value that cannot be sent.
     listed = await _list_ime_ids(serial) if adb.is_ime_id(target) else []
     send = next((c for c in listed if same_component(c, target)), target)
-    return await adb.pm_select(serial, send)
+    return await _select_fresh(serial, send)
 
 
 # A blank *previous* is a REPORTED no-op: the device had no default input

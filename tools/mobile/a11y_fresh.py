@@ -35,9 +35,18 @@ import hashlib
 import logging
 from typing import Any, Awaitable, Callable
 
-from tools.mobile import a11y_clock, a11y_reread, adb, dump_reuse, step_timing
+from tools.mobile import (
+    a11y_bench,
+    a11y_clock,
+    a11y_dump,
+    a11y_reread,
+    a11y_strikes,
+    dump_reuse,
+    step_timing,
+)
 from tools.mobile.a11y_confirm import uiautomator_aside
 from tools.mobile.a11y_parity import compare, node_digest
+from tools.mobile.a11y_pkgs import is_ime
 from tools.mobile.xml_attrs import attr_pattern, attr_values
 
 logger = logging.getLogger("tools.mobile.a11y")
@@ -57,16 +66,12 @@ CONFIRMED_NOTE = "a11y_repeat_confirmed"
 _LAST: dict[str, tuple[int, str]] = {}
 #: serial -> digest of the tree uiautomator contradicted; fast reading waits for another.
 _SUSPENDED: dict[str, str] = {}
-#: serial -> stale verdicts this run.
-_STRIKES: dict[str, int] = {}
+#: serial -> stale verdicts not yet paid back (see :mod:`tools.mobile.a11y_strikes`).
+_STRIKES = a11y_strikes.STRIKES
 #: serial -> packages of the tree uiautomator contradicted (another screen is not it).
 _PKGS: dict[str, frozenset] = {}
 
-#: Stale verdicts in one run before fast reading stays off for the rest of it.
-#: One is a transition lag (a tree read just before the screen moved); two can be
-#: two slow screens; a third means the service is persistently wrong and every
-#: further screen would cost a confirming dump for nothing.
-MAX_STALE_STRIKES = 3
+MAX_STALE_STRIKES = a11y_strikes.MAX_STALE_STRIKES
 
 #: The refusal and ledger note while fast reading waits for the screen to change.
 SUSPENDED_NOTE = "a11y_suspended"
@@ -77,8 +82,10 @@ Provider = Callable[[str], Awaitable[dict]]
 
 def forget(serial: str) -> None:
     """Drop the remembered tree and the suspension (a fresh enable, a restore)."""
-    for table in (_LAST, _SUSPENDED, _STRIKES, _PKGS):
+    for table in (_LAST, _SUSPENDED, _PKGS):
         table.pop(str(serial), None)
+    a11y_strikes.reset(str(serial))
+    a11y_bench.forget(serial)
     a11y_clock.forget(serial)
 
 
@@ -92,27 +99,14 @@ def _packages(xml: str) -> frozenset:
     return frozenset(attr_values(attr_pattern("package"), xml))
 
 
-#: Whole dotted segments of an input-method package (Gboard, AOSP, Samsung,
-#: SwiftKey); equal, not substring, so ``com.example.keyboardshop`` is an app.
-_IME_SEGMENTS = frozenset({"inputmethod", "honeyboard", "swiftkey", "keyboard"})
-#: The QA keyboard; ime_manifest is the lane sentinel, so it is not imported here.
-_QA_IME = "qaagents.ime"
-
-
-def _is_ime(package: str) -> bool:
-    """True for the package of a keyboard window (the QA keyboard or any other)."""
-    low = package.lower()
-    return low.endswith(_QA_IME) or bool(_IME_SEGMENTS & set(low.split(".")))
-
-
 def _other_screen(serial: str, xml: str) -> bool:
     """True when *xml* belongs to other apps than the tree judged stale.
 
     A keyboard window is shown over any screen, so its package is ignored on
     both sides: it appearing or going is not another screen.
     """
-    now = {p for p in _packages(xml) if not _is_ime(p)}
-    was = {p for p in _PKGS.get(serial, frozenset()) if not _is_ime(p)}
+    now = {p for p in _packages(xml) if not is_ime(p)}
+    was = {p for p in _PKGS.get(serial, frozenset()) if not is_ime(p)}
     return bool(now and was and now != was)
 
 
@@ -125,13 +119,12 @@ def _repeats(serial: str, digest: str, started_under: int) -> bool:
 def _stale(serial: str, digest: str) -> dict:
     """Suspend fast reading on *digest*; after :data:`MAX_STALE_STRIKES` drop it."""
     step_timing.note(STALE_NOTE)
-    _STRIKES[serial] = _STRIKES.get(serial, 0) + 1
     _LAST.pop(serial, None)
     a11y_clock.forget(serial)
     _SUSPENDED[serial] = digest
-    if _STRIKES[serial] >= MAX_STALE_STRIKES:
-        logger.warning("mobile.a11y: stale tree on %s; fast reading off", serial)
-        adb.clear_dump_provider(serial)
+    if a11y_strikes.add(serial) >= MAX_STALE_STRIKES:
+        logger.warning("mobile.a11y: stale tree on %s; fast reading benched", serial)
+        a11y_bench.bench(serial, a11y_dump.fetch_dump)
     else:
         logger.warning("mobile.a11y: stale tree on %s; suspended", serial)
     return {"error": STALE_REFUSAL, "content": None}
@@ -171,7 +164,10 @@ async def _verdict(serial: str, xml: str, started_under: int) -> dict | None:
     if not _repeats(serial, digest, started_under):
         return None
     confirm = functools.partial(_judge, serial, xml)
-    return await a11y_clock.judged(serial, digest, confirm)
+    refused = await a11y_clock.judged(serial, digest, confirm)
+    if refused is None:
+        a11y_strikes.decay(serial)  # a proven repeat is a healthy read
+    return refused
 
 
 async def checked(serial: str, inner: Provider) -> dict:

@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.143.0] - 2026-10-20
+## [1.144.0] - 2026-10-20
 
 ### Added
 
@@ -44,6 +44,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - `qa_mobile_status` lists a device this server is setting up (no run
   id yet): the serial, the owner, how old the hold is, and whether
   its setup call is still running or has ended.
+- When a capture setup or teardown (another tool call in the same
+  server) holds the device, `qa_mobile_status` and the refusal say so:
+  it gives the device back when that call ends, so call
+  `qa_mobile_test` again then.
 - The "another run is using the device" text says how old the hold
   is and what ends it: the running setup call finishing, that server
   exiting, or quitting the other editor.

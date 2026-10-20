@@ -12,6 +12,7 @@ from tools.mobile.replay.settle_perm import mark_unclear
 from tools.mobile.replay.settle_run import _settle
 from tools.mobile.replay.waits_poll import _wait_until_element
 from tools.mobile.replay.waits_prior import note_gone
+from tools.mobile.replay.waits_refuse import refusal, stamp_refused
 from tools.mobile.replay.waits_spec import _condition_words, stamp_early
 from tools.mobile.replay.waits_text import _wait_until_idle, _wait_until_text
 from tools.mobile.replay.waits_types import (
@@ -118,12 +119,24 @@ async def _on_met(run: _ReplayRun, step: CondStep, met: tuple) -> tuple:
     return screen, (None if stop is None else {"error": None, "content": stop})
 
 
+def _refused(run: _ReplayRun, step: CondStep, seen: tuple) -> tuple:
+    """Hand an impossible wait back to the model without polling it."""
+    screen, reason = seen
+    entry = step[2]
+    stamp_refused(entry, reason)
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return screen, _needs_model_reply(run, screen, entry)
+
+
 async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tuple:
     """A wait on a text, element or idle condition: ``(screen, reply)``.
 
     ``reply`` is ``None`` when the condition was met and the replay goes on.
     """
     action, spec, entry = step
+    if reason := refusal(run.ctx, step, screen):
+        return _refused(run, step, (screen, reason))
     started = time.monotonic()
     found, screen, interruption = await _poll_into(run, step, screen)
     met, missed, label = _condition_words(action, spec[0], spec[1])

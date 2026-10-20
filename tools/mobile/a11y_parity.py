@@ -6,6 +6,7 @@ import hashlib
 from typing import Any
 
 from tools.mobile import perception
+from tools.mobile.a11y_pkgs import is_ime
 
 #: Share of nodes (by class, id, bounds) both dumps must have in common.
 A11Y_PARITY_OVERLAP_FRACTION = 0.9
@@ -27,6 +28,17 @@ def _node_value(element: dict) -> tuple:
         bool(element.get("editable")),
         bool(element.get("secure")),
     )
+
+
+def _legit_difference(key: tuple, fast: tuple, slow: tuple) -> bool:
+    """True for a node the two readers legitimately render differently.
+
+    Password and editable fields (masked or typed between the two reads) and
+    keyboard-window nodes (the IME resource id names its package).
+    """
+    if fast[3] or slow[3] or fast[4] or slow[4]:
+        return True
+    return ":" in key[1] and is_ime(key[1].split(":", 1)[0])
 
 
 def _keyed(xml: str):
@@ -71,6 +83,15 @@ def _overlap_error(fast: dict, slow: dict) -> dict | None:
     return None
 
 
+def _differing(fast: dict, slow: dict, shared: set) -> int:
+    """How many shared nodes differ in a way that is not a legitimate difference."""
+    return sum(
+        1
+        for key in shared
+        if fast[key] != slow[key] and not _legit_difference(key, fast[key], slow[key])
+    )
+
+
 def compare(fast_xml: str, slow_xml: str) -> dict:
     """Refuse the fast dump unless it describes the same nodes as uiautomator."""
     fast, slow = _keyed(fast_xml), _keyed(slow_xml)
@@ -80,8 +101,8 @@ def compare(fast_xml: str, slow_xml: str) -> dict:
     if refused:
         return refused
     shared = set(fast) & set(slow)
-    differing = sum(1 for key in shared if fast[key] != slow[key])
-    # Zero tolerance, not a cap: the destructive guard must see the same node either way.
+    # No cap on the rest: the destructive guard must see the same node either way.
+    differing = _differing(fast, slow, shared)
     if differing:
         return {
             "error": "a11y parity check: "

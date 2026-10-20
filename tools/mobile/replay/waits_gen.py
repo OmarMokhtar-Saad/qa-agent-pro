@@ -29,6 +29,7 @@ from tools.mobile.replay.context import Context
 from tools.mobile.replay.context_consts import MOVE_S, PROBE_BUDGET_S
 from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
 from tools.mobile.replay.screen import _screen_hash
+from tools.mobile.replay.waits_gate import Gate, hold, token_of
 from tools.mobile.replay.waits_quiet import QUIET_MS
 
 NO_LIMIT = float("inf")
@@ -62,7 +63,7 @@ def baseline_of(ctx: Context, screen: object) -> a11y_events.EventClock | str:
     return a11y_events.latest(ctx.serial) or _screen_hash(screen)
 
 
-async def _look(ctx: Context, until: float) -> Look:
+async def read_look(ctx: Context, until: float) -> Look:
     """One dump cut at *until*."""
     dumped = await _dump(ctx, deadline=until)
     clock = a11y_events.latest(ctx.serial)
@@ -85,14 +86,17 @@ def _moved(base: a11y_events.EventClock | str, look: Look) -> bool:
     return look.clock.count != base.count
 
 
-async def await_move(ctx: Context, base: object, until: float) -> tuple:
+async def await_move(
+    ctx: Context, base: a11y_events.EventClock | str | None, until: float
+) -> tuple:
     """Phase 1: ``(moved, last_look)``; dump until the screen leaves *base* or *until*.
 
     ``last_look`` is ``None`` when no dump ran. A dump error ends the loop.
     """
-    last = None
+    last, gate = None, Gate(token_of(ctx.serial), started=True, probe_only=True)
     while _now() < until:
-        last = await _look(ctx, until)
+        await hold(ctx, gate, until)  # the tap's own read is not read twice
+        last = await read_look(ctx, until)
         if last.error:
             return False, last
         if base is None:
@@ -115,7 +119,7 @@ async def _until_quiet(ctx: Context, first: Look, until: float) -> tuple:
     while not _is_quiet(look, prev):
         if _now() >= until:
             return look, True
-        prev, look = look, await _look(ctx, until)
+        prev, look = look, await read_look(ctx, until)
         if look.error:
             return look._replace(tree=prev.tree), look.error == DUMP_CUT_DETAIL
     return look, False
@@ -129,7 +133,9 @@ def _result(changed: bool, look: Look | None, still: bool) -> Settled:
     return Settled(changed, look.tree, still, failed)
 
 
-async def settle(ctx: Context, baseline: object, until: float = NO_LIMIT) -> Settled:
+async def settle(
+    ctx: Context, baseline: a11y_events.EventClock | str | None, until: float = NO_LIMIT
+) -> Settled:
     """Wait for the screen to move past *baseline*, then to go quiet (see the module)."""
     start = _now()
     moved, look = await await_move(ctx, baseline, min(start + MOVE_S, until))

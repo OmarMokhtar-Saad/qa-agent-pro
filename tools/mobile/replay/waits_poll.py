@@ -11,6 +11,7 @@ from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
 from tools.mobile.replay.screen import _screen_has_element, absent_from
 from tools.mobile.replay.waits_dialog import answer_unless_met
 from tools.mobile.replay.waits_early import quiet_exit
+from tools.mobile.replay.waits_gate import Gate, hold
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_prior import _spinning
 from tools.mobile.replay.waits_quiet import settled
@@ -49,7 +50,7 @@ async def _next_read(ctx: Context, current: object, deadline: float) -> tuple:
     return await _read_now(ctx, current, deadline)
 
 
-async def _advance(ticker: watch.Ticker) -> None:
+async def advance_ticker(ticker: watch.Ticker) -> None:
     """One progress tick between two polls of a wait."""
     await ticker.tick()
 
@@ -90,21 +91,22 @@ async def _wait_for(ctx: Context, screen: object, probe: Probe) -> tuple:
 async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
     """The poll loop of :func:`_wait_for` for a condition not yet met."""
     deadline, ticker, current = await _begin(ctx, screen, probe)
-    previous, quiet = None, 0
+    previous, quiet, gate = None, 0, Gate()
     while True:
         current = await answer_unless_met(ctx, probe, (previous, current, screen))
         if ended := _ended(ctx, probe, (previous, current, screen)):
             return ended
+        await hold(ctx, gate, deadline)  # no event since the last read: no dump
         final, content = await _next_read(ctx, current, deadline)
         if final:
             return final
         quiet, previous, current = (quiet + 1) * (content == current), current, content
-        if _early_exit(ctx, probe, (quiet, current)):
+        if early_exit(ctx, probe, (quiet, current)):
             return False, current, True
-        await _advance(ticker)
+        await advance_ticker(ticker)
 
 
-def _early_exit(ctx: Context, probe: Probe, seen: tuple) -> bool:
+def early_exit(ctx: Context, probe: Probe, seen: tuple) -> bool:
     """True when a wait for text may give up: a quiet, non-loading screen."""
     quiet, current = seen
     return probe.early and not _spinning(current) and quiet_exit(ctx.serial, quiet)

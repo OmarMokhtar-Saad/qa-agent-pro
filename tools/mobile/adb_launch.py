@@ -18,6 +18,7 @@ from tools.mobile.adb_host import host
 async def wait_foreground(serial: str, package: str) -> None:
     """Poll the focused window until *package* holds it, for a bounded time."""
     deadline = host().time.monotonic() + host().LAUNCH_FOREGROUND_TIMEOUT_S
+    gap = host().LAUNCH_FOREGROUND_POLL_S / 8  # grows to the cap: no fixed beat
     while True:
         remaining = deadline - host().time.monotonic()
         if remaining <= 0:
@@ -25,12 +26,9 @@ async def wait_foreground(serial: str, package: str) -> None:
         focus = await host().current_activity(serial, timeout=int(remaining) + 1)
         if str(focus.get("content") or "").split("/", 1)[0] == package:
             return
-        await asyncio.sleep(
-            min(
-                host().LAUNCH_FOREGROUND_POLL_S,
-                max(0.0, deadline - host().time.monotonic()),
-            )
-        )
+        left = max(0.0, deadline - host().time.monotonic())
+        await asyncio.sleep(min(gap, left))
+        gap = min(gap * 2, host().LAUNCH_FOREGROUND_POLL_S)
 
 
 # BY COMPONENT FIRST, monkey second. ``am force-stop`` flags a package

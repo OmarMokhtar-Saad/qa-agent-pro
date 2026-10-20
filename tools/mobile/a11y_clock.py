@@ -48,6 +48,8 @@ class _Seen:
     skips: int = 0
     #: Repeats taken on heard events; ``served`` never resets it, only a confirm.
     heard: int = 0
+    #: The every-event counter when the tree was served (qa-ime 1.2.2+).
+    generation: int | None = None
 
 
 _SEEN: dict[str, _Seen] = {}
@@ -58,11 +60,20 @@ def forget(serial: str) -> None:
     _SEEN.pop(str(serial), None)
 
 
-def _unchanged(serial: str, digest: str) -> bool:
+def no_event_since(serial: str, digest: str) -> bool:
+    """True when the service heard no event since *digest* was served.
+
+    A repeated tree with no event is "unchanged", not stale: no confirming dump.
+    Only a clock with the every-event generation (qa-ime 1.2.2+) is trusted
+    outright: the window/content count alone is also flat on a deaf service, so
+    without it the proven, capped rule of qa-ime 1.2.1 applies.
+    """
     seen, clock = _SEEN.get(serial), a11y_events.latest(serial)
     if seen is None or clock is None or seen.digest != digest:
         return False
-    return seen.proven and seen.skips < MAX_SKIPS and clock.count == seen.count
+    if clock.generation is None:
+        return seen.proven and seen.skips < MAX_SKIPS and clock.count == seen.count
+    return clock.count == seen.count and clock.generation == seen.generation
 
 
 def _heard_after(serial: str, digest: str) -> bool:
@@ -82,7 +93,7 @@ def _heard_after(serial: str, digest: str) -> bool:
 
 async def judged(serial: str, digest: str, confirm: Confirm) -> "dict | None":
     """``None`` when the clock proves the repeat, else the result of *confirm*."""
-    if _unchanged(serial, digest):
+    if no_event_since(serial, digest):
         _SEEN[serial].skips += 1
         step_timing.note(BY_CLOCK_NOTE)
         return None
@@ -105,7 +116,11 @@ def served(serial: str, digest: str) -> None:
     elif seen is None or seen.digest != digest:
         advanced = seen is not None and clock.count > seen.count
         _SEEN[serial] = _Seen(
-            digest, clock.count, bool(advanced or (seen and seen.proven))
+            digest,
+            clock.count,
+            bool(advanced or (seen and seen.proven)),
+            generation=clock.generation,
         )
     elif clock.count != seen.count:
         seen.count, seen.skips = clock.count, 0
+        seen.generation = clock.generation

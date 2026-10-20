@@ -6,6 +6,7 @@ import logging
 
 from tools.mobile import (
     ime,
+    ime_cache,
     ime_fresh,
     step_timing,
 )
@@ -34,6 +35,7 @@ def needs_keyboard(script: object) -> bool:
 async def keyboard_up(serial: str) -> dict:
     """Remember the current keyboard; install, enable, select ours; QUERY once."""
     try:
+        ime_cache.invalidate(serial)
         remembered = await ime.remember_previous(serial)
         if remembered.get("error"):
             return _keyboard_failure(
@@ -78,7 +80,9 @@ async def _keyboard_install(serial: str) -> dict | None:
 async def _keyboard_select(serial: str, previous: str) -> dict | None:
     """Select ours unless it is already the current keyboard; a failure or None."""
     ours = str(((ime.manifest() or {}).get("content") or {}).get("ime_id") or "")
-    current = await step_timing.timed("ime_check", ime.current_ime(serial))
+    current = await step_timing.timed(
+        "ime_check", ime_cache.current(serial, ime.current_ime)
+    )
     if current.get("error") or not ime.same_component(current.get("content"), ours):
         chosen = await ime.select(serial)
         if chosen.get("error"):

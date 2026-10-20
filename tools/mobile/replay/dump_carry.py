@@ -9,11 +9,10 @@ import time
 from typing import Any
 
 from tools.mobile import (
-    adb,
     dump_reuse,
     step_timing,
 )
-from tools.mobile.replay import dump_activity
+from tools.mobile.replay import dump_activity, dump_focus
 from tools.mobile.replay.context_ctx import Context
 
 #: How old a carried screen may be and still stand for the next call's first
@@ -122,9 +121,8 @@ async def _focus_probe(serial: str, budget: float) -> str:
     if budget <= 0:
         return ""
     try:
-        probed = await asyncio.wait_for(
-            adb.current_activity(serial, timeout=int(budget) + 1), budget
+        return await asyncio.wait_for(
+            dump_focus.current(serial, timeout=int(budget) + 1), budget
         )
     except (TimeoutError, OSError, ValueError, KeyError):
         return ""
-    return str((probed or {}).get("content") or "")

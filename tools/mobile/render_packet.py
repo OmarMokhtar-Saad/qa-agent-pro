@@ -75,13 +75,9 @@ STATIC_FIELDS: tuple[str, ...] = (
 #: end. The block is re-sent only when the chat or session changes; a script the
 #: server cannot parse does not bring it back.
 STATIC_OMITTED_NOTE = (
-    "The system prompt, the action vocabulary and the untrusted-data notice "
-    "went out in full with the FIRST packet of this run and have not changed "
-    "since. Read them there rather than asking for them again. If they are no "
-    "longer in front of you, send your best attempt anyway. The whole block "
-    "is sent again only when the chat or session changes. The response schema goes out whole with the first "
-    "packet of the run; a later packet names it in one line and its "
-    "required fields."
+    "System prompt, action vocabulary and untrusted-data notice: unchanged "
+    "since the FIRST packet of this run; read them there. If they are gone "
+    "from your context, send your best attempt anyway."
 )
 
 

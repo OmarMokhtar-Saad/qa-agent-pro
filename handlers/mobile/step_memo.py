@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from handlers.mobile.step_repeat import repeat_once
 from handlers.mobile.step_state import _MOBILE_SAME_SCREEN_NOTE
 from tools.mobile import render as mobile_render
 from tools.mobile import run_store as mobile_run_store
@@ -85,6 +86,7 @@ def _mobile_briefing_memo(shown: dict, run_id: str, token: str) -> tuple[dict, b
         else:
             mobile_run_store.mark_briefed(run_id, token, block_hash)
         shown = _schema_once(shown, run_id)
+        shown = repeat_once(shown, run_id)
     except Exception:
         logger.exception("mcp mobile static-block memo failed")
     return shown, brief_needed

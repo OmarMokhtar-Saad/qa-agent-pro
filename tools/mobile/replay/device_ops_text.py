@@ -61,6 +61,8 @@ def _clear_refusal(fallback: str) -> dict:
 
 async def _focus_field(serial: str, element: object) -> dict | None:
     """Tap the field to focus it; an error reply, or None once it is focused."""
+    if isinstance(element, dict) and element.get("focused") is True:
+        return None  # the tree already shows it focused: a tap adds a round trip
     center = _center(element) if isinstance(element, dict) else None
     if not center:
         return {"error": "That field has no usable bounds.", "content": None}

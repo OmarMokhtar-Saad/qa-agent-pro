@@ -4,6 +4,10 @@ A step folds dozens of adb calls into one ``adb n=27`` row. This keeps a bounded
 ``{label: (n, seconds)}`` table in the armed step state and renders its costliest
 labels as ``adb_cmd`` rows (label in ``caller``), so the ledger says WHICH calls
 took the time. A label is the command's first words, never an argument value.
+
+Each row is a BUCKET of calls sharing a label, not one call: ``ms`` is the
+bucket total, ``n`` its call count, and the caller text carries the average per
+call, so no reader takes "5 rows of 3.3 s" for five 3.3 s commands.
 """
 
 from __future__ import annotations
@@ -27,6 +31,12 @@ def label_of(body: str) -> str:
     """The first words of an adb command body (``shell input tap``)."""
     words = str(body or "").split()
     return " ".join(words[:LABEL_WORDS])[:40] or OTHER
+
+
+def bucket_caller(label: str, count: int, total: float) -> str:
+    """``label: Nx avg M ms`` clipped to the ledger's 40-char caller field."""
+    tail = f": {count}x avg {int(total * 1000 / max(1, count))}ms"
+    return label[: max(0, 40 - len(tail))] + tail
 
 
 def note_adb(state: dict | None, body: str, seconds: float) -> None:
@@ -61,7 +71,7 @@ def rows(state: dict) -> list:
     return [
         {
             "reason": REASON,
-            "caller": label,
+            "caller": bucket_caller(label, count, total),
             "ms": int(total * 1000),
             "n": count,
             "skipped": False,

@@ -8,6 +8,7 @@ from typing import Any
 
 from tools.mobile import (
     adb,
+    adb_dump,
     dump_latency,
     latency_scale,
     step_timing,
@@ -75,6 +76,25 @@ async def _pick_source(serial: str) -> Any:
         return None
 
 
+async def _from_source(serial: str, source: Any) -> dict | None:
+    """The dump the selected tree source served, or None to fall back to adb."""
+    if source is None or source.name == tree_source.FALLBACK_SOURCE:
+        return None
+    timeout = latency_scale.scale_timeout(
+        latency_scale.TREE_TIMEOUT_S, dump_latency.p90_ms(serial)
+    )
+    try:
+        result = await source.dump(serial, timeout)
+    except SOURCE_FAILURES:
+        logger.warning("mobile.executor: tree source failed", exc_info=True)
+        return None
+    if result is None or not result.xml:
+        return None
+    step_timing.note_source(result.source)
+    dump_activity.note_source(serial, result.source)
+    return {"error": None, "content": result.xml}
+
+
 # ONE raw dump through the selected tree source; the adb dump on any miss.
 #
 # Only a source ``tree_optin.allowed`` lets through is ever tried, so without
@@ -83,19 +103,18 @@ async def _pick_source(serial: str) -> Any:
 async def _raw_dump(serial: str) -> dict:
     """ONE raw dump through the selected tree source; the adb dump on any miss."""
     source = await _pick_source(serial)
-    if source is not None and source.name != tree_source.FALLBACK_SOURCE:
-        timeout = latency_scale.scale_timeout(
-            latency_scale.TREE_TIMEOUT_S, dump_latency.p90_ms(serial)
-        )
-        try:
-            result = await source.dump(serial, timeout)
-        except SOURCE_FAILURES:
-            logger.warning("mobile.executor: tree source failed", exc_info=True)
-            result = None
-        if result is not None and result.xml:
-            step_timing.note_source(result.source)
-            dump_activity.note_source(serial, result.source)
-            return {"error": None, "content": result.xml}
+    served = await _from_source(serial, source)
+    if served is not None:
+        return served
     step_timing.note_source(tree_source.FALLBACK_SOURCE)
     dump_activity.note_source(serial, tree_source.FALLBACK_SOURCE)
-    return await adb.uiautomator_dump(serial)
+    raw = await adb.uiautomator_dump(serial)
+    _note_provider_dump(serial, raw)
+    return raw
+
+
+def _note_provider_dump(serial: str, raw: dict) -> None:
+    """A dump the a11y provider served has a tree source: no focus probe for it."""
+    row = step_timing.current_row(0)
+    if not raw.get("error") and row is not None and row.source == adb_dump.SOURCE_A11Y:
+        dump_activity.note_source(serial, adb_dump.SOURCE_A11Y)

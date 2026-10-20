@@ -19,6 +19,7 @@ from tools.mobile.replay.context import Context
 from tools.mobile.replay.context_consts import AUTO_SETTLE_MAX_S
 from tools.mobile.replay.dump import _dump, _focus_probe
 from tools.mobile.replay.dump_stamp import live_focus
+from tools.mobile.replay.waits_gate import Gate, hold
 from tools.mobile.screen_key import screen_key
 
 
@@ -70,10 +71,12 @@ def _deadline(ctx: Context) -> float:
 
 async def _focus_left(ctx: Context, focus: str, deadline: float) -> bool:
     """Probe the focus (no dump; the probe is the poll) until the window changes or the cut."""
+    gate = Gate(probe_only=True, started=True)
     while time.monotonic() < deadline:
         now = await live_focus(ctx, deadline)
         if now and now != focus:
             return True
+        await hold(ctx, gate, deadline)  # wait for news, never spin on the probe
     return False
 
 

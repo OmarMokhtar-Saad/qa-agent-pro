@@ -21,6 +21,7 @@ from __future__ import annotations
 from tools.mobile import case_label
 from tools.mobile.render_crash import crash_note
 from tools.mobile.render_field import _field
+from tools.mobile.render_status_word import status_word
 from tools.mobile.render_summary import screen_block
 from tools.mobile.render_tally import _typed_field_tally
 
@@ -49,7 +50,7 @@ def _verdict_head(body: dict) -> str:
     # Every field here arrives in the model's submitted step and is replayed
     # from disk in a later chat -- the same channel as the status block, and
     # `tc_id` sits in the same single backticks that a planted fence escaped.
-    verdict = _field(body.get("verdict") or body.get("status"))
+    verdict = _field(status_word(body))
     reason = _field(body.get("reason"))[:160]
     return (
         _MARKS.get(verdict, "•")

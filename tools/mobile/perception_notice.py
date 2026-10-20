@@ -55,7 +55,7 @@ def _too_big_clause(too_big: int) -> str:
     """The clause for elements beyond the size of the message."""
     return (
         ", %d beyond the size of this message (some of those may "
-        "be on this screen too)" % too_big
+        "be on this screen too); scroll, or target the rest by visible text" % too_big
     )
 
 

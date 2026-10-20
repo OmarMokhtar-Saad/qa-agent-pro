@@ -23,8 +23,9 @@ from tools.mobile.install_source import (
     InstallRequest,
 )
 from tools.mobile.install_sources.app_tester_ui import AppTesterUiSource
-from tools.mobile.install_sources.app_tester_ui_funcs import _label_required
 from tools.mobile.install_sources.app_tester_ui_handoff import host_next
+from tools.mobile.install_sources.app_tester_ui_labels import default_label
+from tools.mobile.install_sources.app_tester_ui_labels import refusal as label_refusal
 from tools.mobile.install_sources.app_tester_ui_memory import (
     known_bundle,
     parse_app_id,
@@ -136,6 +137,16 @@ async def _listed_and_installed(serial: str, label: str) -> str:
     return package if package in have else ""
 
 
+def _hint_label(call: _AppCall, target: str) -> str:
+    """The app label the call names; the device's one remembered label only
+    when no link or app id picks the app instead."""
+    if parse_app_id(call.value):
+        return goal_app_label(call.goal) or ""
+    return (
+        call.value or target or goal_app_label(call.goal) or default_label(call.serial)
+    )
+
+
 async def app_tester_stage(call: _AppCall, target: str) -> tuple:
     """Launch the installed App Tester, find the app named by the hint in its
     list, install it (Download + system installer) and continue the run with
@@ -143,11 +154,10 @@ async def app_tester_stage(call: _AppCall, target: str) -> tuple:
     tester = await installed_tester(call.serial)
     if not tester:
         return await _open_tester_store(call.serial), target
-    label = "" if parse_app_id(call.value) else call.value or target
-    label = label or goal_app_label(call.goal) or ""
+    label = _hint_label(call, target)
     known = await known_package(call.serial, label)
     if not label and not known:  # nothing names the app: ask before any launch
-        return _failed(_label_required()), ""
+        return _failed(label_refusal(call.serial)), ""
     link = call.source_text
     want = ListedApp(call.serial, label, tester, known, link)
     try:

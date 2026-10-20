@@ -9,7 +9,15 @@ import logging
 import zlib
 
 from config.settings_guard import never_raise
-from tools.mobile import a11y_events, a11y_retry, adb, ime, ime_nonce, ime_proof
+from tools.mobile import (
+    a11y_bench,
+    a11y_events,
+    a11y_retry,
+    adb,
+    ime,
+    ime_nonce,
+    ime_proof,
+)
 
 logger = logging.getLogger("tools.mobile.a11y")
 
@@ -134,7 +142,7 @@ def _strike(serial: str, error: str) -> None:
         streaks, cap = _NO_WINDOW, A11Y_MAX_CONSECUTIVE_NO_WINDOW
     streaks[serial] = streaks.get(serial, 0) + 1
     if streaks[serial] >= cap:
-        adb.clear_dump_provider(serial)
+        a11y_bench.bench(serial, fetch_dump)
 
 
 async def provider(serial: str) -> dict:
