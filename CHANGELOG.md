@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.145.1] - 2026-10-20
+## [1.145.2] - 2026-10-20
 
 ### Added
 
@@ -67,6 +67,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
   delete that still fails is logged.
 - A step clip recorded again under the same name is joined into the
   run video again, instead of the old video being reused.
+- A failed kill of a stuck device recorder is now logged.
 
 ### Known
 

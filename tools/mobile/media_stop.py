@@ -34,18 +34,28 @@ async def signal_recorder(serial: str, pid: object = None) -> None:
     await adb.shell(serial, ["pkill", "-INT", "screenrecord"], MAX_STOP_WAIT_S)
 
 
+def _failed(done: dict) -> bool:
+    """Whether an ``adb.shell`` result is an adb error or a non-zero exit."""
+    body = done.get("content")
+    return bool(done.get("error")) or bool(isinstance(body, dict) and body.get("rc"))
+
+
 async def kill_recorder(serial: str, pid: object = None) -> None:
     """Kill, on the device, a recorder that ignored its interrupt (pid only)."""
-    if isinstance(pid, int) and pid > 0:
-        await adb.shell(serial, ["kill", "-9", str(pid)], MAX_STOP_WAIT_S)
+    if not (isinstance(pid, int) and pid > 0):
+        return
+    done = await adb.shell(serial, ["kill", "-9", str(pid)], MAX_STOP_WAIT_S)
+    if _failed(done):
+        logger.warning(
+            "mobile.media: could not kill recorder pid %d on the device", pid
+        )
 
 
 async def delete_on_device(serial: str, remote: str) -> bool:
     """``rm -f`` a clip on the device, once more if the first try failed."""
     for _ in range(2):
         done = await adb.shell(serial, ["rm", "-f", remote], MAX_STOP_WAIT_S)
-        body = done.get("content")
-        if not done.get("error") and not (isinstance(body, dict) and body.get("rc")):
+        if not _failed(done):
             return True
     logger.warning("mobile.media: could not delete %s on the device", remote)
     return False
