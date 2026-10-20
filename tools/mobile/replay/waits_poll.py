@@ -13,7 +13,7 @@ from tools.mobile.replay.waits_dialog import answer_unless_met
 from tools.mobile.replay.waits_early import quiet_exit
 from tools.mobile.replay.waits_gate import Gate, hold
 from tools.mobile.replay.waits_interrupt import _interruption_of
-from tools.mobile.replay.waits_prior import _spinning
+from tools.mobile.replay.waits_prior import is_spinning
 from tools.mobile.replay.waits_quiet import settled
 from tools.mobile.replay.waits_types import Probe
 
@@ -25,6 +25,16 @@ def _wait_deadline(ctx: Context, seconds: float) -> float:
     )
 
 
+async def read(ctx: Context, deadline: float) -> dict:
+    """The dump one poll reads; the public seam tests replace."""
+    return await _dump(ctx, deadline=deadline)
+
+
+def interruption(ctx: Context, current: object, screen: object) -> object:
+    """The device interruption *current* shows, or falsy; the public seam tests replace."""
+    return _interruption_of(ctx, current, screen)
+
+
 async def _read_now(ctx: Context, current: object, deadline: float) -> tuple:
     """One dump: ``(final_or_None, content)``.
 
@@ -33,7 +43,7 @@ async def _read_now(ctx: Context, current: object, deadline: float) -> tuple:
     """
     # Cut at the deadline like every other poll's dump, so a slow dump cannot
     # carry the wait past its bound; a cut is never a device interruption.
-    dumped = await _dump(ctx, deadline=deadline)
+    dumped = await read(ctx, deadline=deadline)
     if dumped.get("error") == DUMP_CUT_DETAIL:
         return (False, current, True), None
     if dumped.get("error"):
@@ -65,9 +75,9 @@ def _ended(ctx: Context, probe: Probe, seen: tuple):
 
 def _interrupted(ctx: Context, current: object, screen: object) -> bool:
     """Name a device interruption on *ctx*; True when the wait must stop."""
-    found = _interruption_of(ctx, current, screen)
+    found = interruption(ctx, current, screen)
     if found:
-        ctx.wait_interruption = found
+        ctx.wait_interruption = str(found)
     return bool(found)
 
 
@@ -109,7 +119,7 @@ async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
 def early_exit(ctx: Context, probe: Probe, seen: tuple) -> bool:
     """True when a wait for text may give up: a quiet, non-loading screen."""
     quiet, current = seen
-    return probe.early and not _spinning(current) and quiet_exit(ctx.serial, quiet)
+    return probe.early and not is_spinning(current) and quiet_exit(ctx.serial, quiet)
 
 
 def _element_met(rid: str, text: str, gone: bool):

@@ -11,7 +11,7 @@ from tools.mobile.replay.context import (
     _Step,
 )
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
-from tools.mobile.replay.stop_shot import stop_shot
+from tools.mobile.replay.stop_shot import defer_shot
 from tools.mobile.replay.verdicts import AssertView, _evaluate_assert
 from tools.mobile.replay.verdicts_consts import MAX_VISUAL_DETAIL_CHARS
 
@@ -48,5 +48,5 @@ async def _assert_step(run: _ReplayRun, step: _Step, seen: Seen) -> dict | None:
     _close(run, at)
     if ok:
         return None
-    await stop_shot(run, at.screen)
+    defer_shot(run, at.screen)
     return _reply(_result(_stop(run, at, STATUS_NEEDS_MODEL)))

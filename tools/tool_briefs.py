@@ -18,13 +18,20 @@ from typing import Any, cast
 
 from config.settings_guard import never_raise
 from tools import tool_details
+from tools.mobile_brief_text import MOBILE_BRIEF_TEXT
 
 try:
     from tools.mobile import path_plan_text
 except ModuleNotFoundError as _exc:  # a build with no mobile package: never served
     if not (_exc.name or "").startswith("tools.mobile"):
         raise
-    path_plan_text = None
+    path_plan_text = None  # type: ignore[assignment]
+try:
+    from tools.mobile.replay.guard_consts import NO_FABRICATION_NOTE
+except ModuleNotFoundError as _exc:
+    if not (_exc.name or "").startswith("tools.mobile"):
+        raise
+    NO_FABRICATION_NOTE = ""
 
 TOOL_DESCRIPTION_MAX_CHARS = 350
 TOOL_DESCRIPTIONS_TOTAL_MAX_CHARS = 8000
@@ -39,59 +46,8 @@ MOBILE_REMINDER = (
     "form, via qa_submit_mobile_step only."
 )
 
-MOBILE_BRIEF = """\
-MOBILE RULES (qa_mobile_test / qa_submit_mobile_step / qa_mobile_status)
-
-ANY action on an Android emulator or device -- install, launch, switch environment, log in, tap, type, explore -- goes through qa_mobile_test. For ad-hoc steps pass goal="..." (apply defaults to true; no suite, no cases needed) and it drives the device step by step. Do NOT use raw adb or shell commands for device actions (adb shell input/am/pm, uiautomator dumps, ADB Keyboard broadcasts): the tool owns the destructive guard, keyboard install/restore, the run folder, evidence and per-step screenshots, and a raw command skips every one of them. To reset the app under test, pass `reset_app=true` (clears its data and relaunches it) or send a `clear_app_data` op to `qa_submit_mobile_step`; either needs a live run (apply, the default) and never touches a different app. For a login or explore run that must not stop on a runtime-permission dialog (notifications on Android 13+, location), `grant_permissions` is on by default: it grants the permissions the app declares (incl. notifications) before the first step. Pass `grant_permissions=false` when the run tests the permission prompt itself. All permissions are granted by default; if the test prompt denies one, pass `deny_permissions=[names]` (location, camera, microphone, notifications, contacts, photos/storage, phone, sms, calendar, nearby/bluetooth) and only those are denied. An unclear pop-up then stops the run as `permission_unclear` for you to answer. Leave `launch` at its default: the server opens the app under test before the first packet, also when the goal asks to confirm the home screen first (the reply then tells you to send a `home` op to observe it). Pass `launch=false` ONLY when the user explicitly says the app must NOT be opened for them: the start then does not open the app and the run begins on whatever the device shows, with an "App NOT opened" line in the reply. `reset_app=true` still relaunches the app after clearing it, and a scripted case run (cases or suite) still opens the app for each case. A goal charter (explore lane) defaults to `destructive: "none"`, which REFUSES every irreversible op it meets -- a goal that reads like a reset gets a named hint to resend with `destructive: "reversible"` rather than failing on its first step with no explanation. An out-of-enum charter field (e.g. `depth: "functional"`) is never silently accepted either: the reply names the field, what was sent, what was used instead, and a fenced JSON block carrying the field's real `enum` values, sourced from this server's own charter vocabulary rather than restated by hand.
-
-Call qa_mobile_test with NO arguments to start: it answers with whatever the machine needs next (a setup guide, an install source, a preflight list, or the start menu) and asks the tester itself. Every step that installs, downloads or launches needs apply=true, and nothing is installed or downloaded without it. With no Android SDK or no emulator (AVD) on this machine it answers with a setup guide (`setup_required: true`): relay its steps to the tester -- this server downloads no SDK (it can list, boot, create and delete AVDs: see AVDS below). Pass run_id to continue a run in ANY chat -- that takes the run over and the previous chat is told. It hands you ONE packet at a time; answer each with qa_submit_mobile_step.
-
-The install menu's key goes in `source` and its value in `app` (a path, a URL or a package name); for `source=installed_package` specifically, `package` is also accepted for that value and is preferred when both are given. The run menu (current_suite, stored_suite, own_cases, explore, rerun_failures, resume) is a SEPARATE question answered by that same `source` argument in a later call -- send the run menu's key once the app is confirmed installed, or give `goal`/`cases`/`suite_id` instead and skip the question entirely. Once the tester has asked for an install, pass `apply=true` on the first call; no preview round is needed.
-
-Choosing to explore freely with no goal answers with a CHARTER INTAKE packet: the server's own questions about the run's terms (goal, depth, scope, destructive, budget). Put them to the tester in your own words, ask no others, and call again with `charter` set to a JSON object using the field names the packet gives. Never put a password, an OTP or any personal value in it: the charter is written into the run's report on disk, and it has no field for a secret. Anything left out takes a default, and the report names every default it used.
-
-`locale` sets the DEVICE's language for the run -- `ar`, `ar-EG`, `en-US`. It is applied before anything is installed, read back off the device, and shown in the report header, so a run always states the language it actually ran in. When the device will not take it the call REFUSES and says what the device is in rather than running under the wrong language. Needs apply=true. It takes effect from the first frame only on an emulator this server booted itself; on one the tester already started, `persist.sys.locale` usually needs root, and the refusal says so and how to set it by hand.
-
-If the tester already has an emulator running, pass its adb serial (e.g. `emulator-5554`) in `device_id` (`serial` is an alias for the same value; two different values are refused) -- that skips the AVD lookup entirely and never spawns a second one underneath it. `avd` names which AVD to boot when none is running and more than one is configured; leave both empty to let the server look and, if it finds exactly one booted device, use it.
-
-If the same cases are already an unfinished run of the same app, qa_mobile_test answers with THAT run's id instead of starting another one. Pass new_run=true only when the tester has asked for a fresh run: a second run of the same cases produces a second report of the same work.
-
-DUMP FIRST: plan from the element list. No image is attached. One PNG is written to the report at done, a failed assert, screenshot=true or a blind screen (no usable list); the packet text gives its path. Coordinates always come from the element list. A screen byte-identical to the one this chat was just sent is replaced by a one-line same-screen note: the list you already have is still exact.
-
-Submitting (qa_submit_mobile_step): the server validates the script against the action vocabulary, replays it on the device, and returns the verdict plus the NEXT packet. When a packet asked for a credential, ask the TESTER for that one field and pass it as tester_input with tester_input_field set to the field name: it is typed into the app and stored nowhere -- not in the report, the checkpoint or the audit log.
-
-When a packet asks for TWO OR MORE fields in the same turn (a password plus a one-time code, say), pass them all at once as tester_inputs, a JSON object string mapping field name to value, e.g. '{"login_password": "...", "login_otp": "..."}' -- still masked, still typed into the app and stored nowhere. Example: type the ID, type the password ({"op": "type", "target": ..., "field": "login_password", "secret": true}), tap send, wait_until_text for the one-time-code screen, type the code the same way ({"op": "type", "target": ..., "field": "login_otp", "secret": true}), assert, then done -- with both login_password and login_otp supplied via tester_inputs on that SAME submit. The final assert and done belong in the same script as the step before them. Wait FOR something (wait_until_text, wait_until_gone, wait_until_changed, wait_until_idle), never for a number, and never sleep in a shell (sleep, Start-Sleep, timeout) between calls: the phone is not watched while you do.
-
-Send {"op": "clear_app_data"} as a script action to wipe this run's OWN app's data and relaunch it -- gated by the same destructive guard as every other irreversible action, and never a different app. If the first packet already says app data was cleared at run start (reset_app=true), do not send clear_app_data again for that reason.
-
-One script may carry SEVERAL actions, replayed in order until one needs the screen re-read or the case ends, so batch what you already know you want done rather than one action per call: {"actions": [{"op": "tap", "text": "Email"}, {"op": "type", "text": "user@example.com"}, {"op": "tap", "text": "Continue"}, {"op": "assert", "kind": "new_text", "text": "Password"}]} is ONE submit, not four. @@PATH_PLAN@@ @@STOP_NOTE@@ @@PERMISSION_NOTE@@ A script that carries exactly one action still runs, but the reply says so: use more of the budget you already have per call.
-
-To type into a form field, prefer {"op": "fill", "label": "Email", "text": "user@example.com"} over a tap then a type: it finds the editable field by its hint, text or description, or the nearest field below or right of a matching label, taps it, types and checks the text landed. `field` is read only for a secret fill (a plain fill ignores it) and never replaces `text`: a plain fill needs `text`, as above. For a secret send "secret": true with "field" naming the tester input, never the value. If two fields match, the step is refused with the candidates named: resend with a narrower label.
-
-No image is attached to the next packet; a PNG is written to the report only at done, a failed assert, screenshot=true or a blind screen, and the packet text gives its path.
-
-When the destructive guard stops a control and the TESTER confirms it, resubmit with confirm_destructive=true: it unlocks only the control THIS case's last stop named, not any control -- resubmit the SAME op against the SAME element the stop pointed at. A different op, a different element, or a submission before any stop was recorded, refuses by name and does NOT spend the confirm, so the next, correctly-aimed resubmission can still use it. A run whose charter says `destructive: none` still refuses.
-
-Optional `env`="name=value,..." on qa_mobile_test declares this run's setup (e.g. backend=staging) so env-scoped app notes apply; a script may carry knowledge_feedback.
-
-Report only what a qa_* observation read. If the server cannot type or act, stop and name the blocker; no raw adb, no claimed result.
-
-A finished run's reply STARTS with a short verdict block (verdict, each requested step, the typed-field tally). Relay that block to the tester word for word -- never upgrade, soften or summarise it into a plainer claim than it makes.
-
-qa_mobile_status: the emulator, the lease holder and the cases done/failed/remaining. Call it after anything that outlives a tool call -- a large install, a cold boot. With no run_id it lists the runs on this machine. Pass report_now=true to also write that run's standalone HTML report and get its path back; a mid-run report is fine and says it is partial.
-
-Saved flows (qa_submit_mobile_step `flow` / `save_flow`, managed with qa_mobile_flows): `flow`=name replays one as a single script; leave `script` empty and pass `flow_params` as a JSON object for its {placeholders}. `save_flow`=name saves this call's `script` only after it replays cleanly: typed text must be a {placeholder} (its value in `flow_params`), and a password a secret step with a `field`. A flow keeps steps and labels, never values. A step that no longer matches its screen stops the flow and hands back to you.
-
-Saved routes (qa_submit_mobile_step `route` / `save_route`, managed with `qa_mobile_flows` kind=route): a route is a flow whose every screen is checked. `save_route`=name saves this call's `script` only after it replays cleanly, remembering the screen each step started on. `route`=name (empty `script`, `flow_params` for its {placeholders}) replays it ONLY from the screen it was saved from; each step first checks the screen, and any mismatch stops with nothing tapped and hands back to you. Typed text and passwords follow the flow rules. Use a route for a known trip (go to login, switch env to QA); it costs no planning turn.
-
-SCREEN PEEK: `qa_capture_screens(peek=true)` returns the current Android screen's element list as text: nothing is tapped, saved or attached, and no `apply` is needed. If it says the list is not enough to act on, call `qa_capture_screens` without `peek` for the screenshot. A peek is a lookup, not a verdict.
-
-AVDS: never run `avdmanager`, `sdkmanager` or `emulator` yourself in a shell. Use `qa_mobile_test(emulator=...)`: `list` (read-only), `boot` (`avd=NAME`, `apply=true`), `create` (`avd=NAME`, `system_image=` an installed image id shown by `list`, `apply=true`) and `delete` (`avd=NAME`, `apply=true` AND `confirm_destructive=true`, only after the TESTER says yes). A name is letters, digits, `.`, `_`, `-`, not starting with `.` or `-`. Create uses only system images that are already installed and downloads nothing: if none is, relay the steps in the reply. If the reply says this computer cannot run the emulator (no hypervisor), relay its fix text and suggest a real device; do not look for another way to start one.
-
-Never sleep in a shell between calls: a shell sleep is a wait nobody watches; use a `wait` action with a condition. A `wait` waits for `ms`, for `until_text`, or for an element by resource id: `until_rid` (present), with `until_gone=true` (gone) or `until_rid_text` (its text or description contains it). `until_text` and `until_rid` never go together.
-
-PACKET RULES (moved from the packet's system prompt): a control labelled Voice, Record or Mic is NEVER the Send control. Short ids describe the element on the screen you were given; a stale one is handed back, never mistapped, but costs a turn. Never send TWO selectors that name different elements, nor one that matches nothing alongside one that matches. After a tap that opens a new page, the next packet hands you that screen: plan it then, targeting by role, rid, label or text; never redo steps that ran. For 'the app replies' assert new_text (optionally with contains) or text_present, NEVER screen_changed. A raw shell call bypasses the IME, the step record and the tester's report, and one submit replays a whole script where a shell call replays one action. No capture, status, app_info, list_devices, search_corpus or get_mcp_tools during a run. done(verdict): 'pass' = you verified the expected results, 'fail' = you verified they did not hold, 'blocked' = you could not tell; guessing 'pass' is the worst answer.
-"""
+MOBILE_BRIEF = MOBILE_BRIEF_TEXT
+MOBILE_BRIEF = MOBILE_BRIEF.replace("@@NO_FABRICATION@@", NO_FABRICATION_NOTE)
 for _tok, _name in (
     ("@@PATH_PLAN@@", "PATH_PLAN"),
     ("@@STOP_NOTE@@", "STOP_NOTE"),

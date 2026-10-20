@@ -119,6 +119,19 @@ def known_latest(at: Installed) -> Optional[int]:
     return code if isinstance(code, int) else None
 
 
+_NO_APK_ID: set[str] = set()
+
+
+def note_apk_without_id(serial: str, package: str) -> None:
+    """The APK of *package* on *serial* holds no id: do not pull it again this run."""
+    _NO_APK_ID.add(_key(serial, package))
+
+
+def apk_has_no_id(serial: str, package: str) -> bool:
+    return _key(serial, package) in _NO_APK_ID
+
+
 def reset() -> None:
     """Drop everything learned (tests, and a new device session)."""
     store.clear()
+    _NO_APK_ID.clear()

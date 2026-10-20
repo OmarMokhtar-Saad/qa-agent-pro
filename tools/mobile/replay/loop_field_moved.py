@@ -14,12 +14,12 @@ from __future__ import annotations
 import time
 from typing import Any, NamedTuple
 
-from tools.mobile import dump_latency, latency_scale
+from tools.mobile import a11y_events, dump_latency, latency_scale
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.context_consts import AUTO_SETTLE_MAX_S
 from tools.mobile.replay.dump import _dump, _focus_probe
 from tools.mobile.replay.dump_stamp import live_focus
-from tools.mobile.replay.waits_gate import Gate, hold
+from tools.mobile.replay.waits_gate import Gate, hold, token_of
 from tools.mobile.screen_key import screen_key
 
 
@@ -71,7 +71,7 @@ def _deadline(ctx: Context) -> float:
 
 async def _focus_left(ctx: Context, focus: str, deadline: float) -> bool:
     """Probe the focus (no dump; the probe is the poll) until the window changes or the cut."""
-    gate = Gate(probe_only=True, started=True)
+    gate = Gate(started=True)
     while time.monotonic() < deadline:
         now = await live_focus(ctx, deadline)
         if now and now != focus:
@@ -91,6 +91,30 @@ async def _read_moved(ctx: Context, before: object, deadline: float) -> Moved:
     return Moved(False)
 
 
+def _heard_event(serial: str, base: a11y_events.EventClock | None) -> bool:
+    """True when a window/content event arrived since the clock *base*."""
+    clock = a11y_events.latest(serial)
+    return base is not None and clock is not None and clock.count != base.count
+
+
+async def _masked_moved(ctx: Context, seen: tuple[str, object], until: float) -> Moved:
+    """Focus probes; a window/content event is the cue for ONE dump as proof."""
+    focus, before = seen
+    base = a11y_events.latest(ctx.serial)
+    gate = Gate(token_of(ctx.serial), started=True)
+    while time.monotonic() < until:
+        now = await live_focus(ctx, until)
+        if now and now != focus:
+            return Moved(True)
+        if _heard_event(ctx.serial, base):
+            proof = await _dump(ctx, deadline=until)
+            base = a11y_events.latest(ctx.serial)
+            if not proof.get("error") and _moved_on(before, proof.get("content")):
+                return Moved(True, proof["content"])
+        await hold(ctx, gate, until)  # blocks on the next generation
+    return Moved(False)
+
+
 async def moved_on_masked(ctx: Context, before: object) -> Moved:
     """A masked field cannot be read back: focus probes, then ONE dump as proof.
 
@@ -98,8 +122,10 @@ async def moved_on_masked(ctx: Context, before: object) -> Moved:
     """
     deadline = _deadline(ctx)
     focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
-    if focus and await _focus_left(ctx, focus, deadline):
-        return Moved(True)
+    if focus:
+        watched = await _masked_moved(ctx, (focus, before), deadline)
+        if watched.moved:
+            return watched
     dumped = await _dump(ctx)
     while dumped.get("error") and time.monotonic() < deadline:
         dumped = await _dump(ctx, deadline=deadline)

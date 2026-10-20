@@ -35,6 +35,7 @@ from tools.mobile.install_sources.app_tester_ui_handoff import (
     CONSENT_TRIES,
     consent_required,
 )
+from tools.mobile.install_sources.app_tester_ui_hold import installer_waits, reset_hold
 from tools.mobile.install_sources.app_tester_ui_ready import (
     PAGE_READY_POLLS,
     page_ready,
@@ -95,6 +96,8 @@ class _ScreenMixin:
         if xml is None:
             return None
         front = await run.ui.foreground()
+        if front in (APP_TESTER_PACKAGE, run.request.package):
+            reset_hold(run)
         if front == APP_TESTER_PACKAGE:
             return await self._tester_screen(run, xml)
         if front == run.request.package:
@@ -117,12 +120,15 @@ class _ScreenMixin:
         ctx = DialogContext(run.request.serial, front, expected, xml)
         action = dialog_handlers.handle(ctx)
         if action is not None:
+            reset_hold(run)
             await self._perform(run.ui, action)
             return None
         if _in_progress(texts):
+            reset_hold(run)
+        if _in_progress(texts) or installer_waits(run, front, texts):
             await self._sleep(APP_TESTER_POLL_S)
             return None
-        return _foreign_stop(front, texts)
+        return _foreign_stop(front, texts, run.request.package)
 
     async def _perform(self: _Flow, ui: DeviceUi, action: DialogAction) -> None:
         if action.kind == BACK:

@@ -23,11 +23,9 @@ from typing import Any
 from tools.mobile import (
     explore_runner,
     flow_replay,
-    flow_replay_inputs,
-    flow_replay_match,
     flow_replay_state,
-    held_inputs,
     host_flow_goal,
+    host_replay_ready,
     run_store,
 )
 from tools.mobile.case_run_consts import NEEDS_MODEL
@@ -75,22 +73,6 @@ def _seconds(ctx: Any) -> float:
     return 0.0 if left < MIN_BUDGET_S else min(MAX_SECONDS, left - PACKET_RESERVE_S)
 
 
-def _ready(ref: _Ref, screen: Any, body: dict) -> bool:
-    """True when a flow fits the first screen and every input it needs is known."""
-    ctx = ref.ctx
-    key = flow_replay_match.live_keys(screen, ctx)
-    package = str(getattr(ctx, "package", "") or "")
-    skip = host_flow_goal.skip(package, body)
-    _name, template, _pos = flow_replay_match.pick_first(package, key, skip)
-    if not template:
-        return False
-    have = dict(
-        held_inputs.recall(ref.run_id), **(getattr(ctx, "tester_inputs", None) or {})
-    )
-    got = flow_replay_inputs.resolve(template, have)
-    return all(need in got for need in flow_replay_inputs.wanted(template))
-
-
 async def _walk(ref: _Ref, screen: dict, body: dict) -> Any:
     """The replay pass; the call's context holds THIS pass's budget while it runs."""
     seconds = _seconds(ref.ctx)
@@ -133,6 +115,22 @@ def _declined(ref: _Ref, body: dict) -> bool:
     return host_flow_goal.declined(ref.run_id, str(body.get("goal") or ""))
 
 
+async def _fit_then_replay(ref: _Ref, screen: dict, body: dict) -> tuple:
+    """Replay the fitting flow; with inputs owed, name them in the packet note (B15)."""
+    template = host_replay_ready.fitting(ref, screen, body)
+    if not template:
+        return screen, ""
+    owed = host_replay_ready.missing(ref, template)
+    more = host_replay_ready.others(ref, screen, body)
+    if owed:
+        seen, note = screen, host_replay_ready.ask_note(owed)
+    else:
+        seen, note = await _replay(ref, screen, body)
+    if more and note:
+        note += "; " + host_replay_ready.choose_note(more)
+    return seen, note
+
+
 async def run(ref: _Ref, screen: dict, fresh: bool = False) -> tuple:
     """``(screen, note)``: the screen after any saved flow that fit; ``note`` is empty if none ran."""
     body: dict = {}
@@ -142,9 +140,7 @@ async def run(ref: _Ref, screen: dict, fresh: bool = False) -> tuple:
         body = _body(ref, fresh)
         if _declined(ref, body) or not _seconds(ref.ctx):
             return screen, ""
-        if not _ready(ref, screen, body):
-            return screen, ""
-        return await _replay(ref, screen, body)
+        return await _fit_then_replay(ref, screen, body)
     except Exception:  # never stop a case for a replay
         logger.exception("mobile.host_auto_replay.run failed")
         body.pop("auto_trace", None)  # the device state is unknown: record nothing

@@ -57,6 +57,10 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (  # noqa: F401
     parse_releases,
 )
 from tools.mobile.install_sources.app_tester_ui_gate import remember_landed
+from tools.mobile.install_sources.app_tester_ui_open import (
+    landed_evidence,
+    open_when_wanted,
+)
 from tools.mobile.install_sources.app_tester_ui_pick import _PickMixin
 from tools.mobile.install_sources.app_tester_ui_ready import read_drawn, wait_page_ready
 from tools.mobile.install_sources.app_tester_ui_screens import _ScreenMixin
@@ -164,6 +168,11 @@ class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
         if not _improved(run.before, after, run.request.target_version_code):
             return None
         remember_landed(run, after)
+        opened = await open_when_wanted(run, self._sleep)
         return InstallOutcome(
-            True, "", "Installed through the App Tester.", after.version_code
+            True,
+            "",
+            "Installed through the App Tester.",
+            after.version_code,
+            evidence=landed_evidence(run, after, opened),
         )

@@ -14,16 +14,15 @@ total. A phase whose awaitable raises is not recorded. Report only.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import time
 from contextvars import ContextVar
 from typing import Any, Awaitable, Optional
 
 from tools.mobile import step_cover, step_detail, step_ledger
 
-#: Distinct phase names one call may record. The instrumented sites name six;
-#: a name past this is dropped rather than grown into an unbounded dict that
-#: ends up in a reply. Bounded from above in
-#: ``tests/mobile/test_mobile_bounds_upper.py``.
+#: Distinct phase names one call may record (six are instrumented); a name
+#: past this is dropped. Bounded above in ``tests/mobile/test_mobile_bounds_upper.py``.
 MAX_TIMED_PHASES = 20
 
 #: Per-step rows kept for one run's record; past it the oldest are dropped and
@@ -34,16 +33,17 @@ MAX_STEP_TIMING_ROWS = 200
 #: Characters of a tree-source name kept in a row.
 MAX_SOURCE_CHARS = 40
 _PHASES: ContextVar = ContextVar("_STEP_PHASES", default=None)
+_STEP_IDS = itertools.count(1)  # unlike id(state), never reused
 
 
 def begin() -> None:
     """Arm a fresh breakdown for the current task (and its awaited callees)."""
-    _PHASES.set({"start": time.monotonic(), "phases": {}})
+    _PHASES.set({"start": time.monotonic(), "phases": {}, "id": next(_STEP_IDS)})
 
 
 def armed_step() -> int | None:
-    """An id of the armed step's breakdown, or ``None`` when no step is armed."""
-    return None if (state := _PHASES.get()) is None else id(state)
+    """The armed step's unique id, or ``None`` when no step is armed."""
+    return None if (state := _PHASES.get()) is None else state["id"]
 
 
 def _record(name: str, seconds: float) -> None:

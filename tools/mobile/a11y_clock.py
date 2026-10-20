@@ -13,7 +13,9 @@ The skip is allowed only when all of these hold, because a deaf service (the
 * this serial's count already advanced across an earlier screen change, which proves
   the service hears events at all (``proven``);
 * at most :data:`MAX_SKIPS` repeats in a row are taken on the clock, and as many
-  on heard events; the next one runs the uiautomator confirm again;
+  on heard events; the next one runs the uiautomator confirm again. A clock with
+  the every-event generation (qa-ime 1.2.2+) needs no ``proven`` but is capped
+  too, at :data:`GENERATION_SKIPS`;
 * the clock is that of the dump just taken. A reply without a clock (qa-ime older
   than 1.2.1) clears the state, so those runs keep the uiautomator confirm.
 
@@ -30,6 +32,9 @@ from tools.mobile import a11y_events, step_timing
 
 #: Consecutive repeats the clock may confirm before uiautomator checks again.
 MAX_SKIPS = 2
+#: Repeats the every-event generation may confirm in a row; then uiautomator checks
+#: again (a net for a service that stopped counting). Larger than :data:`MAX_SKIPS`.
+GENERATION_SKIPS = 6
 #: The ledger note for a repeat the clock confirmed.
 BY_CLOCK_NOTE = "a11y_repeat_by_clock"
 #: The ledger note for a repeat proven by events heard after the action.
@@ -65,15 +70,20 @@ def no_event_since(serial: str, digest: str) -> bool:
 
     A repeated tree with no event is "unchanged", not stale: no confirming dump.
     Only a clock with the every-event generation (qa-ime 1.2.2+) is trusted
-    outright: the window/content count alone is also flat on a deaf service, so
-    without it the proven, capped rule of qa-ime 1.2.1 applies.
+    outright, up to :data:`GENERATION_SKIPS` repeats in a row: the window/content
+    count alone is also flat on a deaf service, so without it the proven, capped
+    rule of qa-ime 1.2.1 applies.
     """
     seen, clock = _SEEN.get(serial), a11y_events.latest(serial)
     if seen is None or clock is None or seen.digest != digest:
         return False
     if clock.generation is None:
         return seen.proven and seen.skips < MAX_SKIPS and clock.count == seen.count
-    return clock.count == seen.count and clock.generation == seen.generation
+    return (
+        clock.count == seen.count
+        and clock.generation == seen.generation
+        and seen.skips < GENERATION_SKIPS
+    )
 
 
 def _heard_after(serial: str, digest: str) -> bool:
@@ -124,3 +134,5 @@ def served(serial: str, digest: str) -> None:
     elif clock.count != seen.count:
         seen.count, seen.skips = clock.count, 0
         seen.generation = clock.generation
+    elif clock.generation != seen.generation:
+        seen.generation = clock.generation  # count flat: skips keep counting

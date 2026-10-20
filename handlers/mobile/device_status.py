@@ -10,6 +10,7 @@ from handlers.mobile.device_runs import _mobile_status_listing
 from tools.mobile import render as mobile_render
 from tools.mobile import report as mobile_report
 from tools.mobile import session_packets, session_records, session_runs
+from tools.mobile.replay import stop_shot
 from tools.mobile.session_core import STATE_ABANDONED
 from tools.untrusted import single_line as _safe
 
@@ -45,6 +46,7 @@ async def _mobile_status_report(run_id: str, body: dict) -> tuple[str, str]:
     """
 
     await _pull_evidence(run_id, body)
+    await stop_shot.drain_all()  # B11: the report reads these PNGs
     produced = mobile_report.render(run_id)
     if produced.get("error"):
         return "", str(produced["error"])

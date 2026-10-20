@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
+from tools.mobile import target_pin
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.screen import (
     LEAVES_ON_PURPOSE,
@@ -49,6 +50,8 @@ def _cut_of(ctx: Context, view: CutView) -> Cut:
     if dialog:
         return Cut("system_dialog", dialog)
     package = _screen_package(view.screen)
+    if target_pin.repin(ctx, package):  # B05: a transient pin follows the foreground
+        return Cut("", "")
     if (
         package
         and ctx.package

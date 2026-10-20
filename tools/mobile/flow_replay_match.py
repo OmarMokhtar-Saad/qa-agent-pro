@@ -126,7 +126,7 @@ def known_keys(package: str) -> frozenset:
     return frozenset(k for k in keys if k)
 
 
-def _rank(item: tuple) -> tuple:
+def rank(item: tuple) -> tuple:
     name, template, at = item
     reached = bool((template.get("meta") or {}).get("reached"))
     suffix = len(template.get("steps") or []) - at
@@ -155,18 +155,24 @@ def pick(package: str, key: str, skip: Any = ()) -> tuple:
     for by_key in (True, False):
         fits = [(n, t, at) for n, t in rows if (at := _first_at(t, key, by_key)) >= 0]
         if fits:
-            return max(fits, key=_rank)
+            return max(fits, key=rank)
     return ("", {}, 0)
 
 
-def pick_first(package: str, key: str, skip: Any = ()) -> tuple:
-    """Like ``pick`` but only a flow whose FIRST step starts on *key* (host lane)."""
+def first_fits(package: str, key: str, skip: Any = ()) -> list:
+    """Every ``(name, template, 0)`` whose FIRST step starts on *key*, in the tier that fits."""
     rows = [(n, t) for n, t in _templates(package) if _usable(t) and n not in set(skip)]
     for by_key in (True, False):
         fits = [(n, t, 0) for n, t in rows if _first_at(t, key, by_key) == 0]
         if fits:
-            return max(fits, key=_rank)
-    return ("", {}, 0)
+            return fits
+    return []
+
+
+def pick_first(package: str, key: str, skip: Any = ()) -> tuple:
+    """Like ``pick`` but only a flow whose FIRST step starts on *key* (host lane)."""
+    fits = first_fits(package, key, skip)
+    return max(fits, key=rank) if fits else ("", {}, 0)
 
 
 def needed(step: dict) -> str:

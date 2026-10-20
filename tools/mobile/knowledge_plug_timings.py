@@ -17,6 +17,7 @@ from tools.mobile import (
     ktim_samples,
     screen_key,
 )
+from tools.mobile.action_consts import WAIT_UNTIL_OPS
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,8 @@ def step_op_rid(step: object) -> tuple:
     return str(op or ""), str(rid or "")[:200]
 
 
-def snapshot(conn, facts) -> dict:
-    """``{"timings": {(screen_key, op, target): wait_ms}}`` of the active rows."""
-    out: dict = {}
-    rows = knowledge_db.rows(
+def _active(conn) -> list:
+    return knowledge_db.rows(
         conn,
         "timings",
         knowledge_db.Where(
@@ -52,14 +51,24 @@ def snapshot(conn, facts) -> dict:
             knowledge_limits.SNAPSHOT_MAX_ROWS,
         ),
     )
-    for row in rows:
+
+
+def snapshot(conn, facts) -> dict:
+    """``{"timings": {(screen_key, op, target): wait_ms}}`` of the active rows."""
+    out: dict = {}
+    waits: dict = {}
+    for row in _active(conn):
         if ktim_samples.decode(row["samples_json"]) is None:
             continue  # learned under the old formula: our own sleep fed it
-        out[(row["screen_key"], row["action"], row["target"])] = int(row["wait_ms"])
-    return {"timings": out}
+        key = (row["screen_key"], row["action"], row["target"])
+        if row["action"] in WAIT_UNTIL_OPS:
+            waits[key] = ktim_samples.decode(row["samples_json"])
+        else:
+            out[key] = int(row["wait_ms"])
+    return {"timings": out, "waits": waits}
 
 
-def _key_of(ctx, screen) -> str:
+def key_of(ctx, screen) -> str:
     return screen_key.screen_key(
         screen,
         str(getattr(ctx, "package", "") or ""),
@@ -75,7 +84,7 @@ def step_wait(ctx, step, screen) -> int:
         op, rid = step_op_rid(step)
         if not table or op in ktim_samples.UNREADY_OPS:
             return 0
-        wait = int(table.get((_key_of(ctx, screen), op, rid), 0) or 0)
+        wait = int(table.get((key_of(ctx, screen), op, rid), 0) or 0)
         return max(0, min(wait, int(actions.MAX_WAIT_MS)))
     except Exception:
         logger.exception("knowledge timings step_wait failed")

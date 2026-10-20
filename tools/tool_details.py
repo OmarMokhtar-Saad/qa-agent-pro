@@ -15,7 +15,7 @@ try:
 except ModuleNotFoundError as _exc:  # a build with no mobile package: never served
     if not (_exc.name or "").startswith("tools.mobile"):
         raise
-    script_help = None
+    script_help = None  # type: ignore[assignment]
 
 _STEP_FORMAT = getattr(script_help, "SCRIPT_FORMAT_DOC", "")
 
@@ -26,9 +26,7 @@ MOBILE TOOL DETAIL
 
 qa_mobile_test: pass the task as `goal` on the FIRST call; one call does the preflight itself (device, unlock, install), no list_devices first. Install, launch and grants happen by default (`dry_run=true` previews); grants are test setup, not a settings change; `deny_permissions=["location"]` denies one, `grant_permissions=false` only for prompt tests. `source`: install key, `app`/`package`: its value; `device_id`: adb serial; `avd`: AVD to boot; `charter`: JSON; new_run=true only if asked. `note`: JSON {"text","kind":wait|avoid,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app. Batch ops (`tap_text_if_present` for popups). Relay a finished run's verdict verbatim; once the device is released there is no status/stop. Never mark an unexercised check passed; ask before skipping a step. Prove the destination, not only text_absent. Never use raw adb: this tool owns the destructive guard + evidence.
 
-qa_mobile_status: emulator, lease holder, cases done/failed/remaining. Call it after anything that outlives a tool call (big install, cold boot).
-
-qa_submit_mobile_step: the reply is the verdict plus the NEXT packet. For a credential ask the TESTER for that field and pass it as tester_input with tester_input_field (several: tester_inputs='{"login_password": "...", "login_otp": "..."}'); it is typed into the app and stored nowhere. Pass confirm_destructive=true only after the TESTER confirms a guard stop. `note`: as on `qa_mobile_test`. `finding`: explore runs only, one observation per turn. Report only what a qa_* observation read. If the server cannot type or act, stop and name the blocker; no raw adb, no claimed result.
+qa_submit_mobile_step: `note`: as on `qa_mobile_test`. `finding`: explore runs only, one observation per turn.
 
 STEP SCRIPT FORMAT
 """

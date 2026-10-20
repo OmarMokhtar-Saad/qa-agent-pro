@@ -44,7 +44,8 @@ def _drive(device_id: str) -> str:
     device = device_id or "<device>"
     return (
         '`qa_mobile_test(device_id="' + device + '", source="installed_package", '
-        'package="<app on screen>", apply=true, goal="<what to do>")`, then '
+        'package="<app under test, not the installer>", apply=true, '
+        'goal="<what to do>")`, then '
         "`qa_submit_mobile_step` per screen and `qa_mobile_stop` at the end"
     )
 

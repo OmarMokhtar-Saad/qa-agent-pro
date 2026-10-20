@@ -32,11 +32,11 @@ def _extract_buttons(soup: BeautifulSoup) -> list[dict]:
         buttons: list[dict] = []
         for tag in soup.find_all("button"):
             text = tag.get_text(strip=True)
-            btn_type = tag.get("type", "button")
+            btn_type = str(tag.get("type") or "button")
             if text:
                 buttons.append({"text": text, "type": btn_type})
         for tag in soup.find_all("input", type="submit"):
-            text = tag.get("value") or "Submit"
+            text = str(tag.get("value") or "Submit")
             buttons.append({"text": text, "type": "submit"})
         return buttons[:20]  # cap
     except Exception:

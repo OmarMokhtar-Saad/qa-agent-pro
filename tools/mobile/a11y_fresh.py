@@ -1,11 +1,5 @@
 """THE freshness rule for the fast a11y tree: a repeat across an actuation is proven or dropped.
 
-Measured: run ``mrun-20261016-173857-8f3169`` served 71 qa-ime a11y dumps
-that all returned the intro screen (``7d3b14b06434``) while the video showed
-every tap landing. Each consumer (the dialog answerer, ``tap_text``, the
-settle's ``no_change``) trusted the tree it was handed, so each was patched
-in turn and the family came back. The fix is at the source, once.
-
 The rule: an a11y tree that is node-for-node the SAME as the previous a11y
 tree, with a device command that may have moved the screen in between (the
 :mod:`tools.mobile.dump_reuse` generation), is not trusted. uiautomator reads
@@ -20,12 +14,8 @@ the screen and :func:`tools.mobile.a11y_parity.compare` judges the two:
 * uiautomator fails -- nothing proves the repeat, so the provider refuses this
   dump and uiautomator is asked once more; the provider stays registered.
 
-A repeat the service's event clock proves unchanged (see
-:mod:`tools.mobile.a11y_clock`) skips that dump too.
-
-The check costs one uiautomator dump only when a tree repeats across an
-actuation, which is a "tap did nothing" or the first poll of a wait: a
-working fast path pays nothing.
+A repeat the event clock proves unchanged (:mod:`tools.mobile.a11y_clock`) skips it.
+Before that dump, :mod:`tools.mobile.a11y_early` waits for the next event and re-reads.
 """
 
 from __future__ import annotations
@@ -39,6 +29,7 @@ from tools.mobile import (
     a11y_bench,
     a11y_clock,
     a11y_dump,
+    a11y_early,
     a11y_reread,
     a11y_strikes,
     dump_reuse,
@@ -47,7 +38,6 @@ from tools.mobile import (
 from tools.mobile.a11y_confirm import uiautomator_aside
 from tools.mobile.a11y_parity import compare, node_digest
 from tools.mobile.a11y_pkgs import is_ime
-from tools.mobile.xml_attrs import attr_pattern, attr_values
 
 logger = logging.getLogger("tools.mobile.a11y")
 
@@ -78,6 +68,7 @@ SUSPENDED_NOTE = "a11y_suspended"
 SUSPENDED_REFUSAL = "the a11y tree is suspended until the screen changes"
 
 Provider = Callable[[str], Awaitable[dict]]
+Confirm = Callable[[], Awaitable[Any]]
 
 
 def forget(serial: str) -> None:
@@ -94,9 +85,7 @@ def _digest(xml: str) -> str:
     return node_digest(xml) or hashlib.sha1(xml.encode("utf-8", "replace")).hexdigest()
 
 
-def _packages(xml: str) -> frozenset:
-    """The ``package`` attribute values of *xml*: which apps own the tree."""
-    return frozenset(attr_values(attr_pattern("package"), xml))
+_packages = a11y_early.packages  # which apps own a tree
 
 
 def _other_screen(serial: str, xml: str) -> bool:
@@ -116,13 +105,13 @@ def _repeats(serial: str, digest: str, started_under: int) -> bool:
     return last is not None and last[1] == digest and last[0] != started_under
 
 
-def _stale(serial: str, digest: str) -> dict:
-    """Suspend fast reading on *digest*; after :data:`MAX_STALE_STRIKES` drop it."""
+def _stale(serial: str, digest: str, moved: bool) -> dict:
+    """Suspend fast reading on *digest*; a strike only when events moved (B09)."""
     step_timing.note(STALE_NOTE)
     _LAST.pop(serial, None)
     a11y_clock.forget(serial)
     _SUSPENDED[serial] = digest
-    if a11y_strikes.add(serial) >= MAX_STALE_STRIKES:
+    if moved and a11y_strikes.add(serial) >= MAX_STALE_STRIKES:
         logger.warning("mobile.a11y: stale tree on %s; fast reading benched", serial)
         a11y_bench.bench(serial, a11y_dump.fetch_dump)
     else:
@@ -130,44 +119,57 @@ def _stale(serial: str, digest: str) -> dict:
     return {"error": STALE_REFUSAL, "content": None}
 
 
-async def _judge(serial: str, xml: str) -> dict | None:
+async def _judge(serial: str, xml: str, inner: Provider | None = None) -> dict | None:
     """``None`` when uiautomator confirms *xml*, else the refusal to return."""
-    under = dump_reuse.token(serial)
-    slow = await uiautomator_aside(serial, CONFIRM_SOURCE)
+    under, digest = dump_reuse.token(serial), _digest(xml)
+    same = lambda x: _digest(x) == digest  # noqa: E731
+    redo = functools.partial(a11y_early.reread, serial, inner, same)
+    early, moved = await a11y_early.settle(serial, _packages(xml), redo)
+    if early is not None:
+        return early
+    slow = await uiautomator_aside(serial, CONFIRM_SOURCE, a11y_early.CONFIRM_CAP_S)
     if slow.get("error"):
         step_timing.note(UNCHECKED_NOTE)
         return {"error": UNCHECKED_REFUSAL, "content": None}
     if compare(xml, str(slow.get("content") or "")).get("error"):
         a11y_reread.keep(serial, under, slow)
         _PKGS[serial] = _packages(xml)
-        return _stale(serial, _digest(xml))
+        return _stale(serial, digest, moved)
     step_timing.note(CONFIRMED_NOTE)
     return None
 
 
-async def _resume(serial: str, xml: str) -> dict | None:
+async def _resume(serial: str, xml: str, judge: Confirm) -> dict | None:
     """While suspended: refuse the stale tree; once it moves, one confirmation."""
     if _digest(xml) == _SUSPENDED[serial]:
         step_timing.note(SUSPENDED_NOTE)
         return {"error": SUSPENDED_REFUSAL, "content": None}
-    refused = None if _other_screen(serial, xml) else await _judge(serial, xml)
+    refused = None if _other_screen(serial, xml) else await judge()
     if refused is None:
         _SUSPENDED.pop(serial, None)
     return refused
 
 
-async def _verdict(serial: str, xml: str, started_under: int) -> dict | None:
+async def _verdict(serial: str, read: tuple[str, int], judge: Confirm) -> dict | None:
     """``None`` when *xml* may be served, else the refusal (suspended, stale, unchecked)."""
+    xml, started_under = read
     if serial in _SUSPENDED:
-        return await _resume(serial, xml)
+        return await _resume(serial, xml, judge)
     digest = _digest(xml)
     if not _repeats(serial, digest, started_under):
         return None
-    confirm = functools.partial(_judge, serial, xml)
-    refused = await a11y_clock.judged(serial, digest, confirm)
+    refused = await a11y_clock.judged(serial, digest, judge)
     if refused is None:
-        a11y_strikes.decay(serial)  # a proven repeat is a healthy read
+        a11y_strikes.decay(serial)  # a healthy read
     return refused
+
+
+def _serve(key: str, got: dict) -> dict:
+    """Remember *got*'s tree as the last served."""
+    digest = _digest(str(got.get("content")))
+    _LAST[key] = (dump_reuse.token(key), digest)
+    a11y_clock.served(key, digest)
+    return got
 
 
 async def checked(serial: str, inner: Provider) -> dict:
@@ -178,13 +180,14 @@ async def checked(serial: str, inner: Provider) -> dict:
     xml = str(got.get("content") or "")
     if got.get("error") or not xml:
         return got
-    digest = _digest(xml)
-    refused = await _verdict(key, xml, started_under)
-    if refused is not None:
+    judge = functools.partial(_judge, key, xml, inner)
+    refused = await _verdict(key, (xml, started_under), judge)
+    if refused is None:
+        return _serve(key, got)
+    if refused.get("reread") is None:
         return refused
-    _LAST[key] = (dump_reuse.token(key), digest)
-    a11y_clock.served(key, digest)
-    return got
+    _SUSPENDED.pop(key, None)  # the tree moved while we waited: a new screen
+    return _serve(key, refused["reread"])
 
 
 def guarded(inner: Provider) -> Provider:

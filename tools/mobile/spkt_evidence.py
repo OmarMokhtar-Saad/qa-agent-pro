@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import logging
 
-from tools.mobile import explore_stop, run_store
+from tools.mobile import evidence_package, explore_stop, run_store
 from tools.mobile.run_finalize import finalize_explore_cases
 from tools.mobile_evidence import capture
 
@@ -70,10 +70,11 @@ async def _finish_evidence(run_id: str, resolved: object) -> None:
             finalise_once(run_id)
         if not isinstance(manifest, dict) or manifest.get("events_source"):
             return
+        manifest = await evidence_package.refile(run_id, manifest)
         pulled = await capture.pull_events(
             capture.RunRef(
                 str(body.get("serial") or manifest.get("serial") or ""),
-                str(body.get("package") or manifest.get("package") or ""),
+                str(manifest.get("package") or body.get("package") or ""),
                 run_id,
             )
         )

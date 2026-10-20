@@ -41,11 +41,21 @@ def note(serial: str, screen: object) -> None:
         del _RING[next(iter(_RING))]
 
 
-def recent(serial: str) -> list:
-    """The texts of the latest reads, oldest first, since the last actuation."""
+def reads(serial: str) -> list:
+    """The latest reads (text + time), oldest first, since the last actuation."""
     key = str(serial or "")
     now, gen = time.monotonic(), dump_reuse.token(key)
-    return [t for g, at, t in _RING.get(key, ()) if g == gen and now - at <= MAX_AGE_S]
+    held = _RING.get(key, ())
+    return [
+        wait_guard.Read(t, at)
+        for g, at, t in held
+        if g == gen and now - at <= MAX_AGE_S
+    ]
+
+
+def recent(serial: str) -> list:
+    """The texts of the latest reads, oldest first, since the last actuation."""
+    return [r.text for r in reads(serial)]
 
 
 def reset() -> None:

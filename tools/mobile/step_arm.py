@@ -9,9 +9,12 @@ directly arms itself as before.
 
 from __future__ import annotations
 
+import logging
 from contextvars import ContextVar
 
-from tools.mobile import prerun_timing, step_timing
+from tools.mobile import call_stamps, prerun_timing, step_timing
+
+logger = logging.getLogger("tools.mobile.step")
 
 _OUTER: ContextVar = ContextVar("_STEP_OUTER", default=False)
 
@@ -24,6 +27,8 @@ def _arm() -> None:
 
 def begin_outer() -> None:
     """Arm the ledger from the outermost handler."""
+    call_stamps.clear()
+    call_stamps.received()
     _arm()
     _OUTER.set(True)
 
@@ -34,6 +39,16 @@ def begin_inner() -> None:
         _arm()
 
 
+def _log_edges() -> None:
+    """B12: log receive/reply edges and the call time the manifest timer did not count."""
+    edges = call_stamps.reply_sent()
+    if edges:
+        manifest = step_timing.summary().get("total_ms", 0)
+        outside = call_stamps.outside_ms(edges["server_ms"], manifest)
+        logger.info("mobile.step stamps %s outside_manifest_ms=%d", edges, outside)
+
+
 def end_outer() -> None:
     """The outer handler is done: the next direct step arms itself."""
+    _log_edges()
     _OUTER.set(False)

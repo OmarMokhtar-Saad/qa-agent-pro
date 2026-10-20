@@ -105,3 +105,19 @@ def still_changing_note(body: dict) -> str:
     if isinstance(last, dict) and last.get("still_changing"):
         return "\n" + STILL_CHANGING_NOTE
     return ""
+
+
+NO_ASSERT_NOTE = (
+    "no assert was replayed (none in the script, or replay stopped before it): "
+    "no verdict this turn; end scripts with an assert"
+)
+
+
+def no_assert_note(body: dict) -> str:
+    """The line telling the model no assert was replayed this turn, else ``""``."""
+    case = body.get("case") if isinstance(body, dict) else None
+    trace = case.get("trace") if isinstance(case, dict) else None
+    if not isinstance(trace, list) or not trace:
+        return ""
+    ops = {e.get("op") for e in trace if isinstance(e, dict)}
+    return "" if "assert" in ops else "\n" + NO_ASSERT_NOTE

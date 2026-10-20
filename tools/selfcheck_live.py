@@ -19,6 +19,7 @@ LIVE_ENV: frozenset = frozenset(
         "QA_DUMP_SOURCE",
         "QA_EXPORT_DIR",
         "QA_DIST_MODE",
+        "QA_DIST_CLONE",
         "QA_UPDATE_REPO",
         "QA_POSTHOG_KEY",
         "QA_FORCE",

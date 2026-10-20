@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 
-from tools.mobile import adb_sock, dump_reuse, step_timing
+from tools.mobile import adb_sock, dump_reuse, shot_pending, step_timing
 from tools.mobile.adb_host import host
 from tools.process_runner import ArunOpts, arun
 
@@ -114,6 +114,7 @@ async def run_argv(
     ``asyncio.TimeoutError`` on overrun; both are converted by the callers
     below, so nothing raises past this module.
     """
+    await shot_pending.settle(shot_pending.serial_of(cmd))  # B11: after the picture
     r, clock = await _spawn_timed(cmd, timeout, stdin_data)
     if r.timed_out:
         _warn_timed_out(cmd, timeout, stdin_data)

@@ -25,6 +25,7 @@ import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 
+from handlers.mobile import run_background_flags as flags
 from tools.mobile import lock_reaper, locks, locks_devices, session_finish
 
 #: Longest an adopting call waits for a still-running setup (a cold install).
@@ -42,6 +43,7 @@ class Job:
     key: tuple
     task: asyncio.Future
     orphaned: bool = False
+    flags: dict = field(default_factory=dict)
     done_at: float = 0.0
     serial: str = ""
     run_id: str = ""
@@ -50,6 +52,10 @@ class Job:
 
 
 _JOBS: dict[tuple, Job] = {}
+_NOTES: dict[tuple, str] = {}  # reply prefix for the fresh job of a key
+
+#: Longest a restart waits for the cancelled setup to hand its device back.
+RESTART_WAIT_S = 30.0
 
 
 def key_of(req: object) -> tuple:
@@ -97,15 +103,16 @@ def _outcome(job: Job) -> str:
 
 async def launch(req: object, body: Awaitable) -> str:
     """Run *body* (``-> (reply, serial, handed_off)``) so a cancel cannot stop it."""
-    job = Job(key_of(req), asyncio.ensure_future(body))
+    job = Job(key_of(req), asyncio.ensure_future(body), flags=flags.of(req))
     _JOBS.setdefault(job.key, job)
+    prefix = _NOTES.pop(job.key, "")
     job.task.add_done_callback(lambda t: _settle(job, t))
     try:
         await asyncio.wait({job.task})  # waiting never cancels the task
     except asyncio.CancelledError:
         job.orphaned = True
         raise
-    return _outcome(job)
+    return prefix + _outcome(job)
 
 
 async def reclaim(job: Job) -> None:
@@ -142,6 +149,35 @@ async def _adopt_wait(job: Job) -> str | None:
     return _NOTE + _outcome(job)
 
 
+async def _restart(job: Job, names: list[str]) -> None:
+    """Drop an orphan whose device-state flags changed; the caller starts fresh."""
+    if not job.task.done():
+        job.task.cancel()
+        await asyncio.wait({job.task}, timeout=RESTART_WAIT_S)
+    if job.task.done():
+        await reclaim(job)
+    else:  # still unwinding: it may hold the device, so only forget it
+        _drop(job)
+    _NOTES[job.key] = flags.note(names)
+
+
+def discard_note(req: object) -> None:
+    """The restart note of *req* will not be shown (no launch followed adopt)."""
+    _NOTES.pop(key_of(req), None)
+
+
+async def opened(req: object, opening: Awaitable) -> tuple:
+    """Await the pre-launch step ``-> (..., early_reply)``; no launch means no note."""
+    try:
+        result = await opening
+    except BaseException:
+        discard_note(req)
+        raise
+    if result[-1]:
+        discard_note(req)
+    return result
+
+
 async def adopt(req: object) -> str | None:
     """The finished (or still-running) setup of this request, else ``None``.
 
@@ -155,5 +191,9 @@ async def adopt(req: object) -> str | None:
             _drop(job)
     found = _JOBS.get(mine)
     if found is None or not found.orphaned:
+        return None
+    diff = flags.changed(found.flags, flags.of(req))
+    if diff:
+        await _restart(found, diff)
         return None
     return await _adopt_wait(found)

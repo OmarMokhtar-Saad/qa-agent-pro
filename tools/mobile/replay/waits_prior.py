@@ -70,7 +70,7 @@ def _loading_row(row: object) -> bool:
     return any(_LOADING.search(str(row.get(k) or "")) for k in ("cls", "role", "desc"))
 
 
-def _spinning(screen: object) -> bool:
+def is_spinning(screen: object) -> bool:
     """A screen showing a loading indicator: a transient state, not the change we
     wait for. Matches generic Android loading names (``ProgressBar`` subclasses,
     spinner/Lottie/shimmer views, a ``progress``/``loading`` role or description)."""
@@ -84,6 +84,6 @@ def already_changed(ctx: Context, now_hash: str, screen: object = None) -> bool:
     if env.pop(_GONE, False):
         return True
     before = env.pop(_KEY, "")
-    if _spinning(screen):
+    if is_spinning(screen):
         return False
     return bool(before and now_hash and before != now_hash)

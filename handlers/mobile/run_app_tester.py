@@ -24,7 +24,7 @@ from tools.mobile.install_source import (
 )
 from tools.mobile.install_sources.app_tester_ui import AppTesterUiSource
 from tools.mobile.install_sources.app_tester_ui_handoff import host_next
-from tools.mobile.install_sources.app_tester_ui_labels import default_label
+from tools.mobile.install_sources.app_tester_ui_labels import default_label, newest_note
 from tools.mobile.install_sources.app_tester_ui_labels import refusal as label_refusal
 from tools.mobile.install_sources.app_tester_ui_memory import (
     known_bundle,
@@ -106,12 +106,15 @@ async def _install_found(call: _AppCall, want: ListedApp, found: tuple):
         run_skipped.mark_tester_install(call.serial, bundle, False)
         return "", bundle
     await _common.emit(call.progress, _INSTALLING)
-    request = InstallRequest(call.serial, bundle, want.label, latest=True)
+    request = InstallRequest(
+        call.serial, bundle, want.label, latest=True, launch=call.launch
+    )
     outcome = await source.install(request, ask)
     if not outcome.ok:
         return _failed(outcome, want), bundle
     app_alias.remember_alias(call.serial, want.label, bundle)
     run_skipped.mark_tester_install(call.serial, bundle, outcome.code != ALREADY_LATEST)
+    run_skipped.mark_tester_evidence(call.serial, outcome.evidence)
     return "", bundle
 
 
@@ -147,6 +150,17 @@ def _hint_label(call: _AppCall, target: str) -> str:
     )
 
 
+async def _echo_default(call: _AppCall, target: str, label: str) -> None:
+    """Say which remembered app was taken when the call named none (B07/B08).
+
+    ``package=`` (*target*) names the app too, so it is never reported as a default.
+    """
+    named = call.value or target or goal_app_label(call.goal)
+    note = newest_note(call.serial) if label and not named else ""
+    if note:
+        await _common.emit(call.progress, note)
+
+
 async def app_tester_stage(call: _AppCall, target: str) -> tuple:
     """Launch the installed App Tester, find the app named by the hint in its
     list, install it (Download + system installer) and continue the run with
@@ -155,6 +169,7 @@ async def app_tester_stage(call: _AppCall, target: str) -> tuple:
     if not tester:
         return await _open_tester_store(call.serial), target
     label = _hint_label(call, target)
+    await _echo_default(call, target, label)
     known = await known_package(call.serial, label)
     if not label and not known:  # nothing names the app: ask before any launch
         return _failed(label_refusal(call.serial)), ""

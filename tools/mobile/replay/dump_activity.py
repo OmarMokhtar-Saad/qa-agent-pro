@@ -27,6 +27,12 @@ _LAST: dict[str, tuple] = {}
 _MEMO: dict[str, tuple] = {}
 
 
+def reset() -> None:
+    """Forget every held source, dump and activity memo."""
+    for table in (_SOURCE, _LAST, _MEMO):
+        table.clear()
+
+
 def _bounded(table: dict) -> None:
     while len(table) > dump_reuse.MAX_HELD_SERIALS:
         del table[next(iter(table))]

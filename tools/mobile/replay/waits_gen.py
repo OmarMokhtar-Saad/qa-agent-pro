@@ -93,7 +93,7 @@ async def await_move(
 
     ``last_look`` is ``None`` when no dump ran. A dump error ends the loop.
     """
-    last, gate = None, Gate(token_of(ctx.serial), started=True, probe_only=True)
+    last, gate = None, Gate(token_of(ctx.serial), started=True)
     while _now() < until:
         await hold(ctx, gate, until)  # the tap's own read is not read twice
         last = await read_look(ctx, until)

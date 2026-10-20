@@ -51,6 +51,7 @@ class _DetailMixin:
     async def _detail(self: _Flow, run: _Run, texts) -> Optional[InstallOutcome]:
         if not run.tapped:
             _note_latest(run, texts)
+            memory.remember_app_id(run.request.package, " ".join(texts))
             current = card_proves_current(run, parse_releases(texts), texts)
             if current is not None:
                 return current

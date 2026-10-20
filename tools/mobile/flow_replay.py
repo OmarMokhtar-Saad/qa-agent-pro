@@ -21,9 +21,9 @@ from tools.mobile import (
     flow_replay_state,
     flow_replay_stop,
     flow_replay_switch,
+    flow_replay_visited,
     flow_stats,
     held_inputs,
-    host_flow_goal,
     media,
     session_explore_ids,
     step_timing,
@@ -57,7 +57,7 @@ def _inputs(run_id: str, ctx: Any) -> dict:
     return merged
 
 
-def _resume(body: dict, key: str, package: str) -> tuple:
+def _resume(body: dict, key: Any, package: str) -> tuple:
     """``(name, template, pos)`` of the replay to continue, else a fresh pick."""
     back = flow_replay_switch.resume(body, key, package)
     if back[1]:
@@ -98,15 +98,23 @@ def _count(package: str, name: str, walk: flow_replay_run.Walk) -> None:
         flow_stats.record(package, name, not walk.why)
 
 
-def _next(auto: Auto, ctx: Any) -> tuple:
-    """``(name, template, pos)`` to run now; no template when the chain is over."""
+def _found(auto: Auto, ctx: Any, run_id: str) -> tuple:
+    """``(package, (name, template, pos))``: the flow to run and the package it lives in."""
     key = flow_replay_match.live_keys(auto.screen, ctx)
     package = str(getattr(ctx, "package", "") or "")
-    if auto.first_only:
-        skip = host_flow_goal.skip(package, auto.body)
-        got = flow_replay_match.pick_first(package, key, skip)
-    else:
-        got = _resume(auto.body, key, package)
+    if not auto.first_only:
+        return package, _resume(auto.body, key, package)
+    found = flow_replay_visited.pick_first((run_id, ctx, auto.screen), key, auto.body)
+    return found[0] or package, found[1:]
+
+
+def _next(auto: Auto, ctx: Any, run_id: str = "") -> tuple:
+    """``(name, template, pos, package)`` to run now; no template when the chain is over.
+
+    The host lane (B13) also looks in the packages this run visited; *package* is
+    where the flow was found.
+    """
+    package, got = _found(auto, ctx, run_id)
     name, template, pos = got
     if (
         template
@@ -114,8 +122,8 @@ def _next(auto: Auto, ctx: Any) -> tuple:
         and flow_replay_stop.inert_tail(template, pos, auto.screen)
     ):
         flow_replay_stop.chain_done(auto.body, name, pos)
-        return name, {}, pos
-    return got
+        return name, {}, pos, package
+    return (*got, package)
 
 
 def _case(auto: Auto) -> str:
@@ -125,23 +133,27 @@ def _case(auto: Auto) -> str:
     )
 
 
+async def _walk(ctx: Any, auto: Auto, at: tuple) -> flow_replay_run.Walk:
+    """The walk of flow template ``at[1]`` from step ``at[2]`` on the live screen."""
+    serial = str(getattr(ctx, "serial", "") or "")
+    ref = media.ClipRef(at[0], _case(auto), serial)
+    plan = flow_replay_run.Plan(at[1], _inputs(at[0], ctx), ref)
+    start = flow_replay_run.Walk(auto.screen, at[2], [])
+    return await step_timing.timed("replay", flow_replay_run.run(ctx, plan, start))
+
+
 async def _one(run_id: str, ctx: Any, auto: Auto) -> tuple:
     """``(Auto, stop)``: one flow replayed from the live screen; stop ends the chain."""
-    name, template, pos = _next(auto, ctx)
+    name, template, pos, package = _next(auto, ctx, run_id)
     if not template:
         return auto, True
-    case = _case(auto)
-    ref = media.ClipRef(run_id, case, str(getattr(ctx, "serial", "") or ""))
-    plan = flow_replay_run.Plan(template, _inputs(run_id, ctx), ref)
-    walk = await step_timing.timed(
-        "replay",
-        flow_replay_run.run(ctx, plan, flow_replay_run.Walk(auto.screen, pos, [])),
-    )
+    walk = await _walk(ctx, auto, (run_id, template, pos))
     live = flow_replay_match.live_key(auto.screen, ctx)
     said = tuple(flow_replay_record.said(walk.trace))
     head = flow_replay_note.Head(name, template, pos, live, said)
     _record(auto.body, head, walk)
-    _count(str(getattr(ctx, "package", "") or ""), name, walk)
+    auto.body["auto_replay"]["package"] = package
+    _count(package, name, walk)
     detour = flow_replay_switch.detour(auto.body, (name, walk.pos), walk.why)
     return auto._replace(screen=walk.screen, ran=True), bool(walk.why) and not detour
 

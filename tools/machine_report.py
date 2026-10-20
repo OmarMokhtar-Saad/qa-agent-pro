@@ -56,6 +56,7 @@ from tools.machine_report_sdk import (  # noqa: F401
     ime_row,
     sdk_items,
 )
+from tools.machine_report_trust import update_trust_row
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
 PRODUCERS = {
     "backend_version": ("tools.updater", "_local_version"),
     "host_privileges": ("tools.host_privileges", "probe"),
+    "update_trust": ("tools.settings_port", "get"),
     "mobile_sdk": ("tools.mobile.sdk_locator", "locate_sdk"),
     # Same producer as `mobile_sdk`, different QUESTION: the SDK root is what
     # the emulator lives in, the adb binary is what a mirror and the mobile
@@ -94,7 +96,7 @@ _SECTIONS = ("doctor", "clients", "provisioning", "backend")
 
 def doctor_rows() -> list:
     """The machine-readiness rows, from the doctor's own producers."""
-    rows: list[Any] = [version_row(), privileges_row()]
+    rows: list[Any] = [version_row(), privileges_row(), update_trust_row()]
     rows.extend(sdk_items())
     rows.append(ime_row())
     rows.extend(image_items())

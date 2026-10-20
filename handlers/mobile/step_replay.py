@@ -14,6 +14,7 @@ from handlers.mobile.step_hooks import mobile_step
 from handlers.mobile.step_packet import (
     PacketAsk,
     _mobile_packet_text,
+    no_assert_note,
     still_changing_note,
 )
 from handlers.mobile.step_state import _mobile_route_kwargs
@@ -68,7 +69,7 @@ async def _step_tail(turn: StepTurn, body: dict) -> str:
         tail = await mobile_step.mobile_next(
             run_id, token, mobile_step.NextOpts(progress=progress, budget=budget)
         )
-    return tail + still_changing_note(body)
+    return tail + still_changing_note(body) + no_assert_note(body)
 
 
 async def _step_reply(turn: StepTurn, body: dict, previous_screen_id: str) -> str:

@@ -13,17 +13,23 @@ as current.
 
 from __future__ import annotations
 
-from tools.mobile import dump_reuse
+from tools.mobile import a11y_events, dump_reuse
 
-#: serial -> (generation the read began under, the dump envelope).
-_KEPT: dict[str, tuple[int, dict]] = {}
+#: serial -> (actuation token it began under, a11y event generation then, the envelope).
+_KEPT: dict[str, tuple[int, int | None, dict]] = {}
+
+
+def _generation(serial: str) -> int | None:
+    """The every-event generation of *serial*'s latest a11y dump, or ``None``."""
+    clock = a11y_events.latest(serial)
+    return None if clock is None else clock.generation
 
 
 def keep(serial: str, under: int, read: dict) -> None:
     """Keep *read* (a clean uiautomator envelope) begun under generation *under*."""
     if read.get("error") or not read.get("content"):
         return
-    _KEPT[str(serial)] = (under, read)
+    _KEPT[str(serial)] = (under, _generation(str(serial)), read)
 
 
 def take(serial: str) -> dict | None:
@@ -31,8 +37,13 @@ def take(serial: str) -> dict | None:
     kept = _KEPT.pop(str(serial), None)
     if kept is None:
         return None
-    under, read = kept
-    return read if under == dump_reuse.token(str(serial)) else None
+    under, event_gen, read = kept
+    if under == dump_reuse.token(str(serial)):
+        return read
+    # B09: the screen's event generation also proves it, so an actuation that
+    # raised no event (a missed tap) does not void a confirm already paid for.
+    now = _generation(str(serial))
+    return read if event_gen is not None and now == event_gen else None
 
 
 def reset() -> None:

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 
+from tools.mobile import a11y_next
 from tools.mobile.install_source import DeviceUi
 from tools.mobile.install_sources.app_tester_ui_consts import (
     APP_TESTER_PACKAGE,
@@ -33,6 +33,11 @@ async def read_rows(ui: DeviceUi, xml: str | None = None) -> list:
     return rows
 
 
+async def _news(ui: DeviceUi, until: float) -> None:
+    """Wait for the screen's next a11y generation (a short pause without a11y), at most to *until*."""
+    await a11y_next.pause_for_news(ui.serial, until)
+
+
 async def _reread(ui: DeviceUi, xml: str) -> tuple:
     """``(rows, xml)`` after the re-reads of an empty screen."""
     rows = parse_rows(xml)
@@ -40,7 +45,7 @@ async def _reread(ui: DeviceUi, xml: str) -> tuple:
     misses = 0
     while not rows and misses < MAX_EMPTY_REREADS:
         if is_loading(xml) and time.monotonic() < deadline:
-            await asyncio.sleep(APP_TESTER_POLL_S)
+            await _news(ui, time.monotonic() + APP_TESTER_POLL_S)
         else:
             misses += 1
             await _foreground_settled(ui)
@@ -70,7 +75,7 @@ async def _foreground_settled(ui: DeviceUi) -> None:
     while await ui.foreground() != APP_TESTER_PACKAGE:
         if time.monotonic() >= deadline:
             return
-        await asyncio.sleep(APP_TESTER_POLL_S)
+        await _news(ui, min(deadline, time.monotonic() + APP_TESTER_POLL_S))
 
 
 async def settled_rows(ui: DeviceUi) -> list:

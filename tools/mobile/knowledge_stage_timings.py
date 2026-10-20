@@ -24,13 +24,14 @@ from tools.mobile import (
     ktim_samples,
     run_store,
 )
+from tools.mobile.action_consts import WAIT_UNTIL_OPS
 from tools.mobile.knowledge_learn import StageResult
 from tools.mobile.kstg_timing_write import Plan, insert_row, update_row
 
 logger = logging.getLogger(__name__)
 
 #: Ops whose duration is not the app's response time.
-_SKIP_OPS = ktim_samples.UNREADY_OPS
+_SKIP_OPS = ktim_samples.UNREADY_OPS - frozenset(WAIT_UNTIL_OPS)  # waits teach ceilings
 _P90 = 0.9
 _OPEN = "screen_key = ? AND action = ? AND target = ? AND invalid_at IS NULL"
 

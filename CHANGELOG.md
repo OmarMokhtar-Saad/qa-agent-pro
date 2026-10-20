@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.145.2] - 2026-10-20
+## [1.146.0] - 2026-10-20
 
 ### Added
 
@@ -68,9 +68,85 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - A step clip recorded again under the same name is joined into the
   run video again, instead of the old video being reused.
 - A failed kill of a stuck device recorder is now logged.
+- A wait that finds the screen gone is refused only when three reads of
+  the same screen, at least 5 s apart, were unchanged; the message says
+  how long it was unchanged.
+- A setup retry that changes the locale, reset, launch, permissions or
+  capture flag drops the earlier setup and starts fresh, and says so;
+  a retry that only changes the goal still adopts it.
+- Step timing no longer reuses a step id across steps.
+- Speed: waits that polled on a fixed sleep now wake on the screen
+  event clock, so a step ends when the screen changes, not on a timer.
+- Speed: a tap into another app is no longer reported as a stale
+  accessibility read, and the accessibility clock refreshes its
+  generation and caps its skips.
+- Speed: the app launch wait wakes on the first screen event, the
+  window-focus probe is cached per step (never without an event
+  clock), and the picture taken when a run stops is saved in the
+  background. Any later device call and the report wait for it.
+- Each step logs when the server received the call and when it
+  replied, and how much server time fell outside the step timer.
+- The App Tester install waits out any installer screen that keeps
+  changing (for example staging) and stops only when it stays
+  unchanged; the stop message names the app being installed.
+- After an install the server taps App Tester's Open when the run
+  wants the app open, and tells the host what it saw (row found,
+  version), so the host does not scroll the App Tester list again.
+- The server reads the Firebase app id from an installed app's APK
+  and from its App Tester page, so the next install opens the page
+  by link with no list scan.
+- App identity: a run that starts from the installer, launcher or App
+  Tester is re-pinned to the real app under test, and the run is filed
+  (manifest, title, version, log slice) under the app last in the
+  foreground, not the installer. The setup template names the real
+  package.
+- Remembered apps are one row per app (package id, label alias). With
+  several, the newest within its time limit is used and the reply says
+  so; with none or an ambiguous label you get a pick-list.
+- `qa_mobile_test` schema help now explains `launch`, `app` and
+  `grant_permissions`; `app` defaults to the newest remembered app and
+  the reply echoes it.
+- Saved flows are keyed on the resolved target, and the lookup also
+  scans packages visited earlier in the run, so an install and consent
+  flow replays.
+- Replay no longer stops at every secret or anchor wait: it chains
+  across anchors while the screen key matches the recorded one, and
+  stops only at an OTP or a divergence, listing options for the host.
+  A paused replay resumes at its step in the host lane.
+- The first packet lists the input names (secrets included) that a
+  fitting flow still needs. Secrets stay in memory for the run only.
+- Condition waits use a learned ceiling, max(2 s, 3 x p95) per app,
+  screen and action, from at least 5 samples. It only tightens the
+  declared max_s, never raises it. A wait over 2 x p95 is flagged as
+  slower than usual with options for the host.
+- Flows match on the app and the first screen key, so a reworded goal
+  is no longer a new flow and the goal gate is gone. With several
+  fitting flows the best-ranked one replays and the others are listed
+  in the first packet. The flow's goal is shown beside its name in the
+  replay note and in that other-flows list.
+- A wait that times out at a learned limit says "learned limit X s,
+  declared Y s".
+- Release tooling: the wiring-mutants run stops only its own slot
+  workers, the test gate streams per-test progress and records its run,
+  and the gate and notes checks work in a scratch worktree without a
+  sibling dist clone.
+- A release check on a source branch first syncs with origin/main, so it
+  no longer fails on a stale local main; the mypy baseline records the
+  environment it was made in, and the release check refuses lost or
+  reconstructed review files.
 
 ### Known
 
+- Reading the app id from an App Tester detail page is unproven (no
+  real page dump had an id); only the APK read is proven. The Open
+  wait after an install re-reads the screen every 0.25 s (up to 6 s),
+  not on a screen event.
+- When an App Tester install cannot finish, the option to drive the
+  app as a host run shows a placeholder package; the host fills in
+  the app under test. The app id read from an APK is the first
+  id-shaped value; a wrong one only falls back to the list scan.
+- A learned wait limit only ever shortens a step's declared limit;
+  it never waits longer than the flow declares.
 - If the server process is killed, the QA keyboard stays selected
   until the next run's clean-up gives the tester's keyboard back.
 - A count in the learned-mistakes table is how often the mistake was
@@ -104,5 +180,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
   are English only. Matching a case title to a flow goal compares word
   stems, so a short goal matches a longer title (login also matches
   login with a wrong password), and a title in another language than
-  the flow's goal does not match. A flow learned while exploring has
-  a long goal and rarely replays on its own.
+  the flow's goal does not match.
+- After a tap the screen is still read afresh twice in some cases
+  (re-read, then auto-settle); this costs about 0.2 s and is kept so
+  a stale screen is never reused.
+- The final run packet now carries a secret scan of the report, logs and
+  evidence text (clean or file:line; PNG/video and the run's own
+  manifest/case records are skipped, and secrets under 6 characters are
+  counted as not checked) and a claim-vs-evidence table; script fields
+  sent as tool arguments are moved into the script; the doctor shows an
+  Update trust row (releases stay unsigned by design).
+- The case json keeps how a turn ended (ended_as) next to its status; a
+  reply says when no assert was replayed. The first reply is smaller:
+  the mobile brief is an argument list (18.2k to 13.1k chars, 28%) and
+  the vocabulary notes shrink 7.7k to 4.9k (36%).

@@ -12,7 +12,7 @@ from tools.mobile.replay.context import (
 from tools.mobile.replay.guard import NOTHING_MOVED_NOTE, inert_ops
 from tools.mobile.replay.screen import _has_verification, _verification_summary
 from tools.mobile.replay.steps_stop import _reply
-from tools.mobile.replay.stop_shot import stop_shot
+from tools.mobile.replay.stop_shot import defer_shot
 
 _REASON_VERIFIED_TAIL = (
     ". The script ended without a done() action, so this verdict "
@@ -108,6 +108,6 @@ async def _end_of_script(run: _ReplayRun, screen: dict | None) -> dict:
     if inert:
         reason = (NOTHING_MOVED_NOTE % ", ".join(inert)) + reason
     verdict = "" if ended_verified else STATUS_UNVERIFIED
-    await stop_shot(run, screen)
+    defer_shot(run, screen)
     stop = ReplayStop(STATUS_DONE, trace, screen, verdict, reason, len(run.items) - 1)
     return _reply(_result(stop))

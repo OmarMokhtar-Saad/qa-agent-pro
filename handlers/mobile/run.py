@@ -170,7 +170,7 @@ async def _mobile_new_run(req: _MobileTestRequest) -> str:
     adopted = await run_background.adopt(req)
     if adopted is not None:
         return adopted
-    picked, owner, early = await _new_run_open(req)
+    picked, owner, early = await run_background.opened(req, _new_run_open(req))
     if early:
         return early
     return await run_background.launch(req, _mobile_setup(req, picked, owner))

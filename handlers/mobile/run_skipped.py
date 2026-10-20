@@ -7,6 +7,7 @@ from tools.untrusted import single_line
 
 _SKIPPED: dict[str, tuple[str, str]] = {}
 _TESTER: dict[str, tuple[str, bool]] = {}
+_EVIDENCE: dict[str, str] = {}
 _LAUNCH: dict[str, str] = {}
 _HOME: dict[str, str] = {}
 
@@ -31,6 +32,12 @@ def mark_tester_install(serial: str, package: str, fresh: bool) -> None:
     _TESTER[serial] = (package, fresh)
 
 
+def mark_tester_evidence(serial: str, evidence: str) -> None:
+    """Record what the server saw of the App Tester install (row, Open, version)."""
+    if evidence:
+        _EVIDENCE[serial] = evidence
+
+
 def tester_ran(serial: str) -> bool:
     """Whether the App Tester install stage ran for *serial* in this start."""
     return serial in _TESTER
@@ -43,14 +50,21 @@ def mark_launch(serial: str, state: str) -> None:
 
 def forget_run(serial: str) -> None:
     """Drop the per-start marks of *serial* before a new app stage."""
-    for marks in (_SKIPPED, _TESTER, _LAUNCH, _HOME):
+    for marks in (_SKIPPED, _TESTER, _EVIDENCE, _LAUNCH, _HOME):
         marks.pop(serial, None)
 
 
 def reset() -> None:
     """Forget every mark (tests)."""
-    for marks in (_SKIPPED, _TESTER, _LAUNCH, _HOME):
+    for marks in (_SKIPPED, _TESTER, _EVIDENCE, _LAUNCH, _HOME):
         marks.clear()
+
+
+def _evidence_text(serial: str) -> str:
+    """The server's own facts of the install: they answer a "found in the App
+    Tester list" check, so the host does not scroll the list again."""
+    seen = _EVIDENCE.pop(serial, "")
+    return "; server saw: " + single_line(seen, 300) if seen else ""
 
 
 async def _tester_note(serial: str, launched: bool) -> str:
@@ -69,6 +83,7 @@ async def _tester_note(serial: str, launched: bool) -> str:
         + how
         + ")"
         + (" and the app was launched" if launched else "")
+        + _evidence_text(serial)
         + ". Do NOT repeat the App Tester or install steps of the goal by hand; "
         "continue from the app's first screen.\n\n"
     )

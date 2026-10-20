@@ -105,6 +105,20 @@ def _longest_first(found: set) -> tuple:
     return tuple(sorted(kept, key=lambda value: (-len(value), value)))
 
 
+def _run_values(records: tuple) -> set:
+    """Every credential value the run's own records name or type, any length."""
+    found: set = set()
+    stack = list(records)
+    while stack:
+        _scan_record(stack.pop(), found, stack)
+    return found
+
+
+def short_secret_count(*records: object) -> int:
+    """How many credential values `_run_secrets` leaves out as too short."""
+    return sum(1 for value in _run_values(records) if len(value) < _SECRET_MIN)
+
+
 def _run_secrets(*records: object) -> tuple:
     """Every credential value the run's own records name or type, longest first.
 
@@ -113,11 +127,7 @@ def _run_secrets(*records: object) -> tuple:
     text of a ``type`` action the run marked secret or aimed at a credential field.
     Only values of `_SECRET_MIN` characters or more are kept.
     """
-    found: set = set()
-    stack = list(records)
-    while stack:
-        _scan_record(stack.pop(), found, stack)
-    return _longest_first(found)
+    return _longest_first(_run_values(records))
 
 
 def esc(value: object, limit: int = MAX_TEXT) -> str:

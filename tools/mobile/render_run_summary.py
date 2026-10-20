@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any, NamedTuple
 
 from tools.mobile.render_report import _ReportRef, report_line
-from tools.mobile.render_status_word import status_word
+from tools.mobile.render_status_word import status_label
 from tools.mobile.render_tally import _retry_note, _typed_field_tally
 from tools.mobile.render_verdict import verdict_line
 
@@ -32,7 +32,7 @@ def _summary_head(abandoned: bool, partial: bool, run_id: str) -> str:
 def _tally_text(rows: list[dict]) -> str:
     tally: dict[str, int] = {}
     for row in rows:
-        key = status_word(row) or "unknown"
+        key = status_label(row) or "unknown"
         tally[key] = tally.get(key, 0) + 1
     return ", ".join(str(count) + " " + name for name, count in sorted(tally.items()))
 

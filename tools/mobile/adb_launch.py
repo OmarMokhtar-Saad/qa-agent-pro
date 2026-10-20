@@ -3,10 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 
 from tools.device_ids import valid_package_name
 from tools.mobile.adb_consts_dev import LAUNCH_START_TIMEOUT_S
 from tools.mobile.adb_host import host
+
+
+def _generation(serial: str) -> int | None:
+    a11y_next = importlib.import_module("tools.mobile.a11y_next")  # cycle via adb
+    return a11y_next.generation_of(serial)
+
+
+async def _screen_news(serial: str, held: int | None, deadline: float) -> bool:
+    """True when the a11y service heard a window event since *held* (B11).
+
+    *held* is read BEFORE the focus read, so an event landing during that read
+    is news here. The wait is capped at the poll interval: focus is re-read
+    at least that often.
+    """
+    a11y_next = importlib.import_module("tools.mobile.a11y_next")
+    cap = host().time.monotonic() + host().LAUNCH_FOREGROUND_POLL_S
+    return held is not None and await a11y_next.next_generation(
+        serial, held, min(deadline, cap)
+    )
 
 
 # What ``-W`` was used for, without its failure mode: ``-W`` waits for the
@@ -23,10 +43,13 @@ async def wait_foreground(serial: str, package: str) -> None:
         remaining = deadline - host().time.monotonic()
         if remaining <= 0:
             return
+        held = _generation(serial)
         focus = await host().current_activity(serial, timeout=int(remaining) + 1)
         if str(focus.get("content") or "").split("/", 1)[0] == package:
             return
         left = max(0.0, deadline - host().time.monotonic())
+        if await _screen_news(serial, held, deadline):
+            continue
         await asyncio.sleep(min(gap, left))
         gap = min(gap * 2, host().LAUNCH_FOREGROUND_POLL_S)
 

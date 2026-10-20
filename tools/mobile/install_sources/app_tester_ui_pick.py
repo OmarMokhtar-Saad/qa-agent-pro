@@ -9,6 +9,7 @@ from typing import Any, NamedTuple, Optional, Union
 
 from tools.mobile.install_source import InstallOutcome, InstallRequest
 from tools.mobile.install_sources import app_tester_ui_memory as memory
+from tools.mobile.install_sources.app_tester_ui_apk_id import learn_app_id
 from tools.mobile.install_sources.app_tester_ui_consts import (
     APP_TESTER_PACKAGE,
     _Flow,
@@ -63,8 +64,9 @@ class _PickMixin:
             return _LAUNCH_FAILED
         run = _Run(ui, InstallRequest(want.serial, want.package, want.label), ask, None)
         memory.remember_app_id(want.package, want.firebase_id)
+        await learn_app_id(want.serial, want.package)
         if await open_by_link(run, want.tester, self._sleep):
-            run.card_tapped = True
+            run.card_tapped = run.via_link = True
             return _stage(self, run, want.package)
         return await self._scan_and_stage(run, shot.xml, want.firebase_id)
 

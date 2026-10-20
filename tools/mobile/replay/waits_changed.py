@@ -14,7 +14,7 @@ from tools.mobile.replay.waits_dialog import answer_new_dialog
 from tools.mobile.replay.waits_gen import await_move
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_poll import _wait_deadline
-from tools.mobile.replay.waits_prior import _spinning, already_changed
+from tools.mobile.replay.waits_prior import already_changed, is_spinning
 from tools.mobile.replay.waits_spec import _secs
 from tools.mobile.replay.waits_types import AfterWait
 
@@ -72,7 +72,7 @@ async def _changed_by_events(ctx: Context, start: tuple, deadline: float) -> tup
         if not moved:
             break
         if _screen_hash(screen) != before:
-            return screen, True, not _spinning(screen)
+            return screen, True, not is_spinning(screen)
         if system_dialog_package(screen):  # unchanged AND covered: stop waiting
             return screen, False, False
         base = look.clock or _screen_hash(screen)

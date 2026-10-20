@@ -46,7 +46,7 @@ QUIET_POLLS = 4
 
 ACTION_LABELS = ("Update", "Download", "Install")
 OPEN_LABEL = "Open"
-_PROGRESS_STARTS = ("downloading", "installing", "pending", "preparing")
+_PROGRESS_STARTS = ("downloading", "installing", "pending", "preparing", "staging")
 _VERSION_RE = re.compile(r"\b(\d+(?:\.\d+)*)\s*\((\d+)\)")
 #: The App Tester text of its one-time setup for AAB releases (a tester step).
 AAB_SETUP_LABEL = "Get started"
@@ -65,6 +65,8 @@ class _Run:
     ask: Optional[AskCb]
     before: Optional[AppVersion]
     card_tapped: bool = False
+    #: the app page was opened by deep link, not from a list row.
+    via_link: bool = False
     release_done: bool = False
     tapped: int = 0
     #: times the server ticked App Tester's consent page (bounded).
@@ -80,6 +82,9 @@ class _Run:
     #: install watch: the foreground package last seen, cheap polls since a dump.
     last_front: str = ""
     quiet: int = 0
+    #: installer screen held: its texts and the unchanged reads in a row.
+    held: tuple = ()
+    held_polls: int = 0
     #: one (direction, rows seen, new rows, offset) entry per scroll made.
     scrolls: list = field(default_factory=list)
 

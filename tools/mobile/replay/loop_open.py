@@ -8,7 +8,7 @@ from typing import Any, NamedTuple
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import knowledge_feedback
-from tools.mobile.replay import steps_snapshot
+from tools.mobile.replay import steps_snapshot, stop_shot
 from tools.mobile.replay.context import (
     STATUS_ERROR,
     Context,
@@ -62,6 +62,7 @@ async def _replay_open(
     """``_replay_first_screen``, then the script's feedback is recorded before any
     step can stop the run, so it is kept even when no step is dispatched."""
     items = list(getattr(script, "actions", None) or [])
+    await stop_shot.drain(ctx.serial)  # B11: no picture overlaps this call
     screen, reply = await _replay_first_screen(ctx, items, start)
     _record_script_feedback(ctx, script, screen)
     return screen, reply

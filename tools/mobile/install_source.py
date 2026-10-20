@@ -42,6 +42,8 @@ class InstallRequest:
     #: True: the source's own Update/Download button decides the release (the
     #: newest); no release is chosen or asked about.
     latest: bool = False
+    #: True: tap App Tester's Open once the install landed (the run wants the app open).
+    launch: bool = False
 
 
 #: ``InstallOutcome.code`` of an ok outcome where nothing was installed.
@@ -59,6 +61,8 @@ class InstallOutcome:
     message: str = ""
     version_code: Optional[int] = None
     needs_confirmation: str = ""
+    #: facts the server saw (row found, Open shown, version): shown to the host.
+    evidence: str = ""
 
 
 class DeviceUi(Protocol):

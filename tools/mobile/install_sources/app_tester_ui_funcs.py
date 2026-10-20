@@ -168,7 +168,14 @@ def _no_action(texts) -> InstallOutcome:
     )
 
 
-def _foreign_stop(front: str, texts) -> InstallOutcome:
+def _stopped(installing: str) -> str:
+    """The start of the stop message, naming the app being installed."""
+    if installing:
+        return "While installing " + repr(installing[:80]) + ": stopped"
+    return "Stopped"
+
+
+def _foreign_stop(front: str, texts, installing: str = "") -> InstallOutcome:
     joined = " ".join(sorted(texts))
     code = code_from_dialog_text(joined)
     if code:
@@ -177,9 +184,10 @@ def _foreign_stop(front: str, texts) -> InstallOutcome:
     return InstallOutcome(
         False,
         "unrecognised_screen",
-        "Stopped on a screen of "
+        _stopped(installing)
+        + " on a screen of "
         + (front or "an app that could not be read")
-        + " that no dialog handler knows. "
+        + " that no dialog handler knows and that stayed unchanged. "
         + _quoted(texts)
         + " Nothing was tapped.",
     )

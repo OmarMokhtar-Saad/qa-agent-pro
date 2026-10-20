@@ -51,7 +51,6 @@ def _no_log_dir_reason(profile: profiles.Profile, package: str) -> str:
             + "; a "
             + profiles.GENERIC_PROFILE_NAME
             + " captured the app's own logcat by pid instead, and there "
-            "is no on-device event log to pull; write a per-app profile "
-            "into ~/.qa-agents/mobile/profiles/ to turn one on"
+            "is no on-device event log to pull"
         )
     return "the profile names no on-device log directory"

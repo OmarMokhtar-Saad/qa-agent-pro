@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from tools.mobile import wait_guard
 from tools.mobile.replay.context import Context
-from tools.mobile.replay.screen_seen import recent
-from tools.mobile.replay.waits_prior import _spinning
+from tools.mobile.replay.screen_seen import reads
+from tools.mobile.replay.waits_prior import is_spinning
 from tools.mobile.replay.waits_types import CondStep, WaitSpec
 
 OUTCOME = "wait_refused"
@@ -25,9 +25,9 @@ def _op_target(action: object, spec: WaitSpec) -> tuple:
 def refusal(ctx: Context, step: CondStep, screen: object) -> str:
     """Why this wait can never end ("" when it may); a loading screen is never refused."""
     op, target = _op_target(step[0], step[1])
-    if not op or (op == "wait_until_gone" and _spinning(screen)):
+    if not op or (op == "wait_until_gone" and is_spinning(screen)):
         return ""
-    return wait_guard.impossible_wait(op, target, recent(ctx.serial))
+    return wait_guard.impossible_wait(op, target, reads(ctx.serial))
 
 
 def stamp_refused(entry: dict, reason: str) -> None:

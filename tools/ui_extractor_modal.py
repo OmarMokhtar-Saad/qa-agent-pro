@@ -14,12 +14,10 @@ logger = logging.getLogger("tools.ui_extractor")
 def _modal_ids(soup: BeautifulSoup) -> set[str]:
     """Ids of every ``.modal`` and ``role=dialog`` element."""
     modal_ids: set[str] = set()
-    for m in soup.select(".modal"):
-        if m.get("id"):
-            modal_ids.add(m.get("id"))
-    for m in soup.find_all(attrs={"role": "dialog"}):
-        if m.get("id"):
-            modal_ids.add(m.get("id"))
+    for m in (*soup.select(".modal"), *soup.select('[role="dialog"]')):
+        mid = m.get("id")
+        if isinstance(mid, str) and mid:
+            modal_ids.add(mid)
     return modal_ids
 
 
@@ -27,8 +25,8 @@ def _trigger_labels(soup: BeautifulSoup, modal_ids: set[str]) -> dict[str, str]:
     """``{modal_id: visible label}`` of the first control that targets it."""
     triggers: dict[str, str] = {}
     for attr in ("data-bs-target", "data-target", "href"):
-        for el in soup.find_all(attrs={attr: True}):
-            val = (el.get(attr) or "").strip()
+        for el in soup.select(f"[{attr}]"):
+            val = str(el.get(attr) or "").strip()
             if val.startswith("#") and val[1:] in modal_ids:
                 text = el.get_text(strip=True)
                 if text and val[1:] not in triggers:

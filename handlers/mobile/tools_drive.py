@@ -1,12 +1,20 @@
 """MCP registration adapters: qa_mobile_test."""
 
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from handlers.mobile import content as mobile_content
 
 # Tool-body locals never forwarded to the handler. `rt` is a closure variable of
 # the tool bodies, so locals() holds it.
 _TEST_UNSENT = ("ctx", "device_id", "rt", "tester_inputs")
+
+_APP_HELP = "App label or package id. Omitted: the most recently used app, and the reply says so."
+_GRANT_HELP = (
+    "Grant runtime permissions at install; false only to test permission prompts."
+)
+_LAUNCH_HELP = "Open the app before step 1; false starts no app."
 
 _INPUTS_NOTE = (
     "Note: tester_inputs is not used on this call (nothing is typed or stored "
@@ -35,7 +43,7 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
         suite_id: str = "",
         goal: str = "",
         cases: str = "",
-        app: str = "",
+        app: Annotated[str, Field(description=_APP_HELP)] = "",
         package: str = "",
         run_id: str = "",
         session_token: str = "",
@@ -50,8 +58,8 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
         capture: str = "",
         capture_ack: bool = False,
         reset_app: bool = False,
-        grant_permissions: bool = True,
-        launch: bool = True,
+        grant_permissions: Annotated[bool, Field(description=_GRANT_HELP)] = True,
+        launch: Annotated[bool, Field(description=_LAUNCH_HELP)] = True,
         deny_permissions: list[str] | None = None,
         charter: str = "",
         note: str = "",

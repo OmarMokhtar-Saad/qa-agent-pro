@@ -8,6 +8,8 @@ from typing import Any
 
 from handlers.mobile.step_support import _mobile_learn_after
 from tools.mobile import (
+    finish_evidence,
+    finish_secret_scan,
     media,
     session_finish,
     session_records,
@@ -17,6 +19,7 @@ from tools.mobile import (
 from tools.mobile import open_report as mobile_open
 from tools.mobile import render as mobile_render
 from tools.mobile import report as mobile_report
+from tools.mobile.replay import stop_shot
 
 logger = logging.getLogger("tools.mcp_handlers")
 
@@ -62,6 +65,7 @@ RUN_OVER_NOTE = (
 async def _finish_run(run_id: str, session_token: str, body: dict) -> tuple:
     """``(resolved, rows, coverage)`` once the device is given back."""
 
+    await stop_shot.drain_all()  # B11: the report reads these PNGs
     # deferred clips need the device: store them first
     await step_timing.timed("media_flush", media.flush(run_id))
     finishing = session_finish.finish_device(run_id, lease=str(session_token or ""))
@@ -115,6 +119,17 @@ def _summary_kwargs(run_id: str, coverage: str) -> dict[str, Any]:
     }
 
 
+def _finish_extras_sync(run_id: str, rows: list) -> str:
+    return finish_secret_scan.scan_line(run_id) + finish_evidence.evidence_table(
+        run_id, rows
+    )
+
+
+async def _finish_extras(run_id: str, rows: list) -> str:
+    """The secret-scan line and the claim-vs-evidence table (off the event loop)."""
+    return await asyncio.to_thread(_finish_extras_sync, run_id, rows)
+
+
 async def _mobile_report_text(run_id: str, session_token: str, body: dict) -> str:
     """The reply for a run that is over: relay block, summary and report link."""
 
@@ -127,5 +142,6 @@ async def _mobile_report_text(run_id: str, session_token: str, body: dict) -> st
     return (
         relay
         + mobile_render.summary_block(rows, mobile_render.SummaryOpts(**summary))
+        + await _finish_extras(run_id, rows)
         + RUN_OVER_NOTE
     )

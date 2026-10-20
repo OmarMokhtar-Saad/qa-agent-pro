@@ -86,7 +86,7 @@ def _finalized(body: dict) -> dict | None:
     return {
         **body,
         "status": "done",
-        "closed_from": closed_from,
+        "ended_as": closed_from,
         "updated": time.time(),
     }
 

@@ -15,7 +15,7 @@ from tools.mobile.replay.context import (
 from tools.mobile.replay.guard import _asserts_new_element
 from tools.mobile.replay.screen import _verified
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
-from tools.mobile.replay.stop_shot import stop_shot
+from tools.mobile.replay.stop_shot import defer_shot
 
 _UNVERIFIED_PASS = (
     "verdict=pass was not accepted: nothing in this run "
@@ -50,7 +50,7 @@ async def _done_stop(run: _ReplayRun, action: Any, at: StepAt) -> dict:
     verdict, reason = _downgraded(run, verdict, reason)
     at.entry.update(outcome="done", detail=reason)
     _close(run, at)
-    await stop_shot(run, at.screen)
+    defer_shot(run, at.screen)
     stop = ReplayStop(STATUS_DONE, run.trace, at.screen, verdict, reason, at.position)
     return _reply(_result(stop))
 

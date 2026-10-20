@@ -104,6 +104,7 @@ class _AppCall:
     progress: _common.ProgressCb = None
     choose: _common.ChooseCb = None
     goal: str = ""
+    launch: bool = True
 
     @property
     def value(self) -> str:
@@ -132,4 +133,5 @@ def _app_call(req: _MobileTestRequest, serial: str) -> _AppCall:
         req.progress,
         req.choose,
         req.goal,
+        req.launch,
     )

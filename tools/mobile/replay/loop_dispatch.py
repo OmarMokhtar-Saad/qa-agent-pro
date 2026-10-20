@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from tools.mobile import actions as actions_mod
+from tools.mobile import wait_ceiling_lookup
 from tools.mobile.replay.context import _ReplayRun, _Step
 from tools.mobile.replay.device_ops import _perform
 from tools.mobile.replay.elements import _clamp_source
@@ -35,18 +37,33 @@ async def _wait_step(
     """Run a wait op: ``(screen, reply)``, ``reply`` is ``None`` to go on.
 
     Every wait is a condition with a bound (S17): the legacy `wait` maps onto
-    the same four through `_wait_spec`.
+    the same four through `_wait_spec`. The bound is the learned ceiling (B16).
     """
-    spec = _wait_spec(step.action, run.items)
-    if spec[0] != "changed":
-        clear_action(run.ctx)
-        got, reply = await condition_wait(
-            run, CondStep(step.action, spec, step.entry), screen
-        )
-        if reply is None and step.op in CALM_PROOFS:
-            note_calm(run.ctx, _screen_hash(got))
-        return got, reply
-    return await _changed_wait(run, ChangedStep(step.op, spec[2], step.entry), screen)
+    learned = wait_ceiling_lookup.samples(run.ctx, step.op, screen)
+    declared = _wait_spec(step.action, run.items)
+    spec = wait_ceiling_lookup.bounded(declared, learned)
+    began = time.monotonic()
+    got, reply = await _wait_spec_step(run, step, (spec, screen))
+    wait_ceiling_lookup.mark_slow(step.entry, learned, began)
+    wait_ceiling_lookup.mark_learned(step.entry, declared[2], spec[2])
+    return got, reply
+
+
+async def _wait_spec_step(
+    run: _ReplayRun, step: _Step, bound: tuple
+) -> tuple[Any, dict | None]:
+    """Run the wait for ``bound = (spec, screen)``."""
+    spec, screen = bound
+    if spec[0] == "changed":
+        changed = ChangedStep(step.op, spec[2], step.entry)
+        return await _changed_wait(run, changed, screen)
+    clear_action(run.ctx)
+    got, reply = await condition_wait(
+        run, CondStep(step.action, spec, step.entry), screen
+    )
+    if reply is None and step.op in CALM_PROOFS:
+        note_calm(run.ctx, _screen_hash(got))
+    return got, reply
 
 
 # ONE rectangle for the guard and the device -- see
