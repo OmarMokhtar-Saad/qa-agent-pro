@@ -35,6 +35,11 @@ async def _learn(package: str, run_id: str) -> dict:
         return await asyncio.to_thread(knowledge_learn.learn_run, package, run_id)
 
 
+async def learn_job(package: str, run_id: str) -> None:
+    """Learn one package of one run and wait for it. Never raises."""
+    await _job(package, run_id)
+
+
 async def _job(package: str, run_id: str) -> None:
     try:
         got = await _learn(package, run_id)

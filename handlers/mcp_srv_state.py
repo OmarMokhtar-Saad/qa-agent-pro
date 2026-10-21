@@ -49,6 +49,12 @@ DRIFT_RESTART_EXIT_CODE = 86
 _DRIFT_EXIT_JITTER_S = 3.0
 _INFLIGHT: dict = {"n": 0, "last_finish": 0.0}
 _INFLIGHT_LOCK = threading.Lock()
+# Extra "busy" counters other lanes register (the mobile lane adds its live
+# runs). Handlers outside a lane must not import the lane, so it comes in here.
+BUSY_PROBES: list = []
+# A run paused on the tester is re-armed forever by its idle timer, so the drift
+# restart stops deferring for runs after this long and applies the new version.
+_RUN_DEFER_MAX_S = 1800.0
 
 # P1-5 (Air onboarding fix): a duplicate call landing within this window --
 # a host retry, a double-click in a chat UI -- returns the cached result

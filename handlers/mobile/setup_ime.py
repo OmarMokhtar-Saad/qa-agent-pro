@@ -131,10 +131,10 @@ def _answering_row(where: str) -> str:
     """The line for a keyboard that answered: green, or yellow on protocol 1."""
     if ime_nonce.protocol(where) == ime_nonce.PROTOCOL_LEGACY:
         return (
-            "- \u26a0\ufe0f The QA keyboard on "
+            "- \u2b1c The QA keyboard on "
             + where
-            + " answers but speaks legacy protocol 1: slow dumps, "
-            "update the QA keyboard"
+            + " answers but speaks legacy protocol 1: slower dumps "
+            "(optional: update the QA keyboard)"
         )
     return "- \u2705 The QA keyboard is active on " + where + " and answering"
 
@@ -158,8 +158,9 @@ def pinned_row(pinned: dict) -> str:
         )
     if _legacy_version(detail):
         return (
-            "- \u26a0\ufe0f QA input method "
+            "- \u2b1c QA input method "
             + detail
-            + " is the legacy protocol 1: dumps are slow, update the QA keyboard"
+            + " is the legacy protocol 1: dumps are slower "
+            "(optional: update the QA keyboard)"
         )
     return "- \u2705 QA input method " + detail

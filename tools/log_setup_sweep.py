@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from tools import pid_probe
 from tools.log_setup_base import DEFAULT_PREFIX, _pid_from_name
 from tools.log_setup_env import (
     RETENTION_DAYS,
@@ -55,15 +56,7 @@ def _pid_is_alive(pid: int | None) -> bool:
         return True
     if off_posix():
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # it exists, it is just owned by another user
-    except (OSError, OverflowError, TypeError, ValueError, AttributeError):
-        return True  # no os.kill, a silly pid, anything: keep the file
+    return pid_probe.pid_is_alive(pid)
 
 
 class SweepScan(NamedTuple):

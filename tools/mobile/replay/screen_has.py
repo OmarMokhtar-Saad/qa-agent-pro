@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import re
 
+from tools.mobile.act_select import match_class
 from tools.mobile.replay.context_ctx import Context
+
+#: A wait or presence check needs an exact or whole-word label, never a bare substring.
+WORD_CLASS = 2
 
 
 def screen_readable(screen: object) -> bool:
@@ -30,7 +34,7 @@ def _screen_has(screen: object, needle: str) -> bool:
         if not isinstance(element, dict):
             continue
         for field in ("text", "desc"):
-            if want in " ".join(str(element.get(field) or "").split()).lower():
+            if match_class(element.get(field), want) >= WORD_CLASS:
                 return True
     return False
 

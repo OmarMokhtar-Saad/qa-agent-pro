@@ -96,6 +96,10 @@ except Exception:  # wire logging is optional: never block startup
     class WIRE:  # type: ignore[no-redef]
         @staticmethod
         def seen(direction, line):
+            return False
+
+        @staticmethod
+        def set_lost_handler(handler):
             return None
 
 
@@ -471,6 +475,7 @@ class Supervisor:
         # corrupt every in-flight call sharing this proxy. Reentrant, and
         # always the innermost lock -- nothing else is acquired under it.
         self.stdout_lock = threading.RLock()
+        WIRE.set_lost_handler(self.write_lost)
 
     # ------------------------------------------------- child lifecycle
     def spawn(self, replay: bool) -> None:
@@ -583,12 +588,23 @@ class Supervisor:
                 args += ["--resume", resume]
             os.execv(sys.executable, args)
 
+    def write_lost(self, line: bytes) -> bool:
+        """Answer the host with a lost-request error line (wire watchdog thread)."""
+        try:
+            with self.stdout_lock:
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
     # ------------------------------------------------------------ pumps
     def _pump_child_out(self, child) -> None:
         out = sys.stdout.buffer
         for line in iter(child.stdout.readline, b""):
             self.last_activity = time.time()
-            WIRE.seen("out", line)
+            if WIRE.seen("out", line):
+                continue  # late reply to a request already answered as lost
             if self.swallow_id is not None:
                 try:
                     if json.loads(line).get("id") == self.swallow_id:

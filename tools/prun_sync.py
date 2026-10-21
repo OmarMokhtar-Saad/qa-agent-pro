@@ -51,6 +51,8 @@ def _coerce_rc(proc: Any, mode: str) -> Any:
 def run(args: Any, *, timeout: Any, opts: RunOpts = _NO_OPTS) -> RunResult:
     """Run *args* synchronously through ``subprocess.run``; never raises."""
     kwargs = _run_kwargs(timeout, opts)
+    if opts.input is None:  # never inherit the MCP pipe (a reader would eat requests)
+        kwargs["stdin"] = subprocess.DEVNULL
     with never_raise() as guard:
         proc = subprocess.run(args, **kwargs)  # noqa: S603 - caller's argv
         rc = _coerce_rc(proc, opts.rc_coerce)

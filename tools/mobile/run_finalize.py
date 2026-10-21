@@ -39,6 +39,8 @@ STOP_IDLE = "released_idle"
 STOP_IDLE_TIMEOUT = "idle_timeout"
 #: Written when a run's server died and the next start found it unfinished.
 STOP_SERVER_DIED = "server_died"
+#: Written when a stale-lease run's server process is still alive: left idle or superseded.
+STOP_ORPHANED = "orphaned"
 
 #: Characters of any one recorded text field; the verdict reason is short already.
 MAX_TEXT_CHARS = 300

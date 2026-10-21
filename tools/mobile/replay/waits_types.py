@@ -16,6 +16,8 @@ class Probe(NamedTuple):
     met: Any
     label: str
     early: bool = False
+    # False for an idle wait: ``met(None, screen)`` is never true, a hold read cannot end it
+    single: bool = True
 
 
 class TextWait(NamedTuple):

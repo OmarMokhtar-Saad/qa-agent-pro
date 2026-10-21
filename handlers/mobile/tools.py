@@ -5,6 +5,7 @@ this facade keeps the mobile-lane gate and the call that registers them.
 """
 
 from handlers import _common
+from handlers.mcp_srv_state import BUSY_PROBES
 from handlers.mobile.tools_device import (
     _register_mobile_app_info_tool,
     _register_mobile_stop_tool,
@@ -22,6 +23,7 @@ from handlers.mobile.tools_watch import (
     _register_mobile_network_watch_tool,
     _register_mobile_status_tool,
 )
+from tools.mobile import heartbeat
 
 
 # The mobile emulator lane. ONE call, and nothing else may join it here:
@@ -37,9 +39,21 @@ from handlers.mobile.tools_watch import (
 # shipped, and it made the lane unreachable on every distribution build:
 # v1.77.0 registered none of these three tools while its own README
 # promised all three. Do not re-add it here or in the predicate.
+def _active_runs() -> int:
+    """Live mobile runs in this process (heartbeat registry)."""
+    return len(heartbeat.active())
+
+
+def _register_run_probe() -> None:
+    """Tell the drift restart that live runs count as busy (once)."""
+    if _active_runs not in BUSY_PROBES:
+        BUSY_PROBES.append(_active_runs)
+
+
 def register_mobile_tools(mcp, kit, rt) -> None:
     """Register the mobile emulator lane tools when its modules are present."""
     if _common.mobile_lane_enabled():
+        _register_run_probe()
         _register_mobile_stop_tool(mcp, kit.context, rt)
         _register_mobile_app_info_tool(mcp, kit.context, rt)
         _register_mobile_update_app_tool(mcp, kit.context, rt)

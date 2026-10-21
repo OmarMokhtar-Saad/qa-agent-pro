@@ -123,6 +123,11 @@ def _write_run_row(facts: RunFacts) -> None:
         conn.close()
 
 
+def begin_sync(facts: RunFacts) -> None:
+    """Public form of ``_begin_sync`` (runs row for an app seeded at close)."""
+    _begin_sync(facts)
+
+
 def _begin_sync(facts: RunFacts) -> None:
     try:
         _write_run_row(facts)

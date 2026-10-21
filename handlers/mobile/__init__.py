@@ -16,8 +16,9 @@ from tools.mobile import (
     install_sources,
     u2_tree_source,
 )
+from tools.mobile.run_idle_startup import close_orphans
 
-__all__ = ["doctor_section", "register", "register_defaults"]
+__all__ = ["close_orphans", "doctor_section", "register", "register_defaults"]
 
 
 def register(mcp, kit, rt) -> None:

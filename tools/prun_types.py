@@ -75,7 +75,7 @@ class RunOpts:
 
 @dataclass(frozen=True)
 class ArunOpts:
-    """Keywords of :func:`tools.prun_async.arun` (``stdin`` is required, as before)."""
+    """Keywords of :func:`tools.prun_async.arun` (``stdin`` is required; ``None`` means DEVNULL)."""
 
     stdin: Any
     communicate_input: bool = False

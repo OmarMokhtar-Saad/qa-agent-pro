@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.147.0] - 2026-10-21
+## [1.148.0] - 2026-10-21
 
 ### Added
 
@@ -183,6 +183,41 @@ project adheres to [Semantic Versioning](https://semver.org/).
   whose server died is closed on the next start; the report says why.
 - screen_changed after only waits is judged by the wait's own result,
   and the reply says it is weak and to use assert text_absent.
+- Programs the server starts (adb, the screen recorder, ffmpeg) no
+  longer share its input with the editor, so they cannot swallow tool
+  calls any more. A tool call that gets no answer within 110 s is now
+  answered with an error instead of the editor waiting out its own
+  timeout and retrying blind. When the call asked for progress and got
+  none, the error says "lost, not slow" and to send it again once;
+  otherwise it says to check the current state before resending once.
+  Progress sent for a call keeps it from being declared lost, and a
+  late real answer to a call already answered this way is dropped.
+- A run closed by the idle timer counts its committed turns apart from
+  low-level actions, and says where it stopped and how to resume it.
+- A run is closed as server_died only when the server that owned it is
+  really gone; a run whose server is still alive is reported as
+  orphaned. Runs of dead servers are closed when the next server starts,
+  not when the next run is created.
+- `assert screen_changed` after a tap and a wait passes when that wait
+  saw the screen change or the screen's content changed, even if the
+  screen id stayed the same (for example, a download that started).
+- A wait no longer ends a case as "abandoned (another app)" when an
+  installer's Open button starts the app under test.
+- Learning now covers each app a run really tested (ranked by its own
+  steps), runs one learn job per run, and the scope purge only drops
+  system-app stores and is logged once.
+- A step result on a screen showing a progress bar or percentage says
+  so and to wait for the finished state.
+- If a goal needs a login, the tool text tells the host to ask the user
+  for the ID, password or OTP and pass them as tester_inputs, never in
+  the goal.
+- A version-drift restart waits while a mobile run is live (at most
+  30 min). qa-doctor rows that need no action are marked with a neutral
+  square instead of a warning sign, and the host is told to report only
+  blockers.
+- A wait's screen re-read while the screen is held is capped at 0.5 s,
+  so a stuck event clock cannot hide the button it waits for, and text
+  matching in waits respects word boundaries.
 
 ### Known
 

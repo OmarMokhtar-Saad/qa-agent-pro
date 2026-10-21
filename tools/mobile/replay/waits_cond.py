@@ -6,6 +6,7 @@ import time
 
 from tools.mobile.replay.context import ReplayStop, _append, _ReplayRun, _result
 from tools.mobile.replay.context_consts import STATUS_NEEDS_MODEL
+from tools.mobile.replay.near_miss import near_miss
 from tools.mobile.replay.screen import _stamp_after
 from tools.mobile.replay.settle_mark import SettleJob, SettleOpts
 from tools.mobile.replay.settle_perm import mark_unclear
@@ -36,7 +37,7 @@ def _element_want(action: object, spec: WaitSpec) -> ElementWait:
     return ElementWait(spec[1], rid_text, gone, spec[2])
 
 
-async def _poll_into(run: _ReplayRun, step: CondStep, screen: object) -> tuple:
+async def poll_into(run: _ReplayRun, step: CondStep, screen: object) -> tuple:
     """:func:`_poll_condition`, plus what pop-ups answered meanwhile onto the entry."""
     action, spec, entry = step
     polled = await _poll_condition(WaitView(run.ctx, screen), action, spec)
@@ -95,12 +96,20 @@ def _miss(entry: dict, words: tuple, timing: tuple) -> None:
     stamp_early(entry, int((time.monotonic() - started) * 1000), wait_ms)
 
 
-def _needs_model_reply(run: _ReplayRun, screen: object, entry: dict) -> dict:
+def needs_model_reply(run: _ReplayRun, screen: object, entry: dict) -> dict:
     """The reply that hands a missed wait back to the model."""
     stop = ReplayStop(
         STATUS_NEEDS_MODEL, run.trace, screen, "", entry["detail"], entry["index"]
     )
     return {"error": None, "content": _result(stop)}
+
+
+def _words_near(action: object, spec: WaitSpec, screen: object) -> tuple:
+    """:func:`_condition_words`, its miss sentence naming a substring-only label
+    (``setting`` on ``Settings``): a text wait never meets on one (D12)."""
+    met, missed, label = _condition_words(action, spec[0], spec[1])
+    extra = near_miss(screen, spec[1]) if spec[0] == "text" else ""
+    return met, missed + extra, label
 
 
 def _miss_words(interruption: str, label: str) -> str:
@@ -126,7 +135,7 @@ def _refused(run: _ReplayRun, step: CondStep, seen: tuple) -> tuple:
     stamp_refused(entry, reason)
     _stamp_after(entry, screen)
     _append(run.trace, entry)
-    return screen, _needs_model_reply(run, screen, entry)
+    return screen, needs_model_reply(run, screen, entry)
 
 
 async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tuple:
@@ -138,8 +147,8 @@ async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tu
     if reason := refusal(run.ctx, step, screen):
         return _refused(run, step, (screen, reason))
     started = time.monotonic()
-    found, screen, interruption = await _poll_into(run, step, screen)
-    met, missed, label = _condition_words(action, spec[0], spec[1])
+    found, screen, interruption = await poll_into(run, step, screen)
+    met, missed, label = _words_near(action, spec, screen)
     if found:
         screen, stop = await _on_met(run, step, (screen, met))
         if stop is not None:
@@ -148,4 +157,4 @@ async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tu
         _miss(entry, (_miss_words(interruption, label), missed), (started, spec[2]))
     _stamp_after(entry, screen)
     _append(run.trace, entry)
-    return screen, (None if found else _needs_model_reply(run, screen, entry))
+    return screen, (None if found else needs_model_reply(run, screen, entry))

@@ -17,6 +17,7 @@ would go on producing packets for a device it does not own.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -107,6 +108,7 @@ def _swap_lease(claim: _Claim, current: dict | None, decision: tuple[str, str]) 
         if reason != "refresh"
         else (current or {}).get("acquired", moment),
         "taken_over_from": taken_from,
+        "pid": os.getpid(),
     }
     run_io._write_json(_lease_path(claim.run_id), payload)
     confirmed = run_io._read_json(_lease_path(claim.run_id))

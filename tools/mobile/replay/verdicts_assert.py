@@ -13,7 +13,7 @@ from tools.mobile.replay.screen import (
     _texts,
     _typed_by_script,
 )
-from tools.mobile.replay.verdicts_wait_evidence import wait_verdict
+from tools.mobile.replay.verdicts_wait_evidence import change_evidence, wait_verdict
 
 
 class AssertView(NamedTuple):
@@ -125,22 +125,20 @@ def _assert_new_text(action: Any, view: AssertView) -> tuple[bool, str]:
     )
 
 
+def _id_verdict(current: str, trace: list[dict]) -> tuple[bool, str]:
+    """The id comparison, with real change evidence when the ids are equal."""
+    seen = [e.get("before_screen_id") for e in trace if e.get("before_screen_id")]
+    if not seen:
+        return False, "no earlier screen to compare against"
+    if current != seen[0]:
+        return True, "the screen changed since the first action"
+    proof = change_evidence(trace)
+    return bool(proof), proof or "the screen did not change since the first action"
+
+
 def _assert_screen_changed(screen: Any, trace: list[dict]) -> tuple[bool, str]:
     """``assert screen_changed`` (weak: compares ids, see ``_evaluate_assert``)."""
     waited = wait_verdict(trace)
     if waited is not None:
         return waited
-    seen = [
-        entry.get("before_screen_id")
-        for entry in trace
-        if entry.get("before_screen_id")
-    ]
-    current = _screen_id(screen)
-    if not seen:
-        return False, "no earlier screen to compare against"
-    changed = current != seen[0]
-    return changed, (
-        "the screen changed since the first action"
-        if changed
-        else "the screen did not change since the first action"
-    )
+    return _id_verdict(_screen_id(screen), trace)

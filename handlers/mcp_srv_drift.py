@@ -13,6 +13,8 @@ from handlers.mcp_srv_state import (
     _DRIFT_EXIT_JITTER_S,
     _INFLIGHT,
     _INFLIGHT_LOCK,
+    _RUN_DEFER_MAX_S,
+    BUSY_PROBES,
     DRIFT_RESTART_EXIT_CODE,
     logger,
 )
@@ -76,12 +78,38 @@ def _drift_jitter_sleep() -> None:
             time.sleep(_jitter)
 
 
+def _probed_runs() -> int:
+    """Sum of the registered busy probes (live mobile runs); 0 on any failure.
+
+    A run sits idle BETWEEN step calls (the host is thinking), longer than the
+    drain gap, so in-flight accounting alone would restart under it and drop
+    its lease."""
+    with never_raise(logger, "active-run check failed", exc_info=True):
+        return sum(int(probe()) for probe in list(BUSY_PROBES))
+    return 0
+
+
+def _mobile_runs_active() -> int:
+    """Live runs that defer the restart, for at most _RUN_DEFER_MAX_S in a row.
+
+    Bounded because a run waiting on the tester is re-armed by its idle timer
+    forever. LAUNCHER restarts (integrity heal, .env change) cannot see these
+    runs at all: the launcher only watches stdio idleness, and a marker file
+    would need a stale-writer protocol, so that path is left as documented."""
+    runs = _probed_runs()
+    if not runs:
+        _INFLIGHT.pop("runs_since", None)
+        return 0
+    since = _INFLIGHT.setdefault("runs_since", time.monotonic())
+    return 0 if time.monotonic() - since > _RUN_DEFER_MAX_S else runs
+
+
 def _exit_if_idle() -> tuple:
     """Exit the process when no tool runs and the quiet gap has passed; else
     return (busy, idle). The exit happens UNDER the lock _inflight_enter also
     takes, so a tool cannot slip in between the check and the exit."""
     with _INFLIGHT_LOCK:
-        busy = _INFLIGHT["n"]
+        busy = _INFLIGHT["n"] + _mobile_runs_active()
         idle = time.monotonic() - _INFLIGHT["last_finish"]
         if not busy and idle >= _DRAIN_IDLE_S:
             os._exit(DRIFT_RESTART_EXIT_CODE)
@@ -97,7 +125,7 @@ def _log_drift_deferred(deferrals: int, busy, idle) -> None:
         )
     else:
         logger.info(
-            "drift: restart deferred (%d in flight, %.0fs since the last "
+            "drift: restart deferred (%d busy: tools or runs, %.0fs since the last "
             "tool finished, deferral #%d).",
             busy,
             idle,

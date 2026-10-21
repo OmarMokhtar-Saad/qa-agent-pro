@@ -65,16 +65,52 @@ def _labelled_candidates(elements: list, key: str, want: str) -> tuple:
     return contains, [e for e in elements if want in _norm(e.get(key))]
 
 
+def _cased(ch: str) -> bool:
+    """True for a letter of a cased script (Latin, Cyrillic, Greek...)."""
+    return ch.isalpha() and ch.lower() != ch.upper()
+
+
+def _glued(ch: str) -> bool:
+    """True for a char that runs on into a word: a cased letter, a digit, ``_``."""
+    return _cased(ch) or ch.isdigit() or ch == "_"
+
+
+def _bounded(label: str, want: str) -> bool:
+    """True when *want* occurs in *label* not inside a longer word.
+
+    ``install`` is not in ``no release installed`` or ``btn_install``, ``2`` is
+    not in ``12 items``; an uncased script (Arabic, CJK) glues affixes to the
+    word, so a letter of it is always a boundary there."""
+    start = label.find(want)
+    while start >= 0:
+        end = start + len(want)
+        before = label[start - 1] if start else " "
+        after = label[end] if end < len(label) else " "
+        glued_before = _glued(before) and _glued(want[0])
+        glued_after = _glued(after) and _glued(want[-1])
+        if not glued_before and not glued_after:
+            return True
+        start = label.find(want, start + 1)
+    return False
+
+
+def match_class(label: object, want: str) -> int:
+    """3 = the label equals *want*, 2 = *want* is a whole word of it,
+    1 = a bare substring (last resort), 0 = absent."""
+    have = _norm(label)
+    if not want or want not in have:
+        return 0
+    if have == want:
+        return 3
+    return 2 if _bounded(have, want) else 1
+
+
 def _text_candidates(elements: list, want: str) -> tuple:
-    exact = [
-        e
+    """The best match class present wins: exact, then whole word, then substring."""
+    classed = [
+        (max(match_class(e.get("text"), want), match_class(e.get("desc"), want)), e)
         for e in elements
-        if _norm(e.get("text")) == want or _norm(e.get("desc")) == want
     ]
-    if exact:
-        return "text", exact
-    return "contains", [
-        e
-        for e in elements
-        if want in _norm(e.get("text")) or want in _norm(e.get("desc"))
-    ]
+    best = max((c for c, _ in classed), default=0)
+    names = {3: "text", 2: "word", 1: "contains"}
+    return names.get(best, "contains"), [e for c, e in classed if c == best and c]

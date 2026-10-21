@@ -7,6 +7,7 @@ import logging
 from tools.mobile import actions as actions_mod
 from tools.mobile import knowledge_inject, perception, render, run_store, screen_audit
 from tools.mobile.run_packets_text import _SYSTEM_PROMPT
+from tools.mobile.screen_progress import progress_line
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger("tools.mobile.run_packets")
@@ -60,7 +61,8 @@ def _screen_block(screen: object, run_id: str = "") -> str:
     # either package id, and is "" (the old bytes) for every other app.
     hint = render.app_tester_hint(body.get("package"))
     rules = knowledge_inject.screen_rules(run_id, screen) if run_id else ""
-    return "\n".join(part for part in (block, wrapped, hint, rules) if part)
+    parts = (block, wrapped, progress_line(body), hint, rules)
+    return "\n".join(part for part in parts if part)
 
 
 # The key of THIS LOOK at the screen this packet describes, or ``""``.

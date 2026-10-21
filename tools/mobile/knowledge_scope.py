@@ -40,8 +40,15 @@ def _drop(folder: Path) -> None:
             logger.warning("knowledge scope: could not drop %s/%s", folder, name)
 
 
+def _purgeable(package: str) -> bool:
+    """Only system packages' stores are purged. A transient surface (installer,
+    App Tester, launcher) may have been driven on purpose, and nothing can write
+    a store for it any more, so a store that exists is kept (D07)."""
+    return system_packages.is_system(package) and not target_pin.transient(package)
+
+
 def _stale(folder: Path) -> bool:
-    if not folder.is_dir() or folder.is_symlink() or allowed(folder.name):
+    if not folder.is_dir() or folder.is_symlink() or not _purgeable(folder.name):
         return False
     return any((folder / name).exists() for name in _STORE_FILES)
 
@@ -56,8 +63,6 @@ def purge() -> list[str]:
                 gone.append(folder.name)
     except OSError:
         logger.info("knowledge scope: nothing to purge", exc_info=True)
-    if gone:
-        logger.info("knowledge scope: purged %s", ", ".join(gone))
     if gone:
         logger.info("knowledge scope: purged %s", ", ".join(gone))
     return gone

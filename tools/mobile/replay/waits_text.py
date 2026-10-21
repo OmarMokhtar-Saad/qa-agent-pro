@@ -60,5 +60,5 @@ async def _wait_idle_dumps(ctx: Context, screen: object, ms: int) -> tuple:
         return previous is not None and _screen_hash(previous) == _screen_hash(current)
 
     return await _wait_for(
-        ctx, screen, Probe(ms, met, "waiting for the screen to settle")
+        ctx, screen, Probe(ms, met, "waiting for the screen to settle", False, False)
     )

@@ -13,16 +13,19 @@ _JIRA_STATUS_TAIL = (
 )
 
 _JIRA_STATUS_UNCHECKED = (
-    "{head}\u26a0\ufe0f not checked yet. {tail} I check it the first time "
+    "{head}\u2b1c not checked yet. {tail} I check it the first time "
     "you ask me for a Jira ticket, not before \u2014 it's probably fine; if "
     "you're not signed in then, I'll walk you through authorizing it."
 )
 
+# Quiet states (unchecked / stale / probe_outdated) lead with the neutral
+# ⬜ glyph, not ⚠️: nothing is broken, the check simply re-runs on demand, so
+# a warning glyph made hosts volunteer it to users who never asked.
 # Placeholders: {head} {age} {tail}; any other state falls back to UNCHECKED.
 _JIRA_STATUS_TEMPLATES: dict[str, str] = {
     "verified": "{head}\u2705 checked and working ({age} ago). {tail}",
     "stale": (
-        "{head}\u26a0\ufe0f checked {age} ago and not re-checked since. "
+        "{head}\u2b1c checked {age} ago and not re-checked since. "
         "{tail} An OAuth session can expire or be revoked in that time, so "
         "I'll re-check it the next time you ask me for a Jira ticket."
     ),
@@ -32,7 +35,7 @@ _JIRA_STATUS_TEMPLATES: dict[str, str] = {
         "if one does, that is the first thing to check."
     ),
     "probe_outdated": (
-        "{head}\u26a0\ufe0f checked {age} ago, but only that you were "
+        "{head}\u2b1c checked {age} ago, but only that you were "
         "signed in \u2014 not that the account can reach your Jira site. "
         "{tail} I'll re-check it the next time you ask "
         "me for a Jira ticket."

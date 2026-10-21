@@ -14,7 +14,6 @@ from tools.mobile.replay.waits_changed import (  # noqa: F401
 )
 from tools.mobile.replay.waits_cond import (  # noqa: F401
     _condition_wait,
-    _needs_model_reply,
     _poll_condition,
     _record_miss,
 )

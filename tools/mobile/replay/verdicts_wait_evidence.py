@@ -43,3 +43,26 @@ def wait_verdict(trace: list[dict]) -> tuple[bool, str] | None:
         return True, "verified by the wait: " + _op(last) + " finished" + nudge
     reason = str(last.get("detail") or last.get("outcome") or "it did not finish")
     return False, "the wait did not finish: " + reason[:200] + nudge
+
+
+def _tail(trace: list[dict]) -> list[dict]:
+    """The last non-wait action and the waits after it (the action under assertion)."""
+    acts = _acts(trace)
+    cut = max((n for n, e in enumerate(acts) if _op(e) not in WAIT_OPS), default=0)
+    return acts[cut:]
+
+
+def change_evidence(trace: list[dict]) -> str:
+    """What proves the LAST action changed the screen although the ids are equal.
+
+    A tap that starts a download leaves the a11y screen id alone but changes the
+    tree (a progress bar); the ``wait_until_changed`` that follows it re-baselines
+    against clock/cursor/animation noise and saw it. Only that trailing segment
+    counts, and its last evidence wait decides, so a timeout fails. A raw hash
+    move on a tap is noise, and an earlier action's change is a round trip.
+    Empty when nothing proved a change: nothing happened is still a failure.
+    """
+    proofs = [e for e in _tail(trace) if _op(e) in EVIDENCE_OPS]
+    if proofs and proofs[-1].get("outcome") == "ok":
+        return "verified by the wait: " + _op(proofs[-1]) + " finished"
+    return ""

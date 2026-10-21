@@ -23,7 +23,7 @@ async def _spawn(args: Any, opts: ArunOpts) -> Any:
     with never_raise() as guard:
         return await asyncio.create_subprocess_exec(
             *args,
-            stdin=opts.stdin,
+            stdin=asyncio.subprocess.DEVNULL if opts.stdin is None else opts.stdin,
             **_streams(opts.quiet),
             **(no_window_kwargs() if opts.no_window else {}),
             **_new_session_kwargs(),

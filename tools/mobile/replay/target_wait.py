@@ -19,7 +19,7 @@ from tools.mobile.replay.context_consts import TARGET_WAIT_S
 from tools.mobile.replay.steps_elem import Aim, _resolve_element
 from tools.mobile.replay.steps_notrun import WAITED_NO_ACTION
 from tools.mobile.replay.steps_stop import StepAt, _close
-from tools.mobile.replay.waits_cond import _needs_model_reply
+from tools.mobile.replay.waits_cond import needs_model_reply as _needs_model_reply
 from tools.mobile.replay.waits_poll import _wait_for
 from tools.mobile.replay.waits_types import Probe
 

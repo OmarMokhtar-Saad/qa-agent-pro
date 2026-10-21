@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from pydantic import Field
 
 from handlers.mobile import content as mobile_content
+from handlers.mobile.tools_login_note import with_login_note
 
 # Tool-body locals never forwarded to the handler. `rt` is a closure variable of
 # the tool bodies, so locals() holds it.
@@ -81,4 +82,5 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
             fields,
             **rt._make_elicitors(ctx),
         )
+        blocks = with_login_note(blocks, goal, tester_inputs)
         return _with_inputs_note(blocks, tester_inputs)

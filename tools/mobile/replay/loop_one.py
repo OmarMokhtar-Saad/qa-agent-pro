@@ -13,6 +13,7 @@ from tools.mobile.replay.knowledge import _apply_knowledge
 from tools.mobile.replay.loop_dispatch import _dispatch_op
 from tools.mobile.replay.loop_gate import gate_step
 from tools.mobile.replay.loop_open import _step_prelude
+from tools.mobile.replay.near_miss import near_miss
 from tools.mobile.replay.present_pick import resolve_optional_text
 from tools.mobile.replay.present_wait import present_read
 from tools.mobile.replay.steps_assert import Seen
@@ -29,7 +30,7 @@ from tools.mobile.replay.steps_know import (
 )
 from tools.mobile.replay.steps_stop import StepAt, _budget_stop, _close
 from tools.mobile.replay.target_wait import note_wait, wait_for_target
-from tools.mobile.replay.waits_cond import _needs_model_reply
+from tools.mobile.replay.waits_cond import needs_model_reply as _needs_model_reply
 from tools.mobile.replay.waits_types import TextWait
 
 
@@ -137,16 +138,18 @@ async def _present_cur(run: _ReplayRun, turn: Turn, cur: Cur) -> Cur | dict | No
         return _interrupted_reply(run, at, interruption)
     if found and resolve_optional_text(action.text, screen)["element"] is not None:
         return Cur(Aim("tap_text", action), at)
-    _skipped(run, at, _skip_detail(action.text, found))
+    _skipped(run, at, _skip_detail(action.text, (found, screen)))
     return None
 
 
-def _skip_detail(text: str, found: bool) -> str:
+def _skip_detail(text: str, seen: tuple) -> str:
     """Why an optional tap did nothing: its text never showed, or it showed
     but no single control could be tapped (several matches, or none of them
-    a tappable control)."""
+    a tappable control). A text on screen only inside a longer label is named."""
+    found, screen = seen
     note = "found but no single control to tap" if found else "not found"
-    return "`" + text[:80] + "` " + note + ", skipped"
+    extra = "" if found else near_miss(screen, text)
+    return "`" + text[:80] + "` " + note + extra + ", skipped"
 
 
 def _skipped(run: _ReplayRun, at: StepAt, detail: str) -> None:

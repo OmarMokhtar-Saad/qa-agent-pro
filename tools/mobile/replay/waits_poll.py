@@ -101,12 +101,14 @@ async def _wait_for(ctx: Context, screen: object, probe: Probe) -> tuple:
 async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
     """The poll loop of :func:`_wait_for` for a condition not yet met."""
     deadline, ticker, current = await _begin(ctx, screen, probe)
-    previous, quiet, gate = None, 0, Gate()
+    previous, quiet, gate = None, 0, Gate(met=probe.met if probe.single else None)
     while True:
         current = await answer_unless_met(ctx, probe, (previous, current, screen))
         if ended := _ended(ctx, probe, (previous, current, screen)):
             return ended
-        await hold(ctx, gate, deadline)  # no event since the last read: no dump
+        if (held := await hold(ctx, gate, deadline)) is not None:
+            previous, current = current, held  # a hold read met the wait
+            continue
         final, content = await _next_read(ctx, current, deadline)
         if final:
             return final

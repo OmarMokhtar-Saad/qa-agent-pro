@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from pathlib import Path
+from subprocess import DEVNULL
 
 from tools.mobile import media
 from tools.mobile.media_run import SEGMENT_PREFIX
@@ -68,6 +69,9 @@ def _step_clips(cases: list, media_dir: Path) -> list:
     return sorted(present, key=lambda p: (p.stat().st_mtime, p.name))
 
 
+_CONCAT_HEAD = ["-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"]
+
+
 def _concat(clips: list, listing: str, media_dir: Path) -> bool:
     """Run ffmpeg's concat demuxer over *clips* into :data:`RUN_CLIP`."""
     tool = find_ffmpeg()
@@ -75,9 +79,10 @@ def _concat(clips: list, listing: str, media_dir: Path) -> bool:
         return False
     tmp, tmp_list = media_dir / ("tmp-" + RUN_CLIP), media_dir / ("tmp-" + RUN_LIST)
     tmp_list.write_text(listing, encoding="utf-8")
-    argv = [tool, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"]
-    argv += [str(tmp_list), "-c", "copy", str(tmp)]
-    done = subprocess.run(argv, capture_output=True, timeout=JOIN_TIMEOUT_S)
+    argv = [tool, *_CONCAT_HEAD, str(tmp_list), "-c", "copy", str(tmp)]
+    done = subprocess.run(
+        argv, stdin=DEVNULL, capture_output=True, timeout=JOIN_TIMEOUT_S
+    )
     if done.returncode or not tmp.is_file():
         tmp.unlink(missing_ok=True)
         tmp_list.unlink(missing_ok=True)

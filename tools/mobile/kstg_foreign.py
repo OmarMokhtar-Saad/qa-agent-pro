@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
 
-def observed(rec: dict) -> str:
+
+def observed(rec: Mapping[str, Any]) -> str:
     """The package of the screen a step ran on: the stamped one, else the activity's."""
     stamped = str(rec.get("screen_package") or "")
     if stamped:
@@ -48,3 +51,11 @@ def package_problem(package: str, steps: list) -> str:
     if seen and package not in seen:
         return "no observed screen belongs to the run package"
     return ""
+
+
+def observed_packages(steps: list) -> list[str]:
+    """Packages the run's steps ran on, first seen first, without repeats."""
+    seen: dict[str, None] = {}
+    for rec in steps:
+        seen.setdefault(observed(rec), None)
+    return [name for name in seen if name]

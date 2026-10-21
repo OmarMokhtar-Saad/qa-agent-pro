@@ -44,7 +44,7 @@ def _register_doctor_tool(mcp, Context, rt) -> None:
 
     @mcp.tool(name="qa-doctor")
     async def qa_doctor(ctx: Context, fix: bool = False) -> str:
-        """Is THIS machine ready? Verdict, environment, Jira/Atlassian, adb/xcrun, features, action items. Reports NO model backend (generation runs in YOUR chat model). Read-only by default; fix=true repairs what it can. Run first on a new machine."""
+        """Is THIS machine ready? Verdict, environment, Jira/Atlassian, adb/xcrun, features, action items. No model backend (generation runs in YOUR model). Read-only by default; fix=true repairs what it can. Run first. Report only blockers."""
         progress = rt._make_progress(ctx)
         # Resolved BEFORE entering _tracked: this is a round trip back to the
         # client, not part of the report's own work, and _tracked owns the

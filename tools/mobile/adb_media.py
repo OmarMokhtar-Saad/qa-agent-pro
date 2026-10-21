@@ -65,6 +65,7 @@ async def _spawned(serial: str, remote: str, seconds: int) -> dict:
         return refusal
     proc = await asyncio.create_subprocess_exec(
         *_record_cmd(serial, remote, seconds),
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         **platform_info.no_window_kwargs(),

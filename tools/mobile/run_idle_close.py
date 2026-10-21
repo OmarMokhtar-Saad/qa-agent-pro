@@ -13,15 +13,17 @@ import logging
 import math
 import time
 from types import SimpleNamespace
+from typing import NamedTuple
 
 from tools.mobile import (
     lock_reaper,
     media_pending,
     run_consts,
     run_finalize,
+    run_idle_owner,
+    run_idle_words,
     run_lease_core,
     run_list,
-    run_store,
 )
 from tools.mobile.run_verdict import Verdict
 
@@ -31,55 +33,25 @@ OUTCOME_UNFINISHED = "unfinished"
 #: Newest runs the dead-server sweep looks at.
 SWEEP_LIMIT = 20
 #: Stop codes whose report line carries the recorded reason as well.
-STOP_WORDED = (run_finalize.STOP_IDLE_TIMEOUT, run_finalize.STOP_SERVER_DIED)
-
-
-def steps_taken(run_id: str) -> int:
-    """Steps the run's cases recorded in total."""
-    cases = (run_store.list_cases(run_id) or {}).get("content") or []
-    return sum(len(c.get("trace") or []) for c in cases if isinstance(c, dict))
-
-
-def _clock(now: float) -> str:
-    return time.strftime("%H:%M", time.localtime(now))
-
-
-def idle_reason(steps: int, now: float) -> str:
-    """The report wording of a run the idle timer closed."""
-    return (
-        "went idle after step "
-        + str(steps)
-        + ", closed by the server at "
-        + _clock(now)
-    )
-
-
-def died_reason(steps: int, now: float) -> str:
-    """The report wording of a run whose server died."""
-    return (
-        "the server stopped after step "
-        + str(steps)
-        + "; closed by a later session on "
-        + time.strftime("%Y-%m-%d", time.localtime(now))
-        + " at "
-        + _clock(now)
-    )
+STOP_WORDED = (
+    run_finalize.STOP_IDLE_TIMEOUT,
+    run_finalize.STOP_SERVER_DIED,
+    run_finalize.STOP_ORPHANED,
+)
+_WORDS = {
+    run_finalize.STOP_IDLE_TIMEOUT: run_idle_words.idle_reason,
+    run_finalize.STOP_ORPHANED: run_idle_words.orphaned_reason,
+}
 
 
 async def close_run(run_id: str, stop: str, ports: SimpleNamespace) -> bool:
     """End *run_id* as *stop*: verdict through the one funnel, then free its device."""
-    now = time.time()
-    steps = steps_taken(run_id)
-    text = (
-        idle_reason(steps, now)
-        if stop == run_finalize.STOP_IDLE_TIMEOUT
-        else died_reason(steps, now)
-    )
+    progress = run_idle_words.progress_of(run_id)
+    text = _WORDS.get(stop, run_idle_words.died_reason)(progress, time.time())
+    verdict = Verdict(OUTCOME_UNFINISHED, text, run_idle_words.evidence_of(progress))
     try:
         await lock_reaper.call_port(ports.stop_heartbeat, run_id)
-        wrote = run_finalize.finalize(
-            run_id, Verdict(OUTCOME_UNFINISHED, text), stop=stop
-        )
+        wrote = run_finalize.finalize(run_id, verdict, stop=stop)
         await lock_reaper.call_port(ports.release, ports.serial_of(run_id), run_id)
     except lock_reaper.PORT_FAILURES:
         logger.warning("run_idle_close: could not close %s", run_id, exc_info=True)
@@ -108,26 +80,60 @@ def _beat(lease: dict) -> float:
     return beat if math.isfinite(beat) else 0.0
 
 
-async def _sweep_row(row: dict, owner: str, ports: SimpleNamespace) -> bool:
+def _lease_of(run_id: str) -> dict:
+    return (run_lease_core.read_lease(run_id) or {}).get("content") or {}
+
+
+def _owner_up(run_id: str) -> bool:
+    """The lease owner's process is still running (a sibling server's run)."""
+    return run_idle_owner.owner_alive(_lease_of(run_id))
+
+
+def _stop_for(run_id: str) -> str:
+    """``server_died`` only when the lease owner's process is really gone."""
+    if _owner_up(run_id):
+        return run_finalize.STOP_ORPHANED
+    return run_finalize.STOP_SERVER_DIED
+
+
+class Sweep(NamedTuple):
+    """One sweep: the caller's own run, the close ports, and whether a live owner is spared."""
+
+    owner: str
+    ports: SimpleNamespace
+    only_dead: bool = False
+
+
+async def _sweep_row(row: dict, sweep: Sweep) -> bool:
     """Close *row* when its server died; one bad row never ends the sweep."""
+    ports, only_dead = sweep.ports, sweep.only_dead
     try:
         alive = row["run_id"] in ports.live_runs()
-        if alive or not _is_dead(row, owner, time.time()):
+        if alive or not _is_dead(row, sweep.owner, time.time()):
+            return False
+        if only_dead and _owner_up(row["run_id"]):
             return False
         media_pending.restore(row["run_id"])
-        return await close_run(row["run_id"], run_finalize.STOP_SERVER_DIED, ports)
+        return await close_run(row["run_id"], _stop_for(row["run_id"]), ports)
     except (OSError, ValueError, TypeError, KeyError):
         logger.warning("run_idle_close: row skipped", exc_info=True)
         return False
 
 
-async def close_dead_runs(owner: str, ports: SimpleNamespace) -> list[str]:
-    """Close every recent run whose server died. Never raises; the closed ids."""
+async def close_dead_runs(
+    owner: str, ports: SimpleNamespace, *, only_dead: bool = False
+) -> list[str]:
+    """Close every recent run whose server died. Never raises; the closed ids.
+
+    ``only_dead`` spares a run whose lease owner process still runs (start-up:
+    that is a live sibling server's run, not ours to close).
+    """
+    sweep = Sweep(owner, ports, only_dead)
     closed: list[str] = []
     try:
         rows = (run_list.list_runs(SWEEP_LIMIT, gc=False) or {}).get("content") or []
         for row in rows:
-            if await _sweep_row(row, owner, ports):
+            if await _sweep_row(row, sweep):
                 closed.append(row["run_id"])
     except (OSError, ValueError, TypeError, KeyError):
         logger.warning("run_idle_close: dead-run sweep skipped", exc_info=True)
