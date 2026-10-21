@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from tools.mobile import run_finalize, session_records
+from tools.mobile import run_finalize, run_idle_words, session_records
 from tools.mobile.run_verdict import Verdict
 
 logger = logging.getLogger("tools.mobile.session")
@@ -24,6 +24,14 @@ _WORDS = {"pass": "passed", "fail": "failed", "unverified": "not verified"}
 
 def _reason(word: str, rows: list) -> str:
     done = sum(1 for r in rows if r.get("verdict"))
+    # A passed run is judged by its final done(pass): explore rows without a verdict
+    # are stumbles on the way, not an unfinished run.
+    undecided = 0 if word == "pass" else len(rows) - done
+    said = run_idle_words.unjudged_line(
+        len(rows), undecided, run_idle_words.problem_of(rows)
+    )
+    if said:
+        return said
     return "run %s: %d of %d steps reached a verdict" % (
         _WORDS.get(word, word),
         done,

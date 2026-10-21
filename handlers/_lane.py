@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-_MOBILE_PACKAGES = ("handlers.mobile", "tools.mobile")
+_MOBILE_PACKAGES = ("handlers.mobile", "tools.mobile", "tools.mobile_shared")
 _API_PACKAGES = ("handlers.api_lane",)
 
 try:
@@ -30,6 +30,7 @@ try:
     import tools.mobile.script_help as script_help
     import tools.mobile.sdk_locator as sdk_locator
     import tools.mobile.watch as watch
+    import tools.mobile_shared.scrub_render as scrub_render
 except ImportError as exc:  # pragma: no cover - the dist-simulation test covers it
     if (exc.name or "") not in _MOBILE_PACKAGES:
         raise
@@ -45,6 +46,7 @@ except ImportError as exc:  # pragma: no cover - the dist-simulation test covers
     script_help = cast("Any", None)
     sdk_locator = cast("Any", None)
     watch = cast("Any", None)
+    scrub_render = cast("Any", None)
 
 try:
     import handlers.api_lane as api_lane

@@ -42,7 +42,7 @@ fetching the URL a second time; see ``_fetch_or_reuse``.
 When Tier 2 renders a page whose HTML still yields no elements, the
 screenshot is returned under ``vision_screenshot`` (raw bytes) with
 ``extraction_method="vision_deferred"`` so the caller can forward it to
-the tester's OWN multimodal model as MCP image content. ``ui_elements``
+the tester's OWN multimodal model (host-supplied only; this server sends no images). ``ui_elements``
 stays empty on that branch. The ``vision_screenshot`` key is ABSENT (not
 None) unless a screenshot was actually produced.
 """

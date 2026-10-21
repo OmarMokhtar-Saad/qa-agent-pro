@@ -27,7 +27,7 @@ async def capture_screens_call(rt: Any, loc: dict[str, Any]) -> Any:
     """Run qa_capture_screens; ``loc`` holds the wrapper locals, picked by key."""
 
     ctx = loc["ctx"]
-    text, specs = await rt._tracked(
+    text, _specs = await rt._tracked(
         "qa_capture_screens",
         ctx,
         capture.handle_capture_screens(
@@ -40,4 +40,4 @@ async def capture_screens_call(rt: Any, loc: dict[str, Any]) -> Any:
             progress=rt._make_progress(ctx),
         ),
     )
-    return [TextContent(type="text", text=text), *rt._image_content_blocks(specs)]
+    return [TextContent(type="text", text=text)]

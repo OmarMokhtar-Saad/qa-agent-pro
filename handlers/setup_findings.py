@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from config.settings_guard import never_raise
-from handlers import host_check, setup_state
+from handlers import host_check, setup_state, setup_update_idle
 from tools import client_registry
 from tools import host_llm as _host_llm
 
@@ -117,6 +117,9 @@ def _standing_findings(run: setup_state._SetupRun, update_status: Any) -> None:
     _rate_limit_note = host_check.update_rate_limit_advisory(update_status)
     if _rate_limit_note:
         run.recommended.append(_rate_limit_note)
+    _deferred = setup_update_idle.deferred_update_advisory(update_status)
+    if _deferred:
+        run.recommended.append(_deferred)
 
 
 # 2026-08-01: there is nothing Jira-shaped left for this server to

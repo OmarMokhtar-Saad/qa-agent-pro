@@ -56,8 +56,8 @@ _AC_LINE = (
 )
 _IMAGE_LINE = (
     "> ℹ️  This server made **no** vision call for the "
-    "screenshot(s): they are attached to this reply as image content for "
-    "your OWN multimodal model. This server has no vision backend to "
+    "screenshot(s) you attested or supplied in your own conversation; read "
+    "them with your OWN multimodal model. This server has no vision backend to "
     "call and needs no key of its own. Read them as step 0c of the "
     "payload's `jobs_to_run`, ground "
     "your cases in them, and return an optional top-level "

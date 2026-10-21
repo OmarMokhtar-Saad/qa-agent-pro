@@ -19,6 +19,8 @@ from tools.mobile.replay.waits_changed import (
 from tools.mobile.replay.waits_gen import hold_still
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_late import CHANGED, SAME, late_detail, late_verdict
+from tools.mobile.replay.waits_prior import origin_screen
+from tools.mobile.replay.waits_progress import stall_detail, take_progress
 from tools.mobile.replay.waits_spec import _secs, _unchanged_detail, stamp_early
 from tools.mobile.replay.waits_types import AfterWait, ChangedStep, StopView
 
@@ -53,18 +55,26 @@ def _wait_timeout_stop(run: _ReplayRun, view: StopView) -> dict:
     return {"error": None, "content": _result(stop)}
 
 
+def _stamp_unchanged(run: _ReplayRun, step: ChangedStep, seen: tuple) -> None:
+    progress, ends, elapsed_ms = seen
+    ran_ms = _capped_ms(run.ctx, step.wait_ms)
+    step.entry["detail"] = _unchanged_detail(ran_ms, elapsed_ms)
+    stamp_early(step.entry, elapsed_ms, ran_ms)
+    stalled = stall_detail(progress, ends, _secs(ran_ms))
+    step.entry["detail"] = stalled or step.entry["detail"]
+
+
 async def _poll_changed(run: _ReplayRun, step: ChangedStep, screen: object) -> tuple:
     """Run the change wait and watch it: ``(screen, changed, reusable, interruption)``."""
-    before_wait = screen
+    before_wait, origin = screen, origin_screen(run.ctx, screen)
     started = time.monotonic()
     screen, changed, reusable = await _wait_until_changed(run.ctx, screen, step.wait_ms)
+    progress = take_progress(run.ctx)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     step.entry["outcome"] = "ok"
     step.entry["detail"] = _changed_detail(step.op, step.wait_ms, changed)
     if step.op != "wait" and not changed:
-        ran_ms = _capped_ms(run.ctx, step.wait_ms)  # the limit the wait really had
-        step.entry["detail"] = _unchanged_detail(ran_ms, elapsed_ms)
-        stamp_early(step.entry, elapsed_ms, ran_ms)
+        _stamp_unchanged(run, step, (progress, (origin, screen), elapsed_ms))
     after = AfterWait(before_wait, changed, reusable)
     screen, reusable, interruption = await _watch_after_wait(run.ctx, screen, after)
     return screen, changed, reusable, interruption

@@ -12,7 +12,7 @@ from handlers.seam_alias import alias
 
 logger = logging.getLogger("tools.mcp_handlers")
 
-_BUDGET_NOTE = " Any captured screen dropped for size is named in the prepare reply."
+_BUDGET_NOTE = ""
 
 
 # "> ..." disclosure when the tester's own text-only source_plan='jira'
@@ -47,10 +47,9 @@ def _both_channels_what(att: int, cap: int) -> str:
     """The evidence sentence when both intake channels carried screens."""
     return (
         f"You told me {att} screenshot(s) were attached to the chat, and "
-        f"this server captured {cap} device screen(s) and handed them to "
-        "your chat client as image content (up to the reply size budget; "
-        "the two counts are per-CHANNEL and may describe the same physical "
-        "screens)"
+        f"this server captured {cap} device screen(s) and kept them on the "
+        "server (screenshots are never sent to you; the two counts are "
+        "per-CHANNEL and may describe the same physical screens)"
     )
 
 
@@ -58,8 +57,8 @@ def _captured_what(cap: int) -> str:
     """The evidence sentence when only device captures carried screens."""
     return (
         f"This server captured {cap} device screen(s) with "
-        "`qa_capture_screens` and handed them to your chat client as image "
-        "content (up to the reply size budget)"
+        "`qa_capture_screens` and kept them on the server (screenshots are "
+        "never sent to you)"
     )
 
 

@@ -70,20 +70,15 @@ def ticket_image_note(a: ImageNoteArgs, image: ImageHooks) -> str:
 
 
 def captured_screens_note(cap_labels: list, img_job: bool) -> str:
-    """Captured device screens NAMED, or the warning they went nowhere."""
+    """Captured device screens NAMED, each with its age (G06); screens stay on the server."""
     if not cap_labels:
         return ""
-    if img_job:
-        return (
-            "> 📸 Captured device screens, in the order they are attached to "
-            "this reply:\n\n"
-            + wrap_untrusted("captured_screen_labels", "\n".join(cap_labels), limit=800)
-        )
     return (
-        f"> ⚠️ {len(cap_labels)} captured device screen(s) were NOT "
-        "forwarded to your model as image content. No image content rides "
-        "on this reply, and this server describes no screenshots itself, "
-        "so nothing they show is reflected in the cases below."
+        f"> 📸 {len(cap_labels)} captured device screen(s) used for this "
+        "preparation (kept on the server, never sent to you; plan from the "
+        "element lists). A screen captured long ago may no longer match the "
+        "app:\n\n"
+        + wrap_untrusted("captured_screen_labels", "\n".join(cap_labels), limit=800)
     )
 
 

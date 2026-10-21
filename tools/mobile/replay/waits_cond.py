@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import time
 
-from tools.mobile.replay.context import ReplayStop, _append, _ReplayRun, _result
+from tools.mobile.replay.context import (
+    Context,
+    ReplayStop,
+    _append,
+    _ReplayRun,
+    _result,
+)
 from tools.mobile.replay.context_consts import STATUS_NEEDS_MODEL
 from tools.mobile.replay.near_miss import near_miss
 from tools.mobile.replay.screen import _stamp_after
@@ -23,6 +29,7 @@ from tools.mobile.replay.waits_types import (
     WaitSpec,
     WaitView,
 )
+from tools.mobile.replay.waits_visual import with_source
 
 
 def _is_gone(action: object, kind: str) -> bool:
@@ -117,6 +124,12 @@ def _miss_words(interruption: str, label: str) -> str:
     return interruption and interruption + " (while " + label + ")"
 
 
+def _pair(ctx: Context, words: tuple) -> tuple:
+    """``(interruption sentence, timeout sentence naming the sources read)``."""
+    interruption, label, missed = words
+    return _miss_words(interruption, label), with_source(ctx, missed)
+
+
 async def _on_met(run: _ReplayRun, step: CondStep, met: tuple) -> tuple:
     """Record a met condition and settle: ``(screen, stop reply or None)``."""
     action, spec, entry = step
@@ -154,7 +167,7 @@ async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tu
         if stop is not None:
             return screen, stop
     else:
-        _miss(entry, (_miss_words(interruption, label), missed), (started, spec[2]))
+        _miss(entry, _pair(run.ctx, (interruption, label, missed)), (started, spec[2]))
     _stamp_after(entry, screen)
     _append(run.trace, entry)
     return screen, (None if found else needs_model_reply(run, screen, entry))

@@ -9,6 +9,7 @@ from tools.mobile.replay.screen import _screen_has, _screen_hash, absent_from
 from tools.mobile.replay.waits_idle import probe_idle
 from tools.mobile.replay.waits_poll import _wait_for
 from tools.mobile.replay.waits_types import Probe, TextWait
+from tools.mobile.replay.waits_visual import fresh_screen, note_source
 
 
 async def _wait_until_text(ctx: Context, screen: object, want: TextWait) -> tuple:
@@ -30,7 +31,20 @@ async def _wait_until_text(ctx: Context, screen: object, want: TextWait) -> tupl
         has = _screen_has(current, text)
         return absent_from(current, has) if gone else has
 
-    return await _wait_for(ctx, screen, Probe(ms, met, label, not gone))
+    return await _recheck(ctx, screen, Probe(ms, met, label, not gone))
+
+
+async def _recheck(ctx: Context, screen: object, probe: Probe) -> tuple:
+    """Poll; a timed-out text wait looks once more at a fresh non-accessibility read (G03)."""
+    done = await _wait_for(ctx, screen, probe)
+    found, _screen, timed_out = done
+    if found or ctx.wait_interruption or not timed_out:
+        return done
+    fresh = await fresh_screen(ctx)
+    if fresh is not None and probe.met(None, fresh):
+        return True, fresh, False
+    note_source(ctx, fresh is not None)
+    return done
 
 
 async def _wait_until_idle(ctx: Context, screen: object, ms: int) -> tuple:

@@ -34,7 +34,7 @@ async def _fa_capture_run(device, call: FeatureAnalysisCall) -> tuple[_FaCapture
         # already returns them and as IMAGE_JOB does on the generation path.
         await _common.emit(
             call.progress,
-            f"🖼️ Attaching {len(screens)} captured screen(s) for your model…",
+            f"🖼️ Captured {len(screens)} screen(s) (kept on the server)…",
         )
     return _FaCapture(len(screens), tuple(screens)), ""
 

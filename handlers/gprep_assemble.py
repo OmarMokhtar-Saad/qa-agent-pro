@@ -9,7 +9,6 @@ from handlers import (
     gprep_budget,
     gprep_limits,
     gprep_render,
-    gprep_select,
     gprep_split,
 )
 from tools import handover_cost
@@ -50,12 +49,9 @@ def assemble_prepare_payload(
     """Turn a PreparePayloadResult into (text_blocks, image_specs) for the MCP tool layer."""
     if result.clarify or not result.payload:
         return ([gprep_render.render_prepare_payload(result)], [])
-    image_specs, disclosure = gprep_select._select_prepare_images(result)
     single = gprep_render.render_prepare_payload(result)
     if len(single.encode("utf-8")) <= gprep_limits._MAX_TEXT_BLOCK_BYTES:
         text_blocks = [single]
     else:
         text_blocks = _split_with_cost(result, result.payload)
-    if disclosure:
-        text_blocks = [*text_blocks, disclosure]
-    return (text_blocks, image_specs)
+    return (text_blocks, [])

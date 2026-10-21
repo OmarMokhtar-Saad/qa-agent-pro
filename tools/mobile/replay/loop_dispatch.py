@@ -116,7 +116,7 @@ async def _device_step(
     """Run a device op: ``(screen, reply)``, ``reply`` is ``None`` to go on."""
     entry = step.entry
     touch = TouchSpec(step.op, step.action, step.element, _clamp_source(screen))
-    note_action(run.ctx, _screen_hash(screen))
+    note_action(run.ctx, _screen_hash(screen), screen)
     outcome = await _perform(touch, run.ctx)
     outcome = await reconcile_empty_field(run, Acted(outcome, entry, screen))
     read = outcome.get("read_screen")

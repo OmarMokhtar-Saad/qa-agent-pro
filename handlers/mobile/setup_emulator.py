@@ -7,6 +7,7 @@ import logging
 
 from config.settings_guard import never_raise
 from handlers import _reply
+from handlers.mobile import setup_devices
 from tools.mobile import avd_guard, emulator, sdk_locator
 from tools.mobile import render as doctor_render
 
@@ -56,6 +57,13 @@ def _avd_weight_lines(names: list, sdk_locator, avd_guard) -> list:
     return lines
 
 
+async def _physical_attached() -> bool:
+    """True when adb lists a usable device that is not an emulator."""
+    found = await setup_devices._mobile_attached_devices()
+    serials = found.get("content") or []
+    return any(not str(x).startswith("emulator-") for x in serials)
+
+
 async def _mobile_avd_rows() -> list:
     """The AVD lines of the mobile doctor section: configured emulators, heavy
     AVDs and host load."""
@@ -64,7 +72,11 @@ async def _mobile_avd_rows() -> list:
     names = list(avds.get("content") or [])
     lines = [_avd_summary_line(avds, names, doctor_render)]
     lines += _avd_weight_lines(names, sdk_locator, avd_guard)
-    loaded = avd_guard.assess(avd_guard.Panel(load_per_core=avd_guard.host_load()))
+    loaded = ""
+    if not await _physical_attached():
+        # The load warning is about AVD speed; on a physical phone it blames
+        # an emulator the run is not using (G12).
+        loaded = avd_guard.assess(avd_guard.Panel(load_per_core=avd_guard.host_load()))
     if loaded:
         lines.append("- ⚠️ " + loaded)
     return lines

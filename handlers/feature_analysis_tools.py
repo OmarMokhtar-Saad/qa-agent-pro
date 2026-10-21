@@ -43,12 +43,8 @@ def _fa_call(rt, ctx, args: tuple) -> FeatureAnalysisCall:
 
 def _fa_blocks(rt, reply) -> list:
 
-    # Captured screens ride to the tester's own multimodal model as
-    # image content. getattr: every other return path is a plain str.
-    return [
-        TextContent(type="text", text=str(reply)),
-        *rt._image_content_blocks(getattr(reply, "images", ())),
-    ]
+    # Owner rule (fix/1630, G05): text only, never an image to the host.
+    return [TextContent(type="text", text=str(reply))]
 
 
 def _register_fa_start_tool(mcp, kit, rt) -> None:

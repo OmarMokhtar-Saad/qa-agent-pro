@@ -63,8 +63,8 @@ async def _stage(ctx: FinishCtx) -> tuple:
 
 
 # Item 6: carry the RAW ticket screenshots so the TOOL layer can forward them to
-# the host's OWN multimodal model as MCP image content (this server makes no
-# vision call at all). Present only when JIRA_FETCH_IMAGES + ANTHROPIC_API_KEY
+# the host's OWN multimodal model (host-supplied only; this server sends no images
+# and makes no vision call at all). Present only when JIRA_FETCH_IMAGES + ANTHROPIC_API_KEY
 # let jira_fetcher download them; bytes are never persisted in the prep store.
 # QA_HOST_IMAGE_DESCRIPTION_ENABLED additionally forwards the tester's chat
 # attachments; OFF, this is EXACTLY today's ticket-images-only list.

@@ -34,7 +34,7 @@ def _ui_block(ui_content: dict | None) -> str:
 def _attached_block(screens_attached: int) -> str:
     return (
         f"\n\n## Screenshots — {screens_attached} device screen(s)\n"
-        "They are ATTACHED to this conversation as images (this message, "
+        "You supplied them in your own conversation (this message, "
         "or an earlier one in this same chat if you are re-submitting). "
         "READ THEM YOURSELF and treat them as one connected flow. This "
         "server made no vision call and has no description to give you; "
@@ -61,7 +61,7 @@ def _described_block(descriptions: str) -> str:
 # passes it any more: the two that did -- evals/ and graph.py -- were
 # deleted in P2-B and P2-A (2026-08-15), and the server-side vision call
 # that produced the descriptions went in P2-F1 (2026-08-16). Screens now
-# ride to the tester's own multimodal model as MCP image content.
+# ride to the tester's own multimodal model (host-supplied only; this server sends no images).
 def _shots_block(screenshot_descriptions: str, screens_attached: int) -> str:
     """The screenshots section of the user message."""
     if screenshot_descriptions:

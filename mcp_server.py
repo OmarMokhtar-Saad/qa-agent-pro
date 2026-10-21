@@ -44,11 +44,11 @@ from handlers.mcp_srv_client import (  # noqa: E402, F401
 )
 from handlers.mcp_srv_content import (  # noqa: E402, F401
     MobileReplySpec,
-    _image_content_blocks,
     _mobile_reply,
     _prepare_payload_to_content,
 )
 from handlers.mcp_srv_driftloop import _drift_watch  # noqa: E402, F401
+from handlers.mcp_srv_idle import idle_watch  # noqa: E402
 from handlers.mcp_srv_elicit import (  # noqa: E402, F401
     _make_asker,
     _make_chooser,
@@ -97,6 +97,7 @@ def main() -> None:
     _register_mobile_defaults()
     mcp_srv_main.announce_server_start()
     mcp_srv_main.start_drift_thread(_drift_watch)
+    mcp_srv_main.start_drift_thread(idle_watch)
     logger.info("Starting the qa-agents MCP server over stdio…")
     mcp_srv_serve.run_server(server)
 

@@ -8,9 +8,9 @@ from typing import Any
 
 from handlers.mobile.step_state import _MOBILE_SHOT_WANT
 from tools.mobile import adb as mobile_adb
-from tools.mobile import run_io, step_timing
 from tools.mobile import run_store as mobile_run_store
 from tools.mobile import screenshot as mobile_screenshot
+from tools.mobile import step_timing
 
 logger = logging.getLogger("tools.mcp_handlers")
 
@@ -18,7 +18,9 @@ BLIND_NOTE = (
     "This screen has no readable elements (canvas or WebView). Use "
     "wait-until-text or coordinates."
 )
-SAVED_NOTE = " A PNG of it was saved for the report at {path}; it is not shown to you."
+SAVED_NOTE = (
+    " Screenshots are never shared with you; describe the screen from the dump."
+)
 
 
 @dataclass(frozen=True)
@@ -115,12 +117,7 @@ def _blind_note(turn: ShotTurn, stored: bool) -> str:
     """The blind-screen line; it names the PNG path only when the PNG was written."""
     if not stored:
         return BLIND_NOTE
-    packet = turn.packet if isinstance(turn.packet, dict) else {}
-    folder = run_io.run_path(str(turn.body.get("run_id") or ""))
-    name = str(packet.get("observation_id") or "") + ".png"
-    return BLIND_NOTE + SAVED_NOTE.format(
-        path=folder / mobile_run_store.SHOTS_DIR / name
-    )
+    return BLIND_NOTE + SAVED_NOTE
 
 
 # Fast steps (WP-D): a plain step takes NO picture and no reply carries one.

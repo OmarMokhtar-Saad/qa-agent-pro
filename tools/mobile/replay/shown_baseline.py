@@ -31,4 +31,4 @@ def note_shown(ctx: Context, entry: object) -> None:
     ctx.shown_texts = _texts(screen) or None
     shown, now = _screen_hash(screen), _screen_hash(entry)
     if shown and now and shown != now:
-        note_action(ctx, shown)
+        note_action(ctx, shown, screen)

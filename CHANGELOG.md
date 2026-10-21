@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.149.0] - 2026-10-21
+## [1.150.0] - 2026-10-21
 
 ### Added
 
@@ -235,6 +235,36 @@ project adheres to [Semantic Versioning](https://semver.org/).
   passwords or codes.
 - `release.py` no longer runs the desktop gate or desktop tests and no
   longer builds or uploads the desktop DMG.
+- A wait for a screen change no longer passes on a progress text alone
+  (e.g. "Downloading... 0%"); it reports the step as still in
+  progress.
+- A change wait that times out now says when the action did not stick
+  (the screen went back) or when progress stalled.
+- A text wait that times out re-checks once with a fresh non-
+  accessibility read and names the source it read.
+- A run that fails or stops unfinished now gets a final verdict naming
+  how many steps never reached a verdict and the last problem; a run
+  the host abandons gets it when the server closes it as idle (about
+  5 minutes).
+- The server never sends screenshots or PNG paths to the host. Replies
+  are text only, and a note says screenshots are not shared.
+- Text built from an earlier capture now says how old it is, for
+  example "(captured 10 min ago)".
+- qa-doctor no longer installs an update while a run is active; it
+  reports it and installs when idle. A request id never gets two
+  replies across a restart.
+- Waits on an idle screen now make about half as many device calls per
+  step.
+- A tap that hits one of several same-named controls and changes
+  nothing now tells the host how many share the name, which id was
+  hit, and to use a more specific target.
+- Each tool reply's text is now logged, scrubbed and limited to about
+  600 characters.
+- qa-doctor no longer blames emulator speed when the run is on a
+  physical phone.
+- Each editor connection's qa-agents server now stops itself after 10
+  idle minutes and restarts on demand, so unused duplicate servers no
+  longer pile up.
 
 ### Known
 

@@ -84,6 +84,12 @@ def _stash_captures(screens: list, labels: list | None = None) -> list:
     return ids
 
 
+def _age_note(item: dict) -> str:
+    """`` (captured Nm ago)`` so text built from an old capture says how old it is (G06)."""
+    age = max(0, int(clock.now() - float(item.get("created_at") or 0)))
+    return f" (captured {age // 60} min ago)" if age >= 60 else ""
+
+
 def _peek_into(wanted: list, out: tuple) -> None:
     """Resolve the capped slice of *wanted* into ``out = (images, labels, missing)``."""
     images, labels, missing = out
@@ -98,7 +104,7 @@ def _peek_into(wanted: list, out: tuple) -> None:
             missing.append(cid or "(blank)")
             continue
         images.append(_tray_image_payload(item))
-        labels.append(f"{item['filename']} — {item['label']}")
+        labels.append(f"{item['filename']} — {item['label']}{_age_note(item)}")
 
 
 def _peek_overflow(wanted: list, missing: list) -> None:

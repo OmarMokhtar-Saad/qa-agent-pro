@@ -53,14 +53,12 @@ def _fa_reply_header(mode: str, capture: _FaCapture) -> str:
     if mode != "jira":
         header = f"_Mode: {mode} · screens captured: {capture.screens_captured}_\n\n"
     if capture.forwarded:
-        # The screens are ATTACHED to this reply, so the old two-branch
-        # vision disclosure would now be a lie in both directions: nothing
-        # was described server-side, and nothing was lost either.
+        # Owner rule (fix/1630, G05): no screenshot ever reaches the host.
         header += (
             "> ℹ️  "
-            f"{len(capture.forwarded)} captured screen(s) are attached to "
-            "this message as images. This server made NO vision call — "
-            "read them yourself.\n\n"
+            f"{len(capture.forwarded)} screen(s) were captured but screenshots "
+            "are never shared with you. This server made NO vision call — "
+            "describe the screens from the text above.\n\n"
         )
     elif capture.screens_captured:
         # Screens were captured and NOTHING described them (the server makes

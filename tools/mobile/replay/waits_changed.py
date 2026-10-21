@@ -14,7 +14,12 @@ from tools.mobile.replay.waits_dialog import answer_new_dialog
 from tools.mobile.replay.waits_gen import await_move
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_poll import _wait_deadline
-from tools.mobile.replay.waits_prior import already_changed, is_spinning
+from tools.mobile.replay.waits_prior import (
+    already_changed,
+    is_spinning,
+    origin_screen,
+)
+from tools.mobile.replay.waits_progress import added_progress, note_progress
 from tools.mobile.replay.waits_spec import _secs
 from tools.mobile.replay.waits_types import AfterWait
 
@@ -51,16 +56,17 @@ def _capped_ms(ctx: Context, ms: int) -> int:
 # last dump succeeded and the service is known fresh (``fresh_read.unchanged``).
 async def _wait_until_changed(ctx: Context, screen: object, ms: int) -> tuple:
     """Wait until the screen is not the one we started on: ``(screen, changed, reusable)``."""
-    before = _screen_hash(screen)
+    before, origin = _screen_hash(screen), origin_screen(ctx, screen)
     if already_changed(ctx, before, screen):
         return screen, True, True
     deadline = _wait_deadline(ctx, _capped_ms(ctx, ms) / 1000.0)
-    return await _changed_by_events(ctx, (screen, before), deadline)
+    return await _changed_by_events(ctx, (screen, before, origin), deadline)
 
 
 async def _changed_by_events(ctx: Context, start: tuple, deadline: float) -> tuple:
     """Re-baselining move loop of :func:`_wait_until_changed`."""
-    screen, before = start
+    screen, before = start[:2]
+    origin = start[2] if len(start) > 2 else screen
     base = a11y_events.latest(ctx.serial) or before
     ticker, look = watch.Ticker("waiting for the screen to change"), None
     while time.monotonic() < deadline:
@@ -71,12 +77,26 @@ async def _changed_by_events(ctx: Context, start: tuple, deadline: float) -> tup
         screen = look.tree
         if not moved:
             break
-        if _screen_hash(screen) != before:
+        if _moved_from(ctx, origin, screen):  # judged against the pre-action screen
             return screen, True, not is_spinning(screen)
         if system_dialog_package(screen):  # unchanged AND covered: stop waiting
             return screen, False, False
         base = look.clock or _screen_hash(screen)
     return await unchanged(ctx, (screen, look is not None), deadline)
+
+
+def _moved_from(ctx: Context, origin: object, screen: object) -> bool:
+    """True when *screen* is neither *origin* again (a revert) nor *origin* plus progress."""
+    return _screen_hash(screen) != _screen_hash(origin) and not _only_progress(
+        ctx, origin, screen
+    )
+
+
+def _only_progress(ctx: Context, origin: object, screen: object) -> bool:
+    """True when *screen* differs from *origin* by a progress text alone (G01); it is noted."""
+    found = added_progress(origin, screen)
+    note_progress(ctx, found)
+    return bool(found)
 
 
 def _changed_detail(op: str, wait_ms: int, changed: bool) -> str:

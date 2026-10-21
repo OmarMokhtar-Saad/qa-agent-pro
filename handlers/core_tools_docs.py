@@ -17,4 +17,4 @@ SEARCH_CORPUS_DOC = """Search the RAG corpus for similar past test cases or bug 
 CONFIGURE_JIRA_DOC = """DEPRECATED: Jira needs no credentials here; tickets are read through YOUR OWN Atlassian MCP connection. Stores NOTHING; never ask for an API token. If a ticket URL fails, call qa_prepare_test_cases and follow its directive."""
 
 # The description of `qa_capture_screens`, verbatim (continuation lines keep their indent).
-CAPTURE_SCREENS_DOC = """Capture screenshots from a connected phone/emulator: images PLUS one capture_id per screen, to ground cases in REAL screens (pass `capture_ids` to qa_prepare_test_cases). `count` = screens; `peek`=true: text; `names` ONLY if the user told you. `serial` aliases `device_id`."""
+CAPTURE_SCREENS_DOC = """Capture screens from a phone/emulator: one capture_id per screen (kept server-side, never sent to you); ground cases in REAL screens (pass `capture_ids` to qa_prepare_test_cases). `count` = screens; `peek`=true: text; `names` ONLY if the user told you. `serial` aliases `device_id`."""

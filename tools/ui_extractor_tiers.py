@@ -18,7 +18,7 @@ branch a text-only source wrongly satisfied.
 
 Host-mode boomerang: when a rendered page still yields no elements, make NO
 server-side vision call. The raw screenshot rides to the host's OWN
-multimodal model as MCP image content; ui_elements stays empty, which is the
+multimodal model (host-supplied only; this server sends no images); ui_elements stays empty, which is the
 same outcome cli/cursor already reached here.
 """
 

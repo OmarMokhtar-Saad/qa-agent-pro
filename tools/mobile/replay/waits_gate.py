@@ -32,6 +32,13 @@ HOLD_CAP_S = 0.5
 #: Pause (s) when the generation cannot be watched after all (a failed a11y read).
 HOLD_FALLBACK_S = 0.05
 
+#: G08: pause (s) a hold adds between two reads per earlier unmoved hold of the wait,
+#: up to ``HOLD_BACKOFF_MAX_S``. An idle screen is read at a falling rate (a 20 s wait
+#: made 140 adb calls, ~115 of them hold reads); the first hold of a wait and every
+#: wait on a moving screen still read back to back.
+HOLD_BACKOFF_STEP_S = 0.1
+HOLD_BACKOFF_MAX_S = 0.4
+
 
 @dataclass
 class Gate:
@@ -56,6 +63,12 @@ def token_of(serial: str) -> int | None:
 # Each checked hold read goes through ``observed_screen``, so it feeds ``screen_seen``'s
 # ring (``wait_guard.SEEN`` reads) like a real poll: a long hold can fill that
 # window sooner than the real polls alone would.
+def backoff_s(gate: Gate, until: float) -> float:
+    """The pause before the next hold read: grows with unmoved holds, never past *until*."""
+    wanted = min(HOLD_BACKOFF_MAX_S, HOLD_BACKOFF_STEP_S * (gate.idle - 1))
+    return max(0.0, min(wanted, until - time.monotonic()))
+
+
 async def _hold_reads(ctx: Context, gate: Gate, until: float) -> tuple:
     """Re-read the cheap a11y dump until the token moves or *until*.
 
@@ -68,11 +81,12 @@ async def _hold_reads(ctx: Context, gate: Gate, until: float) -> tuple:
             return False, None
         if token_of(ctx.serial) != gate.token:
             return True, None
-        if gate.met is None:
-            continue
-        screen = (await observed_screen(ctx, raw)).get("content")
-        if gate.met(None, screen):
-            return True, screen
+        if gate.met is not None:
+            screen = (await observed_screen(ctx, raw)).get("content")
+            if gate.met(None, screen):
+                return True, screen
+        if delay := backoff_s(gate, until):
+            await pause(delay)
     return False, None  # the cap or the deadline came first: a short pause
 
 

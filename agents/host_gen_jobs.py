@@ -72,7 +72,7 @@ def host_forward_images(
 # never enforced.
 def image_job_flags(host_img: bool, host_images: list, attested: int) -> _ImageFlags:
     """Decide the image job and its relevance/preflight/require stamps."""
-    _img_job = bool(host_img and (host_images or attested))
+    _img_job = bool(host_img and attested)
     _img_relevance = bool(_img_job)
     _img_preflight = bool(_img_relevance)
     _img_require = bool(

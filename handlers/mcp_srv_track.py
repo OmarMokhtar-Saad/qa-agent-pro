@@ -7,6 +7,7 @@ import asyncio
 from handlers import _lane
 from handlers.mcp_srv_drift import _inflight_exit
 from handlers.mcp_srv_progress import keepalive
+from handlers.mcp_srv_reply_log import log_reply
 from handlers.mcp_srv_toolcall import _capture_error, _close_tool_call, _open_tool_call
 from tools import dispatch_guard, tool_briefs
 
@@ -24,6 +25,9 @@ from tools import dispatch_guard, tool_briefs
 # looked for tool names in the log found none and picked no log at all. The
 # line belongs HERE, not in each handler, because this is the one seam every
 # tool already passes through and the name is a literal at each call site.
+#
+# The reply TEXT is logged separately, bounded and scrubbed, by
+# `mcp_srv_reply_log.log_reply` (G11); the handler's own inputs stay out.
 #
 # WHY IT CANNOT LEAK A PAYLOAD: this function is handed a NAME and an already
 # built coroutine. Ticket text, generated cases and test data are bound inside
@@ -98,4 +102,4 @@ async def _tracked_mobile_noted(name, ctx, coro):
 async def _kept(name, ctx, coro):
     """Await *coro* with the call's ONE keepalive running beside it (fix/1580 C01)."""
     async with keepalive(name, ctx):
-        return await coro
+        return log_reply(name, await coro)

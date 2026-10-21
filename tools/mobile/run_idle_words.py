@@ -27,6 +27,23 @@ class Progress(NamedTuple):
     actions: int
     last: str
     run_id: str = ""
+    undecided: int = 0
+    problem: str = ""
+
+
+def unjudged_line(total: int, undecided: int, problem: str) -> str:
+    """The verdict clause of a run that ended with steps that never got one, or ``""``."""
+    if not undecided:
+        return ""
+    line = f"unfinished: {undecided} of {total} steps did not reach a verdict"
+    return f"{line}; last: {problem}" if problem else line
+
+
+def problem_of(rows: list) -> str:
+    """Why the LAST step without a verdict stopped: its reason, else its title."""
+    open_rows = [c for c in rows if not c.get("verdict")]
+    last = open_rows[-1] if open_rows else {}
+    return " ".join(str(last.get("reason") or last.get("title") or "").split())[:200]
 
 
 def progress_of(run_id: str) -> Progress:
@@ -35,7 +52,8 @@ def progress_of(run_id: str) -> Progress:
     rows = [c for c in cases if isinstance(c, dict)]
     actions = sum(len(c.get("trace") or []) for c in rows)
     last = str(rows[-1].get("title") or rows[-1].get("tc_id") or "") if rows else ""
-    return Progress(len(rows), actions, last, run_id)
+    undecided = sum(1 for c in rows if not c.get("verdict"))
+    return Progress(len(rows), actions, last, run_id, undecided, problem_of(rows))
 
 
 def _clock(now: float) -> str:
@@ -54,7 +72,9 @@ def _head(p: Progress) -> str:
 def idle_reason(p: Progress, now: float) -> str:
     """Wording of a run the idle timer closed."""
     closed = f"closed by the server at {_clock(now)}"
-    return f"went idle {_head(p)}; {closed}. {resume_hint(p.run_id)}"
+    said = unjudged_line(p.turns, p.undecided, p.problem)
+    lead = f"{said}. " if said else ""
+    return f"{lead}went idle {_head(p)}; {closed}. {resume_hint(p.run_id)}"
 
 
 def died_reason(p: Progress, now: float) -> str:

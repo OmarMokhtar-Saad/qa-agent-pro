@@ -365,6 +365,178 @@ def orphan_watch(sup, parent_pid: int, on_gone=_end_orphan) -> None:
         stop.wait(ORPHAN_POLL_S)
 
 
+class ReplyLedger:
+    """Ids the client already has an answer for. A respawn re-sends or
+    replays requests, so the OLD and the NEW child can both answer one
+    id; the client must see only the first. Bounded: oldest ids go
+    first, and a request that reuses an id makes it answerable again."""
+
+    LIMIT = 512
+
+    def __init__(self) -> None:
+        self._ids = {}
+        self._lock = threading.Lock()
+
+    def requested(self, request_id) -> None:
+        """A client request with this id is now in flight."""
+        with self._lock:
+            self._ids.pop(repr(request_id), None)
+
+    def is_repeat(self, msg) -> bool:
+        """True when *msg* is a second reply to an id already answered."""
+        if not isinstance(msg, dict) or msg.get("method") or "id" not in msg:
+            return False
+        if "result" not in msg and "error" not in msg:
+            return False
+        key = repr(msg["id"])
+        with self._lock:
+            if key in self._ids:
+                return True
+            self._ids[key] = True
+            while len(self._ids) > self.LIMIT:
+                del self._ids[next(iter(self._ids))]
+        return False
+
+
+# mcp_srv_idle.IDLE_EXIT_CODE -- the child's DELIBERATE 'nothing to do for
+# a long while, free me' exit. The launcher keeps the client's stdio and
+# respawns the child on the next client message. The literals MUST stay
+# equal; tests/test_launcher_idle_out.py asserts it.
+IDLE_EXIT_CODE = 87
+
+
+class PendingRequests:
+    """Client requests written to the child and not yet answered. A child
+    that idles out can die with a request still unread in its pipe; those
+    (and only those) are re-sent to the next child. Bounded: oldest first
+    out."""
+
+    LIMIT = 512
+
+    def __init__(self) -> None:
+        self._lines = {}
+        self._lock = threading.Lock()
+
+    def written(self, msg, line) -> None:
+        """*line* reached the child; remember it when it wants a reply."""
+        if not msg.get("method") or "id" not in msg:
+            return
+        with self._lock:
+            self._lines[repr(msg["id"])] = line
+            while len(self._lines) > self.LIMIT:
+                del self._lines[next(iter(self._lines))]
+
+    def answered(self, msg) -> None:
+        """The child replied to this id (a reply has no method)."""
+        if "id" in msg and not msg.get("method"):
+            with self._lock:
+                self._lines.pop(repr(msg["id"]), None)
+
+    def unanswered(self) -> list:
+        with self._lock:
+            return list(self._lines.values())
+
+    def discard(self, msg) -> None:
+        """The write failed: forget the request again."""
+        with self._lock:
+            self._lines.pop(repr(msg.get("id")), None)
+
+
+def wake_child(sup) -> None:
+    """Respawn an idled-out child (no-op otherwise), replaying the handshake.
+    On a spawn error the child stays idled, so the next call retries."""
+    if not sup.idled:
+        return
+    with sup.child_lock:
+        if not sup.idled or sup.closing:
+            return
+        log.info("Client message after idle-out: respawning the MCP server.")
+        try:
+            sup.spawn(replay=True)
+        except Exception:
+            log.warning("Respawn after idle-out failed; retrying on the next message.")
+            _reap(sup.child)
+            raise
+        sup.idled = False
+
+
+def _reap(child) -> None:
+    """Kill a half-started child and free its pipe fds (a retry loop would leak them)."""
+    if child is None:
+        return
+    try:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+    except Exception:
+        pass
+    for pipe in (child.stdin, child.stdout):
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
+def fail_request(sup, line) -> None:
+    """Answer a request we cannot deliver with a JSON-RPC error."""
+    msg = _as_dict(line)
+    if not msg.get("method") or "id" not in msg:
+        return
+    sup.pending.answered({"id": msg["id"]})
+    text = "The qa-agents server could not be restarted."
+    error = {
+        "jsonrpc": "2.0",
+        "id": msg["id"],
+        "error": {"code": -32603, "message": text},
+    }
+    wire = json.dumps(error).encode() + b"\n"
+    # Tell the wire watchdog this id is answered: else it adds a second,
+    # contradictory error ~110 s later. True = it already answered it.
+    if not WIRE.seen("out", wire):
+        sup.write_lost(wire)
+
+
+def _mark_idle(sup, child):
+    """Flag the idle-out and snapshot the unread requests in ONE critical
+    section: wake_child needs child_lock, so a request that arrives after
+    this is written to the NEW child and can never also be in the snapshot.
+    None when this exit is stale (replaced child, closing)."""
+    with sup.child_lock:
+        if child is not sup.child or sup.closing:
+            return None
+        sup.idled = True
+        sup.respawn_failures = 0
+        return sup.pending.unanswered()
+
+
+def _resend(sup, lost) -> None:
+    try:
+        wake_child(sup)
+    except Exception:
+        for line in lost:
+            fail_request(sup, line)
+        return
+    with sup.child_lock:
+        for line in lost:
+            try:
+                sup.child.stdin.write(line)
+                sup.child.stdin.flush()
+            except Exception:
+                log.warning("Could not re-send a request after idle-out.")
+                fail_request(sup, line)
+
+
+def idle_out(sup, child) -> None:
+    """The child exited with IDLE_EXIT_CODE: stay down until the client
+    speaks, then re-send what it never read."""
+    lost = _mark_idle(sup, child)
+    if lost is None:
+        return
+    log.info("MCP server idled out (no tool or run) — it respawns on the next client message.")
+    if lost:
+        _resend(sup, lost)
+
+
 def _self_hash() -> str:
     try:
         with open(os.path.abspath(__file__), "rb") as fh:
@@ -455,6 +627,10 @@ class Supervisor:
         self.initialized = threading.Event()
         self.first_check_on_init = False
         self.swallow_id = None  # drop the child's reply to a REPLAYED initialize
+        self.replies = ReplyLedger()  # one reply per request id, across respawns
+        self.pending = PendingRequests()  # unanswered requests (idle-out resend)
+        self.idled = False  # child exited on purpose; respawn on client traffic
+        self.refresh_tools = False  # an update landed while idled: tell the client
         self.last_activity = time.time()
         self.closing = False
         self.restarting = False
@@ -481,6 +657,7 @@ class Supervisor:
     def spawn(self, replay: bool) -> None:
         env = dict(os.environ)
         env["QA_MCP_ENABLED"] = "true"  # the server refuses to start without it
+        env["MCP_LAUNCHER_IDLE_OK"] = "1"  # this launcher respawns it on demand
         with self.child_lock:
             self.child_started_at = time.time()
             # Re-stamped on EVERY start: applying a .env change clears it,
@@ -505,7 +682,8 @@ class Supervisor:
             target=self._pump_child_out, args=(self.child,), daemon=True
         ).start()
         self.rearm_setup_check()
-        if replay and self.handshake:
+        if replay and self.handshake and (not self.idled or self.refresh_tools):
+            self.refresh_tools = False
             # Tool schemas may have changed across the update — tell the
             # client to re-fetch tools/list, else it keeps stale cached
             # schemas until the editor restarts.
@@ -524,6 +702,11 @@ class Supervisor:
 
     def restart_child(self, reason: str) -> None:
         # A changed launcher.py hot-swaps the whole process instead.
+        if self.idled:
+            # Down on purpose; the next client message spawns on the new state,
+            # and that respawn must tell the client to re-fetch tool schemas.
+            self.refresh_tools = True
+            return
         self.maybe_self_exec(reason)
         with self.child_lock:
             self.restarting = True
@@ -613,7 +796,12 @@ class Supervisor:
                 except ValueError:
                     pass
             if self.maybe_hold_setup_check(line):
+                log.info("Held the qa-doctor reload notice (not sent to the client).")
                 continue  # answered after the reload, in this same call
+            self.pending.answered(_as_dict(line))
+            if self.replies.is_repeat(_as_dict(line)):
+                log.info("Dropped a second reply to an id the client already has.")
+                continue  # old and new child both answered one request id
             with self.stdout_lock:
                 out.write(line)
                 out.flush()
@@ -638,6 +826,9 @@ class Supervisor:
                 code = child.poll()
             except Exception:
                 code = None
+        if code == IDLE_EXIT_CODE:
+            idle_out(self, child)
+            return
         deliberate = code == DRIFT_EXIT_CODE
         if deliberate:
             # NOT a crash: mcp_server._drift_watch exits with exactly this
@@ -676,6 +867,8 @@ class Supervisor:
             WIRE.seen("in", line)
             msg = _as_dict(line)
             method = msg.get("method")
+            if method and "id" in msg:
+                self.replies.requested(msg["id"])
             if method == "initialize":
                 self.handshake = [line]
                 self.initialized.set()
@@ -688,13 +881,18 @@ class Supervisor:
             if _tool_call_name(msg) == SETUP_CHECK_TOOL:
                 self.note_setup_check(msg.get("id"), line)
             for _attempt in range(CHILD_WRITE_RETRIES):
-                with self.child_lock:
-                    child = self.child
+                # Recorded BEFORE the write (idle_out snapshots it); a failed
+                # wake or write takes it back out and the next attempt retries.
+                self.pending.written(msg, line)
                 try:
+                    wake_child(self)  # a spawn error must not kill the launcher
+                    with self.child_lock:
+                        child = self.child
                     child.stdin.write(line)
                     child.stdin.flush()
                     break
                 except Exception:
+                    self.pending.discard(msg)
                     # Child mid-restart -- retry on the new one. This budget
                     # MUST outlast the worst-case _respawn_delay, or the line
                     # is dropped and the editor waits forever on that id.
@@ -706,6 +904,7 @@ class Supervisor:
                     "within %d attempts.",
                     CHILD_WRITE_RETRIES,
                 )
+                fail_request(self, line)  # never leave the editor waiting
         # The editor closed our stdin: shut everything down.
         self.closing = True
         with self.child_lock:

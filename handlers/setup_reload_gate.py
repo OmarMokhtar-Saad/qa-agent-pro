@@ -8,9 +8,15 @@ import sys
 import threading
 import time
 
-from handlers import _common, export, setup_reload_marker, setup_reload_report
+from handlers import (
+    _common,
+    export,
+    setup_reload_marker,
+    setup_reload_report,
+    setup_update_idle,
+)
 from handlers.mcp_srv_state import _INFLIGHT, _INFLIGHT_LOCK
-from tools import updater
+from tools import updater, updater_peek
 
 # Baked by scripts/build_dist.py in the public distribution ("owner/repo").
 # Empty in the private checkout, which disables the on-demand update path.
@@ -133,6 +139,19 @@ def pending_reload_reason(update_status: str) -> str | None:
     return None
 
 
+async def update_status_for(repo: str) -> str:
+    """Install the update, or only peek for one while a host session is live."""
+    if setup_update_idle.session_busy():
+        # Installing would exit this server under the live session (G07).
+        return await asyncio.to_thread(updater_peek.peek_update, repo)
+    return await asyncio.to_thread(
+        updater.run_update_check,
+        force=True,
+        repo_override=repo,
+        lock_override=True,
+    )
+
+
 # Runs only on the dist edition with an update repo; otherwise ("", None).
 # ops-8: a scheduled reload ends this process within seconds, so the reply
 # is ONLY the honest headline -- see reloading_message for why splicing a
@@ -143,12 +162,7 @@ async def run_reload_gate(progress: _common.ProgressCb) -> tuple[str, str | None
         return "", None
 
     await _common.emit(progress, "⬆️ Checking for the latest release…")
-    update_status = await asyncio.to_thread(
-        updater.run_update_check,
-        force=True,
-        repo_override=_DIST_UPDATE_REPO,
-        lock_override=True,
-    )
+    update_status = await update_status_for(_DIST_UPDATE_REPO)
     reason = pending_reload_reason(update_status)
     if reason is None:
         return update_status, None
