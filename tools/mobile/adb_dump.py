@@ -9,8 +9,15 @@ import time
 
 from config.settings_guard import never_raise
 from tools import tool_status
-from tools.mobile import a11y_events, a11y_reread, dump_latency_state, step_timing
+from tools.mobile import (
+    a11y_events,
+    a11y_reread,
+    dump_latency_state,
+    dump_race,
+    step_timing,
+)
 from tools.mobile.adb_consts import DUMP_REMOTE_PATH, FIRST_DUMP_TIMEOUT_S
+from tools.mobile.adb_dump_errors import _dump_no_xml
 from tools.mobile.adb_host import host
 
 logger = logging.getLogger("tools.mobile.adb")
@@ -56,6 +63,7 @@ def set_dump_provider(serial: str, provider) -> None:
 
 def clear_dump_provider(serial: str) -> None:
     _DUMP_PROVIDERS.pop(str(serial), None)
+    dump_race.disarm(serial)
     a11y_events.record(serial, None)  # uiautomator dumps carry no event clock
 
 
@@ -91,41 +99,6 @@ async def _provider_dump(serial: str, provider) -> str | None:
     return xml
 
 
-def _device_said(said: str) -> dict:
-    """The refusal that quotes the device's own words first."""
-    # The device SPOKE, so its words LEAD (the first sentence is what the model reads).
-    return {
-        "error": (
-            "The device said: "
-            + said
-            + " -- uiautomator produced no XML for this screen. If "
-            "those words name a missing dump file, the dumper did not "
-            "run; a secure window (a password field or a payment "
-            "sheet) is one cause, and moving past it or using a screen "
-            "that allows accessibility is the fix."
-        ),
-        "content": None,
-    }
-
-
-def _dump_no_xml(said: str) -> dict:
-    """The refusal for a dump that did not produce XML; *said* is the device's
-    own (collapsed, capped) output, possibly empty."""
-    if said:
-        return _device_said(said)
-    # Nothing came back at all. There are no device words to lead with, so the
-    # likeliest cause is all this branch has to offer.
-    return {
-        "error": (
-            "uiautomator returned no XML for this screen and the device "
-            "said nothing. A secure window (a password field or a payment "
-            "sheet) blocks the dump; move past it or use a screen that "
-            "allows accessibility."
-        ),
-        "content": None,
-    }
-
-
 async def _fast_dump(serial: str, use_provider: bool) -> dict | None:
     """The provider's reply envelope when it answered cleanly, else ``None``."""
     provider = _DUMP_PROVIDERS.get(str(serial)) if use_provider else None
@@ -139,6 +112,14 @@ async def _fast_dump(serial: str, use_provider: bool) -> dict | None:
         return None
     step_timing.note_source(SOURCE_A11Y)
     return {"error": None, "content": fast_xml}
+
+
+def _race_won(fast: dict) -> str | None:
+    """A race-won tree through the normal path's cap/``<`` check and source tag."""
+    xml = _clean(fast)
+    if xml is not None:
+        step_timing.note_source(SOURCE_A11Y)
+    return xml
 
 
 def _over_cap() -> dict:
@@ -192,9 +173,27 @@ async def _bounded_dump(serial: str) -> dict:
     return read
 
 
+async def _fallback_dump(serial: str) -> dict:
+    """The uiautomator read as the ``uiautomator_dump`` envelope."""
+    return _dump_reply(await _bounded_dump(serial))
+
+
 async def uiautomator_dump(serial: str, *, use_provider: bool = True) -> dict:
     """The current screen's uiautomator XML, as a string."""
     fast = await _fast_dump(serial, use_provider)
     fast = fast or (a11y_reread.take(serial) if use_provider else None)
-    dump_latency_state.mark_slow(serial, use_provider and not fast)
-    return fast or _dump_reply(await _bounded_dump(serial))
+    if fast:
+        return fast
+    won: list = []
+
+    def accept(tree: dict) -> str | None:
+        xml = _race_won(tree)
+        won.extend([1] if xml is not None else [])
+        return xml
+
+    got = await dump_race.first(
+        serial, lambda: _fallback_dump(serial), accept if use_provider else None
+    )
+    # a race the service won is not a uiautomator sample (it must not shrink the budget)
+    dump_latency_state.mark_slow(serial, use_provider and not won)
+    return got

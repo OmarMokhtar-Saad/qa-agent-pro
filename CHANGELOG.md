@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.148.0] - 2026-10-21
+## [1.149.0] - 2026-10-21
 
 ### Added
 
@@ -218,6 +218,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - A wait's screen re-read while the screen is held is capped at 0.5 s,
   so a stuck event clock cannot hide the button it waits for, and text
   matching in waits respects word boundaries.
+- A run that reaches its goal is closed with its real result when the
+  report is written; the idle timer no longer relabels it unfinished,
+  and learning starts right away.
+- In a script that starts with a wait, `assert new_text` counts text
+  that appeared since the screen the host last saw, so text that showed
+  up while the host was thinking is not missed.
+- A passing goal's result line says how many turns failed on the way.
+- The screen reader recovers as soon as an installer or system dialog
+  stops hiding it, instead of waiting for the slow fallback.
+- An update running in another editor window no longer triggers a
+  needless self-heal or restart.
+- An orphaned MCP server exits within seconds.
+- Replies mask the tester inputs a run holds (a short 4-5 digit code
+  only when it stands alone), and the host is told not to repeat IDs,
+  passwords or codes.
+- `release.py` no longer runs the desktop gate or desktop tests and no
+  longer builds or uploads the desktop DMG.
 
 ### Known
 

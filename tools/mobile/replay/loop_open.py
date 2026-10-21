@@ -104,6 +104,14 @@ def _before_texts(op: str, screen: Any, previous: set | None) -> set | None:
     return _texts(screen)
 
 
+def _seed_from_shown(ctx: Context, op: str, state: Any) -> None:
+    """A script that opens on a wait takes the screen the model last saw as its
+    ``new_text`` baseline: the entry screen is already the app's answer."""
+    shown = getattr(ctx, "shown_texts", None)
+    if op in actions_mod.WAIT_OPS and state.baseline_texts is None and shown:
+        state.baseline_texts = set(shown)
+
+
 def _fresh_entry(index: int, action: Any, screen: Any) -> dict:
     """The trace entry for step *index*, stamped with the screen it starts on."""
     started = time.monotonic()
@@ -130,5 +138,6 @@ def _step_prelude(
     expected_id = _route_expected(run.ctx, index, len(run.items))
     if expected_id and expected_id != _screen_id(screen):
         return entry, _route_mismatch_stop(run, StepAt(index, entry, screen))
+    _seed_from_shown(run.ctx, op, state)
     state.baseline_texts = _before_texts(op, screen, state.baseline_texts)
     return entry, None

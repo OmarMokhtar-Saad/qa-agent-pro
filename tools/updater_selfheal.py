@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from tools.updater_heal import MANIFEST_HEAL_RETRY_INTERVAL_S, _manifest_heal_deferred
+from tools.updater_lock import _update_lock
 from tools.updater_log import logger
 from tools.updater_manifest import integrity_problems, lock_files
 from tools.updater_release import _Found, _heal_from_release, _release_of
@@ -65,6 +66,21 @@ def _relock_and_log(install_dir: Path) -> None:
         logger.debug("Code lock: all files already read-only.")
 
 
+# 2026-10-21 (E05): two launchers on one install both poll at the same
+# minute. One applies the new release while the other hashes the tree
+# half-overlaid and reports "29 locally modified files", then heals a tree
+# that was never drifted. Hashing under the update lock makes that
+# impossible: the check waits for no one (a held lock means an update is
+# in flight, so there is nothing to judge) and never sees a partial tree.
+def _problems_when_quiet(install_dir: Path) -> list | None:
+    """Integrity problems, or None while another process is updating."""
+    with _update_lock(install_dir) as acquired:
+        if not acquired:
+            logger.info("Integrity check skipped: an update is in flight.")
+            return None
+        return integrity_problems(install_dir)
+
+
 # Integrity pass for an up-to-date install: heal from the matching
 # release when files drifted, then re-lock. Returns the status string.
 # integrity_problems, not verify_integrity: a deleted or emptied
@@ -74,7 +90,9 @@ def _lock_and_heal(install_dir: Path, found: _Found) -> str:
     """Heal drifted files from the matching release, then re-lock."""
     status = "up-to-date"
     rel = _release_of(found)
-    mismatched = integrity_problems(install_dir)
+    mismatched = _problems_when_quiet(install_dir)
+    if mismatched is None:
+        return status  # peer mid-update: no chmod racing its swap
     same_release = _is_same_release(found)
     if same_release and _manifest_heal_deferred(install_dir, mismatched, found.remote):
         _log_heal_deferred(found.remote)

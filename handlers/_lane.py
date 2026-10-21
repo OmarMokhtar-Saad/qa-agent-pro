@@ -19,6 +19,7 @@ _API_PACKAGES = ("handlers.api_lane",)
 
 try:
     import handlers.mobile as mobile_lane
+    import tools.mobile.act_scrub as act_scrub
     import tools.mobile.adb as adb
     import tools.mobile.emulator as emulator
     import tools.mobile.host_way_on as host_way_on
@@ -33,6 +34,7 @@ except ImportError as exc:  # pragma: no cover - the dist-simulation test covers
     if (exc.name or "") not in _MOBILE_PACKAGES:
         raise
     mobile_lane = cast("Any", None)
+    act_scrub = cast("Any", None)
     adb = cast("Any", None)
     emulator = cast("Any", None)
     host_way_on = cast("Any", None)

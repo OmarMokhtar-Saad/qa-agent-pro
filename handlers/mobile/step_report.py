@@ -12,6 +12,7 @@ from tools.mobile import (
     finish_secret_scan,
     knowledge_close,
     media,
+    run_finalize_done,
     session_finish,
     session_records,
     session_runs,
@@ -77,6 +78,7 @@ async def _finish_run(run_id: str, session_token: str, body: dict) -> tuple:
     coverage = session_runs.coverage_line(
         resolved if isinstance(resolved, dict) else {}, rows_for_relay
     )
+    run_finalize_done.record(run_id, resolved, rows_for_relay)  # E01: final at close
     return resolved, rows_for_relay, coverage
 
 

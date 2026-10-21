@@ -145,6 +145,15 @@ def _strike(serial: str, error: str) -> None:
         a11y_bench.bench(serial, fetch_dump)
 
 
+async def _served(serial: str) -> dict:
+    """``fetch_dump`` plus the bookkeeping of a tree that is served (a raced one too)."""
+    got = await fetch_dump(serial)
+    if not got.get("error"):
+        reset_streaks(serial)
+        ime_proof.on_dump(serial)
+    return got
+
+
 async def provider(serial: str) -> dict:
     """The dump provider ``adb.uiautomator_dump`` consults; drops itself after repeated failures.
 
@@ -153,11 +162,8 @@ async def provider(serial: str) -> dict:
     (:mod:`tools.mobile.a11y_retry`); one that outlasts it falls back to
     uiautomator for that dump alone.
     """
-    got = await a11y_retry.until_tree(fetch_dump, serial)
+    got = await a11y_retry.until_tree(_served, serial)
     if got.get("error"):
         _strike(serial, str(got["error"]))
         a11y_events.record(serial, None)  # a failed read leaves no stale clock
-        return got
-    reset_streaks(serial)
-    ime_proof.on_dump(serial)
     return got

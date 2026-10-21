@@ -38,7 +38,8 @@ def relay_block(
     """The block a finished-run reply MUST start with; relayed word for word."""
     lines = [
         "RELAY THIS BLOCK WORD FOR WORD to the tester. Never upgrade, soften "
-        "or omit it.",
+        "or omit it. Do not repeat the tester's ID, password or one-time "
+        "code in your message, and keep your own reasoning out of it.",
         "verdict: " + (str(verdict).strip() or "unverified"),
         _reset_line(reset),
     ]

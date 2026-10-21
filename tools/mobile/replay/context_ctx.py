@@ -20,6 +20,9 @@ class Context:
     activity: str = ""
     guard_destructive: bool = True
     screen: dict | None = None
+    # Strings of the screen the model last SAW, read when a replay starts: a
+    # script that opens on a wait diffs ``new_text`` against it.
+    shown_texts: set | None = None
     # One tester-supplied value per field, held for THIS call only and never
     # written anywhere. ``case_runner`` fills it from the submit argument.
     tester_inputs: dict | None = None

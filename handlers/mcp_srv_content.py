@@ -129,4 +129,5 @@ async def _mobile_reply(spec: MobileReplySpec, ctx, fields: dict, **extra) -> li
         )
     # a stop never leaves the host without a way on (fix/1490)
     text = _lane.host_way_on.with_way_on(spec.name, text, _target_of(fields))
-    return [TextContent(type="text", text=text)]
+    # no reply echoes a tester input the run holds (E08)
+    return [TextContent(type="text", text=_lane.act_scrub.scrub(text))]

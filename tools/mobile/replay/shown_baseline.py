@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from tools.mobile import run_store
 from tools.mobile.replay.context import Context
-from tools.mobile.replay.screen import _screen_hash
+from tools.mobile.replay.screen import _screen_hash, _texts
 from tools.mobile.replay.waits_prior import note_action
 
 
@@ -26,6 +26,9 @@ def shown_hash(ctx: Context) -> str:
 
 def note_shown(ctx: Context, entry: object) -> None:
     """Arm the first change-wait as already satisfied when *entry* is not what the model saw."""
-    shown, now = shown_hash(ctx), _screen_hash(entry)
+    run_id = str(getattr(ctx, "run_id", "") or "")
+    screen = run_store.latest_screen(run_id) if run_id else {}
+    ctx.shown_texts = _texts(screen) or None
+    shown, now = _screen_hash(screen), _screen_hash(entry)
     if shown and now and shown != now:
         note_action(ctx, shown)

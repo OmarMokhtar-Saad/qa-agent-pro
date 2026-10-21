@@ -38,16 +38,35 @@ def _issues_html(facts: list, kinds: dict) -> str:
     return ('<ul class="issues">' + "".join(items) + "</ul>") if items else ""
 
 
-def _goal_lines(groups: list) -> list:
-    """One result line per goal."""
-    return [
+def _stumbles(cases: list) -> str:
+    """``"4 of 12 turns failed on the way"``, or ``""`` when no turn ended failed."""
+    rows = [c for c in cases if isinstance(c, dict)]
+    failed = sum(1 for c in rows if str(c.get("status")) == "failed")
+    return (
+        " (%d of %s failed on the way)" % (failed, _count(len(rows), "turn"))
+        if failed
+        else ""
+    )
+
+
+def _goal_line(group: dict) -> str:
+    """One goal's result line; a Pass names the turns that failed on the way."""
+    result = _goal_result(group["cases"])
+    note = _stumbles(group["cases"]) if result == "pass" else ""
+    return (
         '<li class="result">'
-        + _result_pill(_goal_result(group["cases"]))
+        + _result_pill(result)
         + '<span dir="auto">'
         + esc(mask_id(mask_cues(group["goal"])), 400)
-        + "</span></li>"
-        for group in groups
-    ]
+        + "</span>"
+        + ('<span class="rcount">' + esc(note, 80) + "</span>" if note else "")
+        + "</li>"
+    )
+
+
+def _goal_lines(groups: list) -> list:
+    """One result line per goal."""
+    return [_goal_line(group) for group in groups]
 
 
 def _scripted_line(scripted: list) -> str:

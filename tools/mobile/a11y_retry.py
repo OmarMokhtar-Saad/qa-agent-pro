@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
-from tools.mobile import adb_dump, dump_latency_state, step_timing
+from tools.mobile import adb_dump, dump_latency_state, dump_race, step_timing
 
 #: The longest a dump re-asks, in ms.
 RETRY_CAP_MS = 400
@@ -41,7 +41,13 @@ class Budget:
 
 
 def budget_ms(serial: str) -> int:
-    """:data:`RETRY_CAP_MS`, or the uiautomator p90 of *serial* when that is smaller."""
+    """:data:`RETRY_CAP_MS`, or the uiautomator p90 of *serial* when that is smaller.
+
+    0 while the last race was won by the fallback (:mod:`tools.mobile.dump_race`): the
+    window is held by another owner, so the re-ask would only delay the race.
+    """
+    if dump_race.blind(serial):
+        return 0
     for source in FALLBACK_SOURCES:
         p90 = dump_latency_state.p90_ms(serial, source)
         if p90 is not None:
@@ -61,6 +67,7 @@ async def until_tree(ask: Ask, serial: str, budget: Budget | None = None) -> dic
     """*ask*'s first answer, re-asked while it is ``no_window`` and the budget lasts."""
     got = await ask(serial)
     if not _refused(got):
+        dump_race.disarm(serial)
         return got
     limit = budget or Budget(budget_ms(serial))
     started, end, asks = limit.now(), limit.deadline(), 0
@@ -70,4 +77,8 @@ async def until_tree(ask: Ask, serial: str, budget: Budget | None = None) -> dic
     if asks:
         name = "a11y_retry_expired" if _refused(got) else "a11y_retry"
         _noted(name, asks, limit.now() - started)
+    if _refused(got):
+        dump_race.arm(serial, ask)
+    else:
+        dump_race.disarm(serial)
     return got

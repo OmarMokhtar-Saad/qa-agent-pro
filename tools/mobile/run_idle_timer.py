@@ -64,7 +64,7 @@ def _fire(run_id: str) -> None:
 
 async def _expire(run_id: str) -> None:
     """Close *run_id* when it is idle, else wait out what is left."""
-    if run_finalize.stop_text(_manifest(run_id)):
+    if run_finalize.recorded(_manifest(run_id)):  # a recorded verdict is final
         return
     idle = lock_reaper.idle_seconds(run_id)
     limit = lock_reaper.IDLE_RELEASE_TIMEOUT_S
