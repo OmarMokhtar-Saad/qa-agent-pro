@@ -22,10 +22,16 @@ STOP_COMPLETED = "completed"
 _WORDS = {"pass": "passed", "fail": "failed", "unverified": "not verified"}
 
 
-def _stumbled(rows: list) -> str:
-    """``"9 failed and 1 interrupted"`` for turns that ended badly, or ``""``."""
+def _counts(rows: list) -> tuple[int, int]:
+    """(failed, interrupted) turn counts."""
     failed = sum(1 for r in rows if r.get("status") == "failed")
     stopped = sum(1 for r in rows if r.get("status") == "abandoned")
+    return failed, stopped
+
+
+def _stumbled(rows: list) -> str:
+    """``"9 failed and 1 interrupted"`` for turns that ended badly, or ``""``."""
+    failed, stopped = _counts(rows)
     said = [f"{failed} failed"] if failed else []
     if stopped:
         said.append(f"{stopped} interrupted")
@@ -61,7 +67,8 @@ def record(run_id: str, resolved: Any, rows: Any) -> bool:
     """Finalize *run_id* with the verdict its report states. True when written."""
     listed = [r for r in list(rows or []) if isinstance(r, dict)]
     word = session_records.run_verdict(resolved, listed)
-    verdict = Verdict(word, _reason(word, listed), ("run report",))
+    failed, stopped = _counts(listed) if word == "pass" else (0, 0)
+    verdict = Verdict(word, _reason(word, listed), ("run report",), failed, stopped)
     try:
         written = run_finalize.finalize(run_id, verdict, stop=STOP_COMPLETED)
     except RuntimeError:  # finalize raises this; the report must still reach the tester

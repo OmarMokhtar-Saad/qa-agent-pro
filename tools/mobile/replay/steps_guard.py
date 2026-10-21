@@ -24,6 +24,7 @@ from tools.mobile.replay.guard import (
 )
 from tools.mobile.replay.steps_label import _guard_label
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
+from tools.mobile.replay.unlabeled_tap import names_target, unlabeled_hit
 
 
 class Tripped(NamedTuple):
@@ -116,6 +117,8 @@ def _guard_stop(run: _ReplayRun, step: _Step, at: StepAt) -> dict | None:
     ctx, op, entry, screen = run.ctx, step.op, step.entry, at.screen
     label, judged_node = _guard_label(step, screen)
     hit = destructive_hit(label)
+    if not hit and not names_target(step.element, screen):  # see unlabeled_tap
+        hit = unlabeled_hit(op, judged_node, screen)
     if not hit and op == "press":  # IME action: see the `press` branch above
         hit = screen_hit(screen, ctx.package)
     if not hit and judged_node is not None:  # LAST: see the judged-node branch

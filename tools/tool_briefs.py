@@ -40,10 +40,10 @@ MOBILE_REMINDER_MAX_CHARS = 300
 
 #: Rides every packet after the first of a chat, in place of ``MOBILE_BRIEF``.
 MOBILE_REMINDER = (
-    "Reminder (full rules in step 1): act from the element list by its #n "
+    "Reminder (full rules: the first packet of this chat): act from the element list by its #n "
     "index. One step = every action possible on THIS screen (fill all fields, "
-    "tick, tap Next); do not guess the next screen. Answer in the step-1 "
-    "form, via qa_submit_mobile_step only."
+    "tick, tap Next); do not guess the next screen. Answer in the "
+    "form given there, via qa_submit_mobile_step only."
 )
 
 MOBILE_BRIEF = MOBILE_BRIEF_TEXT

@@ -124,6 +124,7 @@ from tools.mobile.run_memo import (  # noqa: F401
     _briefing_path,
     _screen_memo_path,
     briefed_session,
+    chat_has_block,
     clear_briefing,
     clear_screen,
     last_screen,

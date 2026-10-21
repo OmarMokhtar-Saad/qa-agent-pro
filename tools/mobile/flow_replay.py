@@ -14,6 +14,7 @@ import time
 from typing import Any, NamedTuple
 
 from tools.mobile import (
+    flow_replay_fresh,
     flow_replay_match,
     flow_replay_note,
     flow_replay_record,
@@ -24,6 +25,7 @@ from tools.mobile import (
     flow_replay_visited,
     flow_stats,
     held_inputs,
+    kstg_flow_sig,
     media,
     session_explore_ids,
     step_timing,
@@ -75,8 +77,9 @@ def _resume(body: dict, key: Any, package: str) -> tuple:
     if name and last.get("retry"):
         got = flow_replay_match.template(package, name)
         pos = int(last.get("pos") or 0)
-        if got and flow_replay_match.starts(got, key, pos):
-            return name, got, pos
+        if got and flow_replay_fresh.same_shape(last, got):
+            if flow_replay_match.starts(got, key, pos):
+                return name, got, pos
     return flow_replay_match.pick(package, key, last.get("done") or ())
 
 
@@ -91,6 +94,7 @@ def _record(
         "pos": walk.pos,
         "start": head.start,
         "total": len(head.template.get("steps") or []),
+        "sig": kstg_flow_sig.of_template(head.template),
         "done": [] if retry else done[-MAX_CHAIN * 2 :],
         "why": walk.why,
         "retry": retry,

@@ -103,8 +103,6 @@ def _heard_after(serial: str, digest: str) -> bool:
 
 async def judged(serial: str, digest: str, confirm: Confirm) -> "dict | None":
     """``None`` when the clock proves the repeat, else the result of *confirm*."""
-    if a11y_unchecked.reuse(serial, digest):
-        return None
     if no_event_since(serial, digest):
         _SEEN[serial].skips += 1
         step_timing.note(BY_CLOCK_NOTE)
@@ -112,6 +110,9 @@ async def judged(serial: str, digest: str, confirm: Confirm) -> "dict | None":
     if _heard_after(serial, digest):
         _SEEN[serial].heard += 1
         step_timing.note(BY_EVENT_NOTE)
+        return None
+    # H04: a blind reuse is the last resort, after the event clock had its say.
+    if a11y_unchecked.reuse(serial, digest):
         return None
     refused = await confirm()
     seen = _SEEN.get(serial)

@@ -13,6 +13,17 @@ from tools.mobile.saud_names import _rid_name
 CALL_WORDS = frozenset({"calling", "ringing", "dialing", "dialling", "end call"})
 TAP_OPS = ("tap", "tap_text", "tap_text_if_present")
 _TOP_TEXTS = 4
+#: The guard term of a tap on a control that has no name (a lexicon entry, so
+#: the stop is confirmable like any other control stop).
+UNNAMED_TERM = "unnamed control"
+
+
+def unlabeled_hit(op: str, node: Any, screen: Any = None) -> str:
+    """:data:`UNNAMED_TERM` when a tap lands on a node with no text,
+    description, contained text or id name; else ``""``."""
+    if op not in TAP_OPS:
+        return ""
+    return UNNAMED_TERM if is_unlabeled(node, screen) else ""
 
 
 def is_unlabeled(element: Any, screen: Any = None) -> bool:
@@ -23,6 +34,11 @@ def is_unlabeled(element: Any, screen: Any = None) -> bool:
         return False
     words = element_label(dict(element, cls="", rid=""), screen)  # text/desc/children
     return not words
+
+
+def names_target(element: Any, screen: Any = None) -> bool:
+    """True when the step's own element carries a name (text, desc, id name)."""
+    return isinstance(element, dict) and not is_unlabeled(element, screen)
 
 
 def _texts(screen: Any) -> list[str]:

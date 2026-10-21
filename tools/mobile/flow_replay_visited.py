@@ -11,7 +11,12 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Any
 
-from tools.mobile import flow_replay_match, flow_replay_note, host_flow_goal
+from tools.mobile import (
+    flow_replay_fresh,
+    flow_replay_match,
+    flow_replay_note,
+    host_flow_goal,
+)
 
 _KEEP_RUNS = 64
 _KEEP_PACKAGES = 12
@@ -55,8 +60,9 @@ def resume(body: dict, ctx: Any, key: Any) -> tuple:
     if name and last.get("retry"):
         got = flow_replay_match.template(package, name)
         pos = int(last.get("pos") or 0)
-        if got and flow_replay_match.starts(got, key, pos):
-            return package, name, got, pos
+        if got and flow_replay_fresh.same_shape(last, got):
+            if flow_replay_match.starts(got, key, pos):
+                return package, name, got, pos
     return "", "", {}, 0
 
 

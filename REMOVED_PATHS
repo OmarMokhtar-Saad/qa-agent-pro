@@ -82,3 +82,4 @@ tools/mcp_handlers/submit_category.py
 tools/mcp_handlers/submit_suite.py
 tools/mcp_handlers/suite_tools.py
 tools/mcp_handlers/wizard.py
+handlers/gprep_select.py

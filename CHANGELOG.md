@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.151.0] - 2026-10-21
+## [1.152.0] - 2026-10-21
 
 ### Added
 
@@ -285,8 +285,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
   steps instead of paying an 11 s confirmation dump each time.
 - A physical phone is no longer told to switch to an emulator; the
   note names the animating screen.
-- An App Tester list scan that reads nothing gives up after about 25 s
-  with a clear reason, and one scan learns the labels of every app in
+- An App Tester list scan that reads nothing gives up about 25 s after
+  the install attempt started, with a clear reason, and one scan learns the labels of every app in
   the list.
 - A goal's invalid JSON is reported with its line and column.
 - A goal that names an app is no longer run against the last-used app;
@@ -299,14 +299,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
   that tap by the card's label.
 - The model is told up to 3 known flows plus a route map of known
   screens and taps, and saved edges record what was tapped.
-- A tap on a control with no name says what it opened and flags a call
-  screen; voice-call, video-call and dial controls need the host's
-  confirm flag.
+- A tap on a control with no name, description or id is stopped
+  before it fires and the tester can confirm it; voice-call, video-call
+  and dial controls need the host's confirm flag.
 - An optional tap says what it tapped, and an empty screen read stops
   for the model instead of passing as "not present".
 - The mobile tool brief sent at the start of a run is about 4%
   shorter: duplicated argument and credential rules are gone, no rule
   was dropped.
+- A run that passes despite failed turns records the failed and
+  interrupted turn counts in its final verdict, not only in the reason.
+- A launcher update that lands while the server is idle applies at
+  once, with no editor restart.
+- Learned flows include the App Tester and installer steps that led
+  to the app, so the whole install-and-open route is replayed. A paused
+  replay is dropped when its saved flow has since changed.
+- A repeated screen that could not be checked is reused only after the
+  event clock gave no proof, and a changed screen forgets old reuses.
+- A new run in a chat that already holds the tool brief is not sent it
+  again, which makes the start reply much smaller.
+- A long "Installing..." screen is waited out for up to 180 s, and a
+  download that fell back to its start button is reported as stalled.
+- Waits for an element end early once the screen content stays the
+  same for 10 s, even while minor events keep arriving.
+- "app list" alone in a goal no longer makes a quoted word count as
+  the app to install.
 
 ### Known
 

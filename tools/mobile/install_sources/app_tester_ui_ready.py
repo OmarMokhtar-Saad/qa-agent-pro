@@ -17,6 +17,7 @@ from tools.mobile.install_sources import app_tester_ui_memory as memory
 from tools.mobile.install_sources.app_tester_ui_consts import (
     ACTION_LABELS,
     APP_TESTER_POLL_S,
+    NO_ROWS_S,
     OPEN_LABEL,
     READ_BUDGET_S,
     SleepFn,
@@ -72,11 +73,20 @@ async def wait_page_ready(run: _Run, sleep: SleepFn) -> str:
     return xml
 
 
+def _read_end(run: _Run) -> float:
+    """When reads stop: READ_BUDGET_S from now, and while no list row has been
+    read yet also no later than the NO_ROWS_S box of the attempt (H15)."""
+    end = time.monotonic() + READ_BUDGET_S
+    if run.offsets or run.card_tapped:
+        return end
+    return min(end, run.started + NO_ROWS_S)
+
+
 async def read_drawn(run: _Run, sleep: SleepFn) -> Optional[str]:
     """The screen's XML once it holds any text, at most BLANK_REREADS reads.
     None when no read worked; an empty screen's XML when it stayed empty."""
     xml: Optional[str] = None
-    end = time.monotonic() + READ_BUDGET_S
+    end = _read_end(run)
     for _ in range(BLANK_REREADS):
         shot = await run.ui.screen()
         if shot is not None:

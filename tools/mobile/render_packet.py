@@ -76,8 +76,9 @@ STATIC_FIELDS: tuple[str, ...] = (
 #: server cannot parse does not bring it back.
 STATIC_OMITTED_NOTE = (
     "System prompt, action vocabulary and untrusted-data notice: unchanged "
-    "since the FIRST packet of this run; read them there. If they are gone "
-    "from your context, send your best attempt anyway."
+    "since the first packet this chat got them (this run or an earlier one); "
+    "read them there. If they are gone from your context, start the run "
+    "without session_token to get them again."
 )
 
 

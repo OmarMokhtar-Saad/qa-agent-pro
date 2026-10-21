@@ -50,6 +50,10 @@ class Verdict:
     outcome: str
     reason: str
     evidence: tuple = ()
+    #: Turns that ended failed / interrupted; recorded in ``final`` when set, so a
+    #: "pass" that hid failures is told apart without parsing ``reason``.
+    failed_turns: int = 0
+    interrupted_turns: int = 0
 
     def line(self) -> str:
         return self.outcome + ": " + self.reason

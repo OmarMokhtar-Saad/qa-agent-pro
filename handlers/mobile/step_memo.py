@@ -84,6 +84,9 @@ def _mobile_briefing_memo(shown: dict, run_id: str, token: str) -> tuple[dict, b
             shown = _without_briefed(shown, block_hash)
             brief_needed = False
         else:
+            if mobile_run_store.chat_has_block(token, block_hash, run_id):
+                shown = mobile_render.without_static(shown, block_hash)
+                brief_needed = False
             mobile_run_store.mark_briefed(run_id, token, block_hash)
         shown = _schema_once(shown, run_id)
         shown = repeat_once(shown, run_id)

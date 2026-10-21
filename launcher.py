@@ -632,6 +632,7 @@ class Supervisor:
         self.idled = False  # child exited on purpose; respawn on client traffic
         self.refresh_tools = False  # an update landed while idled: tell the client
         self.last_activity = time.time()
+        self.intake = threading.Lock()  # held while a client line is handled
         self.closing = False
         self.restarting = False
         self.self_hash = _self_hash()
@@ -700,12 +701,22 @@ class Supervisor:
             except Exception:
                 log.debug("could not send tools/list_changed", exc_info=True)
 
+    def client_busy(self) -> bool:
+        """True while an exec would drop client traffic: unanswered requests,
+        or (idled) activity inside the idle window."""
+        if self.pending.unanswered():
+            return True
+        return self.idled and time.time() - self.last_activity < IDLE_SECONDS
+
     def restart_child(self, reason: str) -> None:
         # A changed launcher.py hot-swaps the whole process instead.
         if self.idled:
             # Down on purpose; the next client message spawns on the new state,
             # and that respawn must tell the client to re-fetch tool schemas.
             self.refresh_tools = True
+            # A changed launcher.py must not wait for the next restart: no child
+            # is running, so the re-exec only hands the handshake over.
+            self.maybe_self_exec(reason)
             return
         self.maybe_self_exec(reason)
         with self.child_lock:
@@ -746,7 +757,9 @@ class Supervisor:
             )
             return
         log.info("Launcher code changed on disk — re-exec (%s).", reason)
-        with self.child_lock:
+        with self.intake, self.child_lock:
+            if self.client_busy():  # retried on the next update tick
+                return
             self.restarting = True
             if self.child is not None and self.child.poll() is None:
                 self.child.terminate()
@@ -860,51 +873,55 @@ class Supervisor:
         self.restart_child(reason)
         self.resend_setup_check()
 
+    def forward_client_line(self, line: bytes) -> None:
+        self.last_activity = time.time()
+        WIRE.seen("in", line)
+        msg = _as_dict(line)
+        method = msg.get("method")
+        if method and "id" in msg:
+            self.replies.requested(msg["id"])
+        if method == "initialize":
+            self.handshake = [line]
+            self.initialized.set()
+            _write_session_state()
+        elif method == "notifications/initialized" and self.handshake:
+            self.handshake = self.handshake[:1] + [line]
+        elif method == "tools/list":
+            # The client re-fetched schemas — record the fresh version.
+            _write_session_state()
+        if _tool_call_name(msg) == SETUP_CHECK_TOOL:
+            self.note_setup_check(msg.get("id"), line)
+        for _attempt in range(CHILD_WRITE_RETRIES):
+            # Recorded BEFORE the write (idle_out snapshots it); a failed
+            # wake or write takes it back out and the next attempt retries.
+            self.pending.written(msg, line)
+            try:
+                wake_child(self)  # a spawn error must not kill the launcher
+                with self.child_lock:
+                    child = self.child
+                child.stdin.write(line)
+                child.stdin.flush()
+                break
+            except Exception:
+                self.pending.discard(msg)
+                # Child mid-restart -- retry on the new one. This budget
+                # MUST outlast the worst-case _respawn_delay, or the line
+                # is dropped and the editor waits forever on that id.
+                time.sleep(CHILD_WRITE_RETRY_SLEEP_S)
+        else:
+            # Never silent: a dropped request is an editor hang.
+            log.warning(
+                "Dropped a client request: the server did not come back "
+                "within %d attempts.",
+                CHILD_WRITE_RETRIES,
+            )
+            fail_request(self, line)  # never leave the editor waiting
+
     def pump_client_in(self) -> None:
         stdin = sys.stdin.buffer
         for line in iter(stdin.readline, b""):
-            self.last_activity = time.time()
-            WIRE.seen("in", line)
-            msg = _as_dict(line)
-            method = msg.get("method")
-            if method and "id" in msg:
-                self.replies.requested(msg["id"])
-            if method == "initialize":
-                self.handshake = [line]
-                self.initialized.set()
-                _write_session_state()
-            elif method == "notifications/initialized" and self.handshake:
-                self.handshake = self.handshake[:1] + [line]
-            elif method == "tools/list":
-                # The client re-fetched schemas — record the fresh version.
-                _write_session_state()
-            if _tool_call_name(msg) == SETUP_CHECK_TOOL:
-                self.note_setup_check(msg.get("id"), line)
-            for _attempt in range(CHILD_WRITE_RETRIES):
-                # Recorded BEFORE the write (idle_out snapshots it); a failed
-                # wake or write takes it back out and the next attempt retries.
-                self.pending.written(msg, line)
-                try:
-                    wake_child(self)  # a spawn error must not kill the launcher
-                    with self.child_lock:
-                        child = self.child
-                    child.stdin.write(line)
-                    child.stdin.flush()
-                    break
-                except Exception:
-                    self.pending.discard(msg)
-                    # Child mid-restart -- retry on the new one. This budget
-                    # MUST outlast the worst-case _respawn_delay, or the line
-                    # is dropped and the editor waits forever on that id.
-                    time.sleep(CHILD_WRITE_RETRY_SLEEP_S)
-            else:
-                # Never silent: a dropped request is an editor hang.
-                log.warning(
-                    "Dropped a client request: the server did not come back "
-                    "within %d attempts.",
-                    CHILD_WRITE_RETRIES,
-                )
-                fail_request(self, line)  # never leave the editor waiting
+            with self.intake:
+                self.forward_client_line(line)
         # The editor closed our stdin: shut everything down.
         self.closing = True
         with self.child_lock:

@@ -10,8 +10,14 @@ _QUOTED = re.compile(
 )
 _SENTENCE_END = re.compile(r"[.;!?](?=\s|$)|\n")
 _INSTALL_CUE = re.compile(
-    r"app\s*tester|install|update|download|\bbuild\b|(?:app|display)\s+name"
-    r"|app\s+list",
+    r"app\s*tester|install|update|download|\bbuild\b|(?:app|display)\s+name",
+    re.IGNORECASE,
+)
+#: "app list" only counts inside a goal that is an install flow somewhere else;
+#: alone it is a screen of the app under test ('open the app list, tap "Settings"').
+_LIST_CUE = re.compile(
+    r"(?:scroll|find|locate|look\s+for|search|select|pick|choose)\b[^.;!?\n]*"
+    r"app\s+list|app\s+list\b[^.;!?\n]*\b(?:until|for)\b",
     re.IGNORECASE,
 )
 _MAX_WORDS = 5
@@ -24,6 +30,13 @@ _CLAUSE_END = re.compile(
 _NOT_A_NAME = frozenset(
     "tester list store name icon drawer screen bar page button menu distribution".split()
 )
+
+
+def _cued(part: str, text: str) -> bool:
+    """Whether sentence *part* of goal *text* carries an install cue."""
+    if _INSTALL_CUE.search(part):
+        return True
+    return bool(_LIST_CUE.search(part) and _INSTALL_CUE.search(text))
 
 
 def _sentence(goal: str, match: re.Match) -> str:
@@ -50,7 +63,7 @@ def _names_after(text: str, cue: re.Pattern) -> set:
     """The unquoted names after ``cue`` in the install sentences of ``text``."""
     names: set = set()
     for part in _SENTENCE_END.split(text):
-        if _INSTALL_CUE.search(part):
+        if _cued(part, text):
             names |= {_unquoted_name(part, c) for c in cue.finditer(part)}
     names.discard(None)
     return names
@@ -72,7 +85,7 @@ def _install_quoted(text: str) -> set:
     return {
         next(g for g in m.groups() if g).strip()
         for m in _QUOTED.finditer(text)
-        if _INSTALL_CUE.search(_sentence(text, m))
+        if _cued(_sentence(text, m), text)
     }
 
 

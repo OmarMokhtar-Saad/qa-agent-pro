@@ -55,7 +55,6 @@ DESTRUCTIVE_LEXICON = (
     # transfer confirmation headed "Transfer to Ahmed", a button labelled
     # plainly "Send" is not stopped, and neither are "Send $50", "Send to
     # Ahmed" or a rid of `btn_send`.
-    #
     # THE RESIDUAL, stated rather than implied, exactly as the no-label residual
     # below is: a send control on a money screen whose own label says only
     # "Send" is not stopped by this lexicon. For a TAP the guard stays on the
@@ -92,6 +91,7 @@ DESTRUCTIVE_LEXICON = (
     "audio call",
     "llamar",
     "appeler",
+    "unnamed control",  # no name at all (H18): see unlabeled_tap.unlabeled_hit
 )
 
 

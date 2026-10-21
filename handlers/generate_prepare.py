@@ -61,7 +61,6 @@ from handlers.gprep_run import (  # noqa: F401
     _missing_note_of,
     _prepare_generate,
 )
-from handlers.gprep_select import _select_prepare_images  # noqa: F401
 from handlers.gprep_split import (  # noqa: F401
     _split_body_blocks,
     _split_prepare_text_blocks,

@@ -19,6 +19,7 @@ reported instead of a success-shaped reply.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from config.settings_guard import never_raise
 from tools.mobile import (
@@ -58,12 +59,17 @@ def _clip(value: object) -> str:
 def _final_of(verdict: object, stop: str) -> dict:
     evidence = getattr(verdict, "evidence", None)
     lines = evidence if isinstance(evidence, (list, tuple)) else ()
-    return {
+    final: dict[str, Any] = {
         "outcome": _clip(getattr(verdict, "outcome", "")),
         "reason": _clip(getattr(verdict, "reason", "")),
         "evidence": [_clip(line) for line in lines[:MAX_EVIDENCE]],
         "stop": _clip(stop),
     }
+    for key in ("failed_turns", "interrupted_turns"):
+        count = getattr(verdict, key, 0)
+        if isinstance(count, int) and count > 0:
+            final[key] = count
+    return final
 
 
 def _read(run_id: str) -> dict:

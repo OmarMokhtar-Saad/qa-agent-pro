@@ -44,7 +44,8 @@ class _Scan:
             run.request.serial, run.request.app_label
         )
         self.cur: list = rows
-        self.deadline = time.monotonic() + LISTING_DEADLINE_S
+        self.began = time.monotonic()
+        self.deadline = self.began + LISTING_DEADLINE_S
         run.offsets.clear()
         run.scrolls.clear()
         self.note(rows, 0, below=True)
@@ -71,10 +72,10 @@ class _Scan:
         return self.pos > max(self.run.offsets.values(), default=-1)
 
     def alive(self, steps: int, extra: int = 0) -> bool:
-        if (
-            not self.rows
-            and time.monotonic() > self.deadline - LISTING_DEADLINE_S + NO_ROWS_S
-        ):
+        # as _read_end: after a card tap the attempt clock is spent on earlier
+        # screens, so a re-scan gets its own box from its own start
+        start = self.began if self.run.card_tapped else self.run.started
+        if not self.rows and time.monotonic() > start + NO_ROWS_S:
             return (
                 False  # nothing readable for NO_ROWS_S: fail with a reason, not at 90 s
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, NamedTuple, Optional, Protocol
 
@@ -96,6 +97,9 @@ class _Run:
     held_polls: int = 0
     #: one (direction, rows seen, new rows, offset) entry per scroll made.
     scrolls: list = field(default_factory=list)
+    #: when this attempt began; the no-rows box (NO_ROWS_S) counts from here, so
+    #: the reads made before the scan starts are inside it (H15).
+    started: float = field(default_factory=time.monotonic)
 
 
 class Seen(NamedTuple):

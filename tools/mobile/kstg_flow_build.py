@@ -17,6 +17,7 @@ from tools.mobile import (
     kstg_flow_popup,
     kstg_foreign,
     run_store,
+    target_pin,
 )
 from tools.mobile.app_flows_consts import MAX_FLOW_NAME_CHARS, OK_OUTCOMES
 
@@ -94,15 +95,43 @@ def _in_route(rec: dict, package: str) -> bool:
     return kstg_foreign.own(rec, package) or kstg_flow_popup.is_popup_tap(rec, package)
 
 
+def _first_own(steps: list, package: str) -> int:
+    """Index of the first step stamped with *package*; -1 when none is."""
+    return next(
+        (i for i, r in enumerate(steps) if kstg_foreign.observed(r) == package), -1
+    )
+
+
+def _approach(steps: list, package: str) -> list:
+    """The steps on transient surfaces (App Tester, installer) just before the app.
+
+    H20: the route to an app installed during the run starts on those surfaces; it is
+    saved under the app so the whole route can be replayed. The run of transient
+    screens ends at the first step on any other screen.
+    """
+    out: list = []
+    for rec in reversed(steps[: max(_first_own(steps, package), 0)]):
+        if not target_pin.transient(kstg_foreign.observed(rec)):
+            break
+        out.append(rec)
+    return out[::-1]
+
+
 def app_recs(steps: list, package: str) -> list:
     """The replayable step records of *package* that ran as planned and landed.
 
     A step that errored, found no element, needed the model, or whose screen never
     changed as expected (``landed`` False) is not part of the route, so it is left out.
     A tap on a popup (an OS permission dialog, or an in-app sheet that came and went)
-    stays, as an optional step (``kstg_flow_popup``).
+    stays, as an optional step (``kstg_flow_popup``). The transient screens that led
+    to the app (App Tester, installer) stay too (``_approach``).
     """
-    kept = [r for r in steps if _ran(r, package) and _in_route(r, package)]
+    lead = [id(r) for r in _approach(steps, package)]
+    kept = [
+        r
+        for r in steps
+        if _ran(r, package) and (_in_route(r, package) or id(r) in lead)
+    ]
     out: list = []
     for rec in kept:
         rec = kstg_flow_popup.as_optional(rec, package)

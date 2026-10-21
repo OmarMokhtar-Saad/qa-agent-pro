@@ -39,7 +39,10 @@ def refusal(serial: str, digest: str) -> dict:
 def reuse(serial: str, digest: str) -> bool:
     """True (and one reuse spent) when *digest* may be served without a dump."""
     row = _ROWS.get(str(serial))
-    if row is None or row[0] != digest:
+    if row is None:
+        return False
+    if row[0] != digest:
+        _ROWS.pop(str(serial), None)  # A -> B -> A must not revive A's reuses (H04)
         return False
     if row[1] <= 0:
         _ROWS.pop(str(serial), None)

@@ -30,6 +30,7 @@ The screen-block memo (:func:`last_screen`, :func:`mark_screen`,
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from pathlib import Path
 
 from tools.mobile import run_consts, run_io
@@ -43,6 +44,30 @@ from tools.mobile.run_memo_screen import (  # noqa: F401
 )
 
 logger = logging.getLogger("tools.mobile.run_store")
+
+# Chat scope: a chat (token) that already holds a static block needs no second
+# copy when it starts another run. In-process and bounded; a restart or a
+# missing entry reads as "not briefed", which sends the block whole.
+CHAT_BRIEFED_MAX = 64
+_CHAT_BRIEFED: OrderedDict[str, tuple[str, str]] = OrderedDict()
+
+
+def chat_has_block(token: str, static_hash: str, run_id: str) -> bool:
+    """Whether chat *token* got the block *static_hash* in an EARLIER run.
+
+    The same run never counts: an unreadable run marker must repeat the block.
+    """
+    seen = _CHAT_BRIEFED.get(token) if token and static_hash else None
+    return bool(seen and seen[0] == static_hash and seen[1] != run_id)
+
+
+def _note_chat_block(token: str, static_hash: str, run_id: str) -> None:
+    if not token or not static_hash:
+        return
+    _CHAT_BRIEFED[token] = (static_hash, run_id)
+    _CHAT_BRIEFED.move_to_end(token)
+    while len(_CHAT_BRIEFED) > CHAT_BRIEFED_MAX:
+        _CHAT_BRIEFED.popitem(last=False)
 
 
 def _briefing_path(run_id: str) -> Path:
@@ -92,6 +117,7 @@ def mark_briefed(run_id: str, session_id: str, static_hash: str = "") -> dict:
             "static_hash": _kept_hash(run_id, session_id, static_hash),
         }
         run_io._write_json(_briefing_path(run_id), body)
+        _note_chat_block(str(session_id), body["static_hash"], run_id)
         return {"error": None, "content": {"session_id": str(session_id)}}
     except Exception as exc:
         logger.exception("mobile.run_store.mark_briefed failed")
@@ -122,6 +148,7 @@ def clear_briefing(run_id: str) -> dict:
     try:
         if not run_io.valid_run_id(run_id):
             return {"error": "Invalid run id.", "content": None}
+        _CHAT_BRIEFED.pop(str(briefed_session(run_id).get("content") or ""), None)
         _briefing_path(run_id).unlink(missing_ok=True)
         return {"error": None, "content": {"cleared": True}}
     except Exception as exc:
