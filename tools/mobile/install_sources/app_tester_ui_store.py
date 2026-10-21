@@ -24,6 +24,7 @@ TTL_S: dict = {
     "pages": WEEK_S,
     "spages": WEEK_S,
     "rows": WEEK_S,
+    "seen": WEEK_S,
     "ids": WEEK_S,
     "latest": None,
 }

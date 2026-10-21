@@ -91,7 +91,10 @@ def text(head: Head, pos: int, why: str) -> str:
     """The whole note for a replay that ran steps ``head.start`` .. *pos* - 1."""
     total = len(head.template.get("steps") or [])
     named = labelled("`%s`" % head.name, head.template)
-    base = "auto-replayed flow %s: %s" % (named, _span(head, pos))
+    base = "auto-replayed saved flow %s (from an earlier run): %s" % (
+        named,
+        _span(head, pos),
+    )
     ran = done_lines(head, pos)
     steps = "\nreplayed: " + "; ".join(ran) if ran else ""
     for said in head.said:

@@ -19,6 +19,7 @@ from tools.mobile.install_sources.app_tester_ui_consts import (
     CHEAP_EMPTY_READ_S,
     LISTING_DEADLINE_S,
     MAX_LISTING_SCROLLS,
+    NO_ROWS_S,
     _Run,
 )
 from tools.mobile.install_sources.app_tester_ui_read import (
@@ -27,6 +28,7 @@ from tools.mobile.install_sources.app_tester_ui_read import (
     settled_rows,
 )
 from tools.mobile.install_sources.app_tester_ui_rows import list_at_top
+from tools.mobile.install_sources.app_tester_ui_unreadable import learn_labels
 
 
 class _Scan:
@@ -69,6 +71,13 @@ class _Scan:
         return self.pos > max(self.run.offsets.values(), default=-1)
 
     def alive(self, steps: int, extra: int = 0) -> bool:
+        if (
+            not self.rows
+            and time.monotonic() > self.deadline - LISTING_DEADLINE_S + NO_ROWS_S
+        ):
+            return (
+                False  # nothing readable for NO_ROWS_S: fail with a reason, not at 90 s
+            )
         return steps < MAX_LISTING_SCROLLS + extra and time.monotonic() < self.deadline
 
     async def _scroll(self, down: bool) -> list:
@@ -180,4 +189,5 @@ async def scan_listing(run: _Run, xml: str) -> tuple:
         await scan.up()
     run.pos = scan.pos
     run.top_pos = scan.top_pos
+    learn_labels(run.request.serial, scan.rows)
     return scan.rows, scan.found() or (scan.end and scan.top)

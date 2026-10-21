@@ -95,13 +95,19 @@ def newest_note(serial: str) -> str:
     )
 
 
-def refusal(serial: str) -> InstallOutcome:
-    """The fast "which app?" pick-list, listing the apps used before."""
+def refusal(serial: str, named: tuple = ()) -> InstallOutcome:
+    """The fast "which app?" pick-list, listing the apps used before.
+
+    *named*: quoted names the goal holds that are none of those apps (H17); said
+    first, so the host asks the user instead of the server reusing the last app."""
     labels = remembered_labels(serial)[:choices_shown]
     base = _label_required()
-    if not labels:
-        return base
-    listed = "; ".join(repr(label) for label in labels)
+    said = ""
+    if named:
+        said = " The goal names %s, which is none of the known apps." % "; ".join(
+            repr(n) for n in named
+        )
+    listed = " Used on this device before: %s." % "; ".join(map(repr, labels))
     return InstallOutcome(
-        False, base.code, base.message + " Used on this device before: " + listed + "."
+        False, base.code, base.message + said + (listed if labels else "")
     )

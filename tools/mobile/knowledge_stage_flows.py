@@ -145,6 +145,7 @@ def run(conn, lc) -> StageResult:
     result = StageResult("flows")
     flow_goal_migrate.run(lc.package)
     recs = kstg_flow_build.app_recs(lc.steps, lc.package)
+    recs = kstg_flow_packets.replayable_from(recs)
     if len(recs) >= kstg_flow_build.MIN_STEPS:
         _save_all(lc, (goal, recs), result)
     return result

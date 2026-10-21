@@ -41,6 +41,17 @@ async def _watch_text_or_calm(ctx: Context, screen: object, want: TextWait) -> t
     return found and _screen_has(latest, want.text), latest, bool(calm)
 
 
+def _empty_read(found: bool, screen: object, text: str) -> str:
+    """An optional tap cannot tell present from absent on an empty screen read."""
+    if found or (isinstance(screen, dict) and screen.get("elements")):
+        return ""
+    return (
+        "`" + str(text)[:80] + "`: the screen read came back empty (no elements), "
+        "so presence could not be checked and nothing was tapped. "
+        "Re-read the screen, then retry."
+    )
+
+
 async def present_read(ctx: Context, state: _ReplayState, at: tuple) -> tuple:
     """``(found, screen, interruption)`` for one optional tap; *at* is
     ``(step index, TextWait)``. The wait's interruption sentence is read here."""
@@ -52,4 +63,4 @@ async def present_read(ctx: Context, state: _ReplayState, at: tuple) -> tuple:
     interruption, ctx.wait_interruption = ctx.wait_interruption, ""
     if calm and not found and not interruption:
         note_calm(ctx, _screen_hash(screen))
-    return found, screen, interruption
+    return found, screen, interruption or _empty_read(found, screen, want.text)

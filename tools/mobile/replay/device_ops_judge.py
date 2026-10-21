@@ -111,8 +111,8 @@ def _recovery_text(secret: bool) -> str:
     """What the model is asked to check next, by whether the field is masked."""
     if secret:
         return (
-            " and the keyboard could not confirm it landed. Look at the "
-            "screenshot: the field is masked, so check that it is non-empty "
+            " and could not read it back: the field is masked, so the keyboard cannot "
+            "confirm it landed. Look at the screenshot and check that it is non-empty "
             "and roughly the right length. Never read the value back."
         )
     return (

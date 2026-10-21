@@ -65,18 +65,19 @@ def tested_packages(run_id: str, package: str) -> list[str]:
     Ranked by the steps the run drove in each app, most first (ties: first
     seen), so a transient pin never pushes the target past the cap. An app
     needs ``_MIN_STEPS`` steps (a one-step bounce is not tested); the run's own
-    declared package always qualifies. Transient and system surfaces never do.
+    declared package qualifies with any step, and alone when nothing else does
+    (a declared 0-step package is no learn target next to an app that was driven). Transient and system surfaces never do.
     """
     steps = knowledge_trace.load_steps(run_id)
     counts: dict[str, int] = {}
     for rec in steps:
         name = kstg_foreign.observed(rec)
         counts[name] = counts.get(name, 0) + 1
-    counts.setdefault(package, 0)
     named = [n for n in counts if n and knowledge_scope.allowed(n)]
-    named = [n for n in named if n == package or counts[n] >= _MIN_STEPS]
+    named = [n for n in named if counts[n] >= _MIN_STEPS or n == package]
     named.sort(key=lambda n: -counts[n])
-    return named[:_MAX_TESTED]
+    fallback = [package] if knowledge_scope.allowed(package) else []
+    return named[:_MAX_TESTED] or fallback
 
 
 def _seed(run_id: str, app: str, declared: str) -> None:

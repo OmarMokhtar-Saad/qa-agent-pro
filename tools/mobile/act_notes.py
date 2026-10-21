@@ -70,7 +70,7 @@ def _wait_until_head() -> str:
         "gone (spinner); wait_until_changed screen differs; wait_until_idle "
         "two reads equal. max_s (default "
         + str(WAIT_UNTIL_DEFAULT_S)
-        + ", max "
+        + ", longer is clamped to "
         + str(WAIT_UNTIL_MAX_S)
         + ") only bounds a condition that never comes; a dialog, call, other "
         "app or error text stops a wait early and is named. There is no fixed wait: "

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from tools.mobile import target_pin, watch
 from tools.mobile.replay.context import Context
+from tools.mobile.replay.installer_screen import installing_text
 from tools.mobile.replay.screen import (
     _screen_package,
     _texts,
@@ -38,6 +39,8 @@ def _interruption_of(ctx: Context, screen: object, baseline: object) -> str:
     named = watch.classify_package(package, before_package)
     if named:
         return named
+    if installing_text(screen):  # H05: the installer is working, not asking
+        return ""
     dialog = system_dialog_package(screen)
     if dialog and dialog != system_dialog_package(baseline):
         return watch.PREFIX + system_dialog_detail(dialog)

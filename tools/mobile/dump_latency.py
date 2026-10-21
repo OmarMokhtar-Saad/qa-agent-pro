@@ -66,14 +66,23 @@ HOST_WARN_LOAD_PER_CORE = 2.0
 SLOW_DUMP_WARN_MS = 5000
 
 
+def is_emulator(serial: str) -> bool:
+    """True for a local emulator serial; a phone (USB or Wi-Fi) is never one."""
+    return str(serial).startswith("emulator-")
+
+
 def _reasons(serial: str) -> list[str]:
-    """Why this step's reply should warn: the host load, a slow device, or neither."""
+    """Why this step's reply should warn: the host load, a slow device, or neither.
+
+    The host's load slows an emulator, which runs ON the host; it does not slow a
+    physical phone, so it is never named for one.
+    """
     reasons: list[str] = []
     with never_raise() as g:
         load = avd_guard.host_load()
     if g.failed:
         load = None
-    if load is not None and load > HOST_WARN_LOAD_PER_CORE:
+    if load is not None and load > HOST_WARN_LOAD_PER_CORE and is_emulator(serial):
         reasons.append(f"the host's load is {load:.1f} per CPU core")
     p90 = p90_ms(serial)
     if p90 is not None and p90 > SLOW_DUMP_WARN_MS:
@@ -81,15 +90,21 @@ def _reasons(serial: str) -> list[str]:
     return reasons
 
 
-def _warning_text(reasons: list[str]) -> str:
-    """The advice sentence naming *reasons*."""
-    return (
-        "Slow device: "
-        + " and ".join(reasons)
-        + ". Every wait now keeps a margin that fits it, so steps take longer. "
-        + "Switch to a 1080p Pixel AVD (e.g. Pixel 6, 1080x2400) and close Screen "
-        + "Sharing and any other heavy program on the host."
-    )
+_EMULATOR_ADVICE = (
+    "Switch to a 1080p Pixel AVD (e.g. Pixel 6, 1080x2400) and close Screen "
+    "Sharing and any other heavy program on the host."
+)
+_PHONE_ADVICE = (
+    "The usual cause is a screen that keeps animating (a progress bar, a spinner, "
+    "a video): uiautomator waits for the UI to go idle before it answers. Let the "
+    "animation finish, or act on what is already readable, before the next step."
+)
+
+
+def _warning_text(reasons: list[str], serial: str = "") -> str:
+    """The advice sentence naming *reasons*, with the remedy that fits the device."""
+    advice = _EMULATOR_ADVICE if is_emulator(serial) else _PHONE_ADVICE
+    return "Slow device: " + " and ".join(reasons) + ". " + advice
 
 
 # The slow-host / slow-device warning, said at most once per run.
@@ -107,4 +122,4 @@ def host_warning_once(run_id: object, serial: str) -> str:
     _WARNED[key] = None
     while len(_WARNED) > MAX_WARNED_RUNS:
         _WARNED.popitem(last=False)
-    return _warning_text(reasons)
+    return _warning_text(reasons, serial)

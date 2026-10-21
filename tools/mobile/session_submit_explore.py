@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 
-from tools.mobile import explore_runner
+from tools.mobile import explore_runner, knowledge_handover
 from tools.mobile.session_submit_args import ExploreCall
 from tools.mobile.session_submit_commit import _commit_explore_turn
 from tools.mobile.session_submit_parse import (
@@ -45,7 +46,11 @@ async def _submit_explore(call: ExploreCall) -> dict:
     )
     if refusal is not None:
         return refusal
-    call = _apply_handover(call, payload)
+    moved = _apply_handover(call, payload)
+    if moved is not call:
+        app = (moved.resolved.get("explore") or {}).get("app")
+        await asyncio.to_thread(knowledge_handover.follow, call.run_id, str(app))
+    call = moved
     _arm_explore_guards(call.run_id, call.ctx, call.resolved)
     replay = await _replay_explore_turn(call, payload, parsed)
     if isinstance(replay, dict):

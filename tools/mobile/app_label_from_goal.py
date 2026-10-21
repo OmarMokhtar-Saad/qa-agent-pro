@@ -10,7 +10,8 @@ _QUOTED = re.compile(
 )
 _SENTENCE_END = re.compile(r"[.;!?](?=\s|$)|\n")
 _INSTALL_CUE = re.compile(
-    r"app\s*tester|install|update|download|\bbuild\b|(?:app|display)\s+name",
+    r"app\s*tester|install|update|download|\bbuild\b|(?:app|display)\s+name"
+    r"|app\s+list",
     re.IGNORECASE,
 )
 _MAX_WORDS = 5
@@ -66,18 +67,40 @@ def _unquoted_label(text: str) -> str | None:
     return None
 
 
+def _install_quoted(text: str) -> set:
+    """Every quoted string sharing a sentence with App Tester or install wording."""
+    return {
+        next(g for g in m.groups() if g).strip()
+        for m in _QUOTED.finditer(text)
+        if _INSTALL_CUE.search(_sentence(text, m))
+    }
+
+
+def goal_install_names(goal: str) -> tuple:
+    """The short quoted names in the install sentences of *goal* (a quoted
+    button in another sentence is not an app name)."""
+    found = _install_quoted(str(goal or ""))
+    return tuple(sorted(n for n in found if n and len(n.split()) <= _MAX_WORDS))
+
+
 def goal_app_label(goal: str) -> str | None:
     """The single quoted name sharing a sentence with App Tester or install
     wording; ``None`` for zero or several, so a quoted button never counts.
     With no quoted name there, one unquoted name after "named X", "called X"
     or "app X" in such a sentence."""
     text = str(goal or "")
-    found = {
-        next(g for g in m.groups() if g).strip()
-        for m in _QUOTED.finditer(text)
-        if _INSTALL_CUE.search(_sentence(text, m))
-    }
+    found = _install_quoted(text)
     names = {n for n in found if n and len(n.split()) <= _MAX_WORDS}
     if names:
         return names.pop() if len(names) == 1 else None
     return None if found else _unquoted_label(text)
+
+
+def goal_quoted_names(goal: str) -> tuple:
+    """Every short quoted name in *goal*, in order (the app may be one of them)."""
+    seen: list = []
+    for m in _QUOTED.finditer(str(goal or "")):
+        name = next(g for g in m.groups() if g).strip()
+        if name and len(name.split()) <= _MAX_WORDS and name not in seen:
+            seen.append(name)
+    return tuple(seen)

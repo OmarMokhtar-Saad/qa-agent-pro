@@ -9,6 +9,7 @@ the number of reads; nothing pauses for a fixed time.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from tools.mobile.dialog_handlers import visible_texts
@@ -17,6 +18,7 @@ from tools.mobile.install_sources.app_tester_ui_consts import (
     ACTION_LABELS,
     APP_TESTER_POLL_S,
     OPEN_LABEL,
+    READ_BUDGET_S,
     SleepFn,
     _Run,
 )
@@ -57,12 +59,15 @@ async def wait_page_ready(run: _Run, sleep: SleepFn) -> str:
     """Poll until the app page is drawn, at most PAGE_READY_POLLS reads. The
     last XML read ("" when no read worked)."""
     xml = ""
+    end = time.monotonic() + READ_BUDGET_S
     for _ in range(PAGE_READY_POLLS):
         shot = await run.ui.screen()
         xml = shot.xml if shot is not None else ""
         if page_ready(xml):
             return xml
         log.info("app_tester page not drawn: %d texts", len(visible_texts(xml)))
+        if time.monotonic() >= end:
+            break
         await sleep(APP_TESTER_POLL_S)
     return xml
 
@@ -71,6 +76,7 @@ async def read_drawn(run: _Run, sleep: SleepFn) -> Optional[str]:
     """The screen's XML once it holds any text, at most BLANK_REREADS reads.
     None when no read worked; an empty screen's XML when it stayed empty."""
     xml: Optional[str] = None
+    end = time.monotonic() + READ_BUDGET_S
     for _ in range(BLANK_REREADS):
         shot = await run.ui.screen()
         if shot is not None:
@@ -78,5 +84,7 @@ async def read_drawn(run: _Run, sleep: SleepFn) -> Optional[str]:
             if visible_texts(xml):
                 return xml
             log.info("app_tester blank read: 0 texts")
+        if time.monotonic() >= end:
+            break
         await sleep(APP_TESTER_POLL_S)
     return xml

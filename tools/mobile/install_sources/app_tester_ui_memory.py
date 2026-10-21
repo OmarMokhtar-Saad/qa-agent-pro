@@ -89,10 +89,18 @@ def remember_label(serial: str, label: str, bundle: str) -> None:
         store.put("rows", _label_key(serial, label), bundle)
 
 
+def remember_seen_label(serial: str, label: str, bundle: str) -> None:
+    """A row a scan read but nobody picked: found again by label, never offered
+    as an app used before (H16 must not make the last-read row the default)."""
+    if (label or "").strip() and bundle:
+        store.put("seen", _label_key(serial, label), bundle)
+
+
 def known_bundle(serial: str, label: str) -> str:
     if not (label or "").strip():
         return ""
-    return str(store.get("rows", _label_key(serial, label)) or "")
+    key = _label_key(serial, label)
+    return str(store.get("rows", key) or store.get("seen", key) or "")
 
 
 class Installed(NamedTuple):

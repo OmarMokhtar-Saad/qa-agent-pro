@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import Field, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 
 from tools.mobile.action_consts import (
     MAX_WAIT_MS,
@@ -84,8 +84,17 @@ class WaitUntilAction(_Base):
     op: Literal[
         "wait_until_changed", "wait_until_text", "wait_until_gone", "wait_until_idle"
     ]
-    max_s: float = Field(default=WAIT_UNTIL_DEFAULT_S, gt=0, le=WAIT_UNTIL_MAX_S)
+    max_s: float = Field(default=WAIT_UNTIL_DEFAULT_S, gt=0)
     text: str = Field(default="", max_length=200)
+    # What the caller asked when above the cap; ``max_s`` is clamped (H03).
+    _asked_s: Optional[float] = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def clamp_max_s(self) -> "WaitUntilAction":
+        if self.max_s > WAIT_UNTIL_MAX_S:
+            self._asked_s = self.max_s
+            self.max_s = WAIT_UNTIL_MAX_S
+        return self
 
     @model_validator(mode="after")
     def text_where_it_is_the_condition(self) -> "WaitUntilAction":

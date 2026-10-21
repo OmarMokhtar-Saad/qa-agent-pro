@@ -48,6 +48,19 @@ def chunk(acts: list) -> list:
     return packets + [cur] if cur else packets
 
 
+def replayable_from(recs: list) -> list:
+    """*recs* without the leading steps that cannot stand alone as a script.
+
+    A route whose first step is an unnamed tap (nothing stable to aim at) is not refused
+    whole: the replay starts at the first step that can run by itself, and the screen
+    each step carries still tells the server where that start is.
+    """
+    for at, rec in enumerate(recs):
+        if _fits([rec["flow_action"]]):
+            return recs[at:]
+    return []
+
+
 def kept(packets: list) -> int:
     """How many actions the *packets* hold."""
     return sum(len(p) for p in packets)

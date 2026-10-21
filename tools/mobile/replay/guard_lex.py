@@ -47,7 +47,6 @@ DESTRUCTIVE_LEXICON = (
     # The contract this lexicon enforces is "this tap is not undoable", and a
     # chat message is not. So the token became the phrases that ARE about
     # money.
-    #
     # THE COMPENSATING CONTROL FIRST CLAIMED HERE DOES NOT EXIST, and saying so
     # is the point. The claim was that every money word below still stands
     # alone, so each transaction path keeps two independent catchers. A review
@@ -80,6 +79,19 @@ DESTRUCTIVE_LEXICON = (
     "log out",
     "logout",
     "yes, delete",
+    # a call or a dial cannot be taken back once it rings (H18)
+    "voice call",
+    "video call",
+    "phone call",
+    "start call",
+    "place call",
+    "call now",
+    "dial",
+    "dialer",
+    "dialpad",
+    "audio call",
+    "llamar",
+    "appeler",
 )
 
 

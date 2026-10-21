@@ -22,6 +22,28 @@ STOP_COMPLETED = "completed"
 _WORDS = {"pass": "passed", "fail": "failed", "unverified": "not verified"}
 
 
+def _stumbled(rows: list) -> str:
+    """``"9 failed and 1 interrupted"`` for turns that ended badly, or ``""``."""
+    failed = sum(1 for r in rows if r.get("status") == "failed")
+    stopped = sum(1 for r in rows if r.get("status") == "abandoned")
+    said = [f"{failed} failed"] if failed else []
+    if stopped:
+        said.append(f"{stopped} interrupted")
+    return " and ".join(said)
+
+
+def _count_line(word: str, rows: list, done: int) -> str:
+    """``run passed: 5 of 15 ...``; a pass with failed turns names them first."""
+    hurt = _stumbled(rows) if word == "pass" else ""
+    if hurt:
+        return f"run passed, but {hurt} of {len(rows)} turns; {done} reached a verdict"
+    return "run %s: %d of %d steps reached a verdict" % (
+        _WORDS.get(word, word),
+        done,
+        len(rows),
+    )
+
+
 def _reason(word: str, rows: list) -> str:
     done = sum(1 for r in rows if r.get("verdict"))
     # A passed run is judged by its final done(pass): explore rows without a verdict
@@ -32,11 +54,7 @@ def _reason(word: str, rows: list) -> str:
     )
     if said:
         return said
-    return "run %s: %d of %d steps reached a verdict" % (
-        _WORDS.get(word, word),
-        done,
-        len(rows),
-    )
+    return _count_line(word, rows, done)
 
 
 def record(run_id: str, resolved: Any, rows: Any) -> bool:

@@ -46,6 +46,13 @@ def init_manifest(run_id: str, env: object = None) -> bool:
         return False
 
 
+def _changes(know: dict, state: str) -> bool:
+    """False for no change, and for a ``skipped`` that would undo a ``learned``:
+    one tested app learning makes the run learned (H22)."""
+    old = know.get("learn_state")
+    return old != state and not (old == "learned" and state == "skipped")
+
+
 def store_state(run_id: str, state: str, reason: str = "") -> None:
     """Mirror ``runs.learn_state`` (and why) on the manifest. Never raises."""
     try:
@@ -54,7 +61,7 @@ def store_state(run_id: str, state: str, reason: str = "") -> None:
         if read.get("error") or not isinstance(body, dict):
             return
         know = body.setdefault("knowledge", {})
-        if isinstance(know, dict) and know.get("learn_state") != state:
+        if isinstance(know, dict) and _changes(know, state):
             know["learn_state"] = state
             know["learn_reason"] = reason
             run_store.write_manifest(run_id, body)

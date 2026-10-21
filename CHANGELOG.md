@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.150.0] - 2026-10-21
+## [1.151.0] - 2026-10-21
 
 ### Added
 
@@ -265,6 +265,48 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Each editor connection's qa-agents server now stops itself after 10
   idle minutes and restarts on demand, so unused duplicate servers no
   longer pile up.
+- A run that passed with failed turns now says how many turns failed
+  or were interrupted in its result line, and the summary counts them
+  next to the verdict count.
+- The claim-vs-evidence table shows the real proof (passed asserts,
+  screen ids) instead of "no evidence".
+- The final packet quotes the app's own reported events (event count,
+  HTTP statuses, env) for any app.
+- Waits asking for more than 20 s are clamped instead of refused, and
+  a timeout with progress visible reads "still in progress", not
+  failed.
+- The installer's "Installing" screen is waited out on both install
+  paths.
+- A failed assert right after a change wait is re-checked once the
+  screen settles.
+- A stop names the actions that did not run.
+- A masked field that cannot be read back says so in the step reply.
+- Steps on an animated screen reuse a recent screen read for up to 3
+  steps instead of paying an 11 s confirmation dump each time.
+- A physical phone is no longer told to switch to an emulator; the
+  note names the animating screen.
+- An App Tester list scan that reads nothing gives up after about 25 s
+  with a clear reason, and one scan learns the labels of every app in
+  the list.
+- A goal's invalid JSON is reported with its line and column.
+- A goal that names an app is no longer run against the last-used app;
+  an unknown name is refused with the list of known apps.
+- An auto-replayed saved flow is named in the reply, and replay state
+  from another app is not carried over.
+- The knowledge snapshot follows a handover to another app, and a run
+  counts as learned if any tested app learned.
+- Learning keeps a flow whose first tap was an unnamed card and aims
+  that tap by the card's label.
+- The model is told up to 3 known flows plus a route map of known
+  screens and taps, and saved edges record what was tapped.
+- A tap on a control with no name says what it opened and flags a call
+  screen; voice-call, video-call and dial controls need the host's
+  confirm flag.
+- An optional tap says what it tapped, and an empty screen read stops
+  for the model instead of passing as "not present".
+- The mobile tool brief sent at the start of a run is about 4%
+  shorter: duplicated argument and credential rules are gone, no rule
+  was dropped.
 
 ### Known
 

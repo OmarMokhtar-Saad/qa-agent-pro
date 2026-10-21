@@ -16,7 +16,11 @@ from tools.mobile import (
     resolve_cache,
     run_store,
 )
-from tools.mobile.app_label_from_goal import goal_app_label
+from tools.mobile.app_label_from_goal import (
+    goal_app_label,
+    goal_install_names,
+    goal_quoted_names,
+)
 from tools.mobile.install_source import (
     ALREADY_LATEST,
     InstallOutcome,
@@ -145,9 +149,17 @@ def _hint_label(call: _AppCall, target: str) -> str:
     when no link or app id picks the app instead."""
     if parse_app_id(call.value):
         return goal_app_label(call.goal) or ""
-    return (
-        call.value or target or goal_app_label(call.goal) or default_label(call.serial)
-    )
+    return call.value or target or goal_app_label(call.goal) or _remembered(call)
+
+
+def _remembered(call: _AppCall) -> str:
+    """The device's one remembered label, unless an install sentence of the goal
+    quotes a name that is not it (H17: "Acme QA" must never run as the last app,
+    "Acme Agent"; a quoted button in another sentence does not count)."""
+    last = default_label(call.serial)
+    low = last.lower()
+    names = [n.lower() for n in goal_install_names(call.goal)]
+    return "" if names and not any(low in n or n in low for n in names) else last
 
 
 async def _echo_default(call: _AppCall, target: str, label: str) -> None:
@@ -172,7 +184,8 @@ async def app_tester_stage(call: _AppCall, target: str) -> tuple:
     await _echo_default(call, target, label)
     known = await known_package(call.serial, label)
     if not label and not known:  # nothing names the app: ask before any launch
-        return _failed(label_refusal(call.serial)), ""
+        named = goal_quoted_names(call.goal)
+        return _failed(label_refusal(call.serial, named)), ""
     link = call.source_text
     want = ListedApp(call.serial, label, tester, known, link)
     try:

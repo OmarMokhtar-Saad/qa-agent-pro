@@ -17,6 +17,7 @@ from tools.mobile.replay.screen import _stamp_after
 from tools.mobile.replay.settle_mark import SettleJob, SettleOpts
 from tools.mobile.replay.settle_perm import mark_unclear
 from tools.mobile.replay.settle_run import _settle
+from tools.mobile.replay.wait_inprogress import note_in_progress
 from tools.mobile.replay.waits_poll import _wait_until_element
 from tools.mobile.replay.waits_prior import note_gone
 from tools.mobile.replay.waits_refuse import refusal, stamp_refused
@@ -105,6 +106,7 @@ def _miss(entry: dict, words: tuple, timing: tuple) -> None:
 
 def needs_model_reply(run: _ReplayRun, screen: object, entry: dict) -> dict:
     """The reply that hands a missed wait back to the model."""
+    note_in_progress(entry, screen)
     stop = ReplayStop(
         STATUS_NEEDS_MODEL, run.trace, screen, "", entry["detail"], entry["index"]
     )

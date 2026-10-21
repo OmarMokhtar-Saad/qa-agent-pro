@@ -86,13 +86,19 @@ def _run_env(package: str, run_id: object) -> object:
         conn.close()
 
 
+def package_of(content: object) -> str:
+    """The package whose knowledge a run uses: the handed-over app, else its own."""
+    body = content if isinstance(content, dict) else {}
+    return str(body.get("knowledge_package") or body.get("package") or "")
+
+
 def load_for_run(run_id: object) -> dict:
     """Load and register the snapshot of *run_id* (package and env from its manifest
     and run row). Always registers something, so a miss is not retried every turn."""
     snap = empty()
     try:
         content = run_store.read_manifest(str(run_id or "")).get("content") or {}
-        package = str(content.get("package") or "")
+        package = package_of(content)
         env = _run_env(package, run_id)
         facts = knowledge_run.RunFacts(
             run_id=str(run_id),

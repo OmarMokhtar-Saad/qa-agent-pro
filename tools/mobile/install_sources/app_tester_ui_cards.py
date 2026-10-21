@@ -30,6 +30,7 @@ from tools.mobile.install_sources.app_tester_ui_rows import (
     matching_rows,
 )
 from tools.mobile.install_sources.app_tester_ui_scan import remember_row, scan_listing
+from tools.mobile.install_sources.app_tester_ui_unreadable import list_unreadable
 from tools.mobile.resolve import Candidate, PickOpts, resolve_or_ask
 from tools.untrusted import wrap_untrusted
 
@@ -81,6 +82,8 @@ class _CardMixin:
 
 async def _choose_row(run: _Run, scanned: tuple) -> Union[str, InstallOutcome]:
     rows, whole = scanned
+    if not rows:
+        return list_unreadable()
     label = run.request.app_label.strip() or derive_label(run.request.package)
     hits = matching_rows(label, rows) if label else []
     listed = any(row.bundle == run.request.package for row in rows)

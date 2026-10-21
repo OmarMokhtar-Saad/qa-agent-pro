@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+from tools.mobile.replay.assert_settle import recheck_after_wait
 from tools.mobile.replay.context import (
     STATUS_NEEDS_MODEL,
     _ReplayRun,
@@ -44,6 +45,8 @@ async def _assert_step(run: _ReplayRun, step: _Step, seen: Seen) -> dict | None:
         return _visual_check(run, step, at)
     view = AssertView(seen.screen, run.trace, seen.baseline_texts)
     ok, detail = _evaluate_assert(step.action, view)
+    if not ok:
+        ok, detail, at = await recheck_after_wait(run, step, (view, at))
     step.entry.update(outcome="assert_pass" if ok else "assert_fail", detail=detail)
     _close(run, at)
     if ok:

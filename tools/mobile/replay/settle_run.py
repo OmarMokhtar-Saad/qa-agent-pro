@@ -14,6 +14,7 @@ from tools.mobile.replay.context_consts import (
 )
 from tools.mobile.replay.dump import _dump
 from tools.mobile.replay.dump_stamp import stamp_step
+from tools.mobile.replay.installer_wait import await_install
 from tools.mobile.replay.screen import _stamp_after
 from tools.mobile.replay.settle_auto import (
     Settled,
@@ -62,15 +63,16 @@ UNVERIFIED_DETAIL = (
 #
 # *mark_no_change* is False for ``wait``: ``no_change`` exists to tell a model
 # "your tap did nothing", and a wait that changes nothing is the normal case.
+# The installer's "Installing..." screen is waited out (H05), then a registered
+# dialog handler answers a known interruption BEFORE the screen is stamped, so
+# the entry records the screen the replay continues on.
 async def _settle(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
     """Re-read the screen after an action that could have changed it."""
     if opts.redump:
         screen, stop = await _settle_redump(job, screen, opts)
         if stop is not None:
             return screen, stop
-    # A registered dialog handler answers a known interruption BEFORE the screen
-    # is stamped, so the entry records the screen the replay actually continues
-    # on. No handler registered: this returns the screen untouched.
+    screen = await await_install(job.ctx, screen)
     view = CutView(screen, opts.op, opts.extra_expected)
     screen = await _answer_dialogs(job, view)
     await stamp_step(job.ctx, screen)

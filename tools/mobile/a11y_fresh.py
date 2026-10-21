@@ -33,6 +33,7 @@ from tools.mobile import (
     a11y_reread,
     a11y_scrolled,
     a11y_strikes,
+    a11y_unchecked,
     dump_reuse,
     step_timing,
 )
@@ -46,8 +47,6 @@ CONFIRM_SOURCE = "uia-fresh-confirm"  # the dump-latency source of the confirmat
 # Ledger notes and refusals: a contradicted fast tree, an unchecked repeat, a confirmed one.
 STALE_NOTE = "a11y_stale"
 STALE_REFUSAL = "the a11y tree repeated across an action and uiautomator disagrees"
-UNCHECKED_NOTE = "a11y_repeat_unchecked"
-UNCHECKED_REFUSAL = "the a11y tree repeated across an action and could not be checked"
 CONFIRMED_NOTE = "a11y_repeat_confirmed"
 
 #: serial -> (generation after the last a11y dump, its node digest).
@@ -76,6 +75,7 @@ def forget(serial: str) -> None:
     a11y_bench.forget(serial)
     a11y_clock.forget(serial)
     a11y_scrolled.forget(serial)
+    a11y_unchecked.forget(serial)
 
 
 def _digest(xml: str) -> str:
@@ -127,8 +127,7 @@ async def _judge(serial: str, xml: str, inner: Provider | None = None) -> dict |
         return early
     slow = await uiautomator_aside(serial, CONFIRM_SOURCE, a11y_early.CONFIRM_CAP_S)
     if slow.get("error"):
-        step_timing.note(UNCHECKED_NOTE)
-        return {"error": UNCHECKED_REFUSAL, "content": None}
+        return a11y_unchecked.refusal(serial, digest)
     if compare(xml, str(slow.get("content") or "")).get("error"):
         a11y_reread.keep(serial, under, slow)
         _PKGS[serial] = _packages(xml)

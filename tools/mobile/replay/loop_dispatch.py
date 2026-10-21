@@ -23,6 +23,7 @@ from tools.mobile.replay.screen import _screen_hash
 from tools.mobile.replay.skip_done import skip_if_done
 from tools.mobile.replay.steps_assert import Seen, _assert_step
 from tools.mobile.replay.verdicts import SCROLL_TARGET_MISSED
+from tools.mobile.replay.wait_clamp import note_clamp
 from tools.mobile.replay.waits import _changed_wait, _wait_spec
 from tools.mobile.replay.waits import _condition_wait as condition_wait
 from tools.mobile.replay.waits_prior import clear_action, note_action, note_calm
@@ -50,6 +51,7 @@ async def _wait_step(
     spec = wait_ceiling_lookup.bounded(declared, learned)
     began = time.monotonic()
     got, reply = await _wait_spec_step(run, step, (spec, screen))
+    note_clamp(step.entry, step.action)
     wait_ceiling_lookup.mark_slow(step.entry, learned, began)
     wait_ceiling_lookup.mark_learned(step.entry, declared[2], spec[2])
     return got, reply
@@ -101,6 +103,10 @@ def _note_ok(step: _Step, outcome: dict) -> None:
     )
     if step.op in ("tap", "tap_text", "tap_text_if_present"):
         entry["tapped"] = _tapped_label(step)
+        if not entry["detail"]:
+            entry["detail"] = "tapped " + repr(
+                entry["tapped"] or "an unlabeled control"
+            )
     proof = _fill_proof(outcome)
     if proof:
         entry["detail"] = (proof + " " + entry["detail"]).strip()

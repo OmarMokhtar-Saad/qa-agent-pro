@@ -15,11 +15,12 @@ from tools.mobile.replay.screen import _screen_hash
 
 _KEY = "wait_progress"
 _PERCENT = re.compile(r"\b\d{1,3}\s?%")
-_BUSY = re.compile(
+_PREFIX = (
     r"^(downloading|loading|installing|uploading|updating|syncing|preparing|"
-    r"connecting|please wait|in progress)\b|(\.{3}|…)$",
-    re.I,
+    r"connecting|please wait|in progress)\b"
 )
+_BUSY = re.compile(_PREFIX + r"|(\.{3}|…)$", re.I)
+_BUSY_WORD = re.compile(_PREFIX, re.I)
 
 
 def _texts(screen: object) -> set[str]:
@@ -37,6 +38,11 @@ def _texts(screen: object) -> set[str]:
 def is_progress_text(text: str) -> bool:
     """True for a percentage or a busy phrase (``Downloading... 0%``, ``Loading...``)."""
     return bool(_PERCENT.search(text) or _BUSY.search(text))
+
+
+def is_busy_text(text: str) -> bool:
+    """Strict form: a percentage or a busy-prefix text; a bare trailing ``…`` is not enough."""
+    return bool(_PERCENT.search(text) or _BUSY_WORD.search(text))
 
 
 def _grew_into(gone: str, added: set[str]) -> bool:

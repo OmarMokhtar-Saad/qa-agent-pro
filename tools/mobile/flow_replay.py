@@ -57,12 +57,20 @@ def _inputs(run_id: str, ctx: Any) -> dict:
     return merged
 
 
+def _same_package(last: object, package: str) -> dict:
+    """The earlier replay state, or ``{}`` when it ran in another package (H19: a
+    flow chain from one app is never carried into the run's current app)."""
+    got = last if isinstance(last, dict) else {}
+    named = str(got.get("package") or "")
+    return got if not named or not package or named == package else {}
+
+
 def _resume(body: dict, key: Any, package: str) -> tuple:
     """``(name, template, pos)`` of the replay to continue, else a fresh pick."""
     back = flow_replay_switch.resume(body, key, package)
     if back[1]:
         return back
-    last = body.get("auto_replay") or {}
+    last = _same_package(body.get("auto_replay"), package)
     name = str(last.get("name") or "")
     if name and last.get("retry"):
         got = flow_replay_match.template(package, name)

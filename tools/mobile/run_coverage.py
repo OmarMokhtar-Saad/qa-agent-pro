@@ -78,6 +78,27 @@ def _expected_verdicts(body: dict, lane: str, total: int) -> int:
     return max(planned, total)
 
 
+def _status_count(items: list, status: str) -> int:
+    """How many case records ended with *status* and no verdict."""
+    return sum(
+        1
+        for c in items
+        if isinstance(c, dict)
+        and str(c.get("status") or "") == status
+        and not _has_verdict(c)
+    )
+
+
+def _unfinished_tail(body: dict) -> str:
+    """``"; 9 failed, 1 interrupted"`` for the turns that ended without a verdict."""
+    parts = [
+        f"{int(body.get(key) or 0)} {key}"
+        for key in ("failed", "interrupted")
+        if int(body.get(key) or 0)
+    ]
+    return ("; " + ", ".join(parts)) if parts else ""
+
+
 def verdict_coverage(cases: Any, manifest: object = None) -> dict:
     """``{"lane", "total", "with_verdict", "expected", "complete"}``; never raises."""
     body = manifest if isinstance(manifest, dict) else {}
@@ -89,6 +110,8 @@ def verdict_coverage(cases: Any, manifest: object = None) -> dict:
     return {
         "lane": lane,
         "total": total,
+        "failed": _status_count(items, "failed"),
+        "interrupted": _status_count(items, "abandoned"),
         "with_verdict": with_verdict,
         "expected": int(expected),
         "complete": bool(expected) and with_verdict >= expected,
@@ -110,6 +133,7 @@ def _explore_phrase(body: dict, with_verdict: int, total: int) -> str:
         + str(total)
         + " turn"
         + ("" if total == 1 else "s")
+        + _unfinished_tail(body)
     )
 
 
@@ -125,4 +149,5 @@ def coverage_phrase(coverage: object) -> str:
         + " of "
         + str(max(total, int(body.get("expected") or 0)))
         + " cases reached a verdict"
+        + _unfinished_tail(body)
     )

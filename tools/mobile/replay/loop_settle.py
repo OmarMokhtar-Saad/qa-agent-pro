@@ -13,7 +13,7 @@ from tools.mobile.replay.guard import _confirmed
 from tools.mobile.replay.settle import SettleJob, SettleOpts, _settle
 from tools.mobile.replay.settle_run import _target_in_hand
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
-from tools.mobile.replay.tap_ambiguity import note_if_ambiguous
+from tools.mobile.replay.unlabeled_tap import note_tap_advice
 from tools.mobile.replay.verdicts import Landing, _brought_to_front
 
 
@@ -175,7 +175,7 @@ async def _settle_device(
         opts = _device_opts(run, step, front or typed)
         opts = opts._replace(mark_no_change=not typed)  # not re-read != unchanged
         screen, stop = await _settle(job, screen, opts)
-        note_if_ambiguous(entry, step, acted.screen)
+        note_tap_advice(entry, step, (acted.screen, screen))
         if stop is not None:
             return screen, _reply(stop)
     _close(run, StepAt(entry["index"], entry, screen))

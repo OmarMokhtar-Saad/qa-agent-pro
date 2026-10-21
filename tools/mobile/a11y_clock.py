@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from tools.mobile import a11y_events, step_timing
+from tools.mobile import a11y_events, a11y_unchecked, step_timing
 
 #: Consecutive repeats the clock may confirm before uiautomator checks again.
 MAX_SKIPS = 2
@@ -103,6 +103,8 @@ def _heard_after(serial: str, digest: str) -> bool:
 
 async def judged(serial: str, digest: str, confirm: Confirm) -> "dict | None":
     """``None`` when the clock proves the repeat, else the result of *confirm*."""
+    if a11y_unchecked.reuse(serial, digest):
+        return None
     if no_event_since(serial, digest):
         _SEEN[serial].skips += 1
         step_timing.note(BY_CLOCK_NOTE)

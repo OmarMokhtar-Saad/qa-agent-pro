@@ -27,6 +27,26 @@ ADVANCED_NOTE = (
 )
 
 
+MASKED_NOTE = (
+    "Typed into a masked field and could not read it back (read-back is "
+    "unknown); the screen then advanced, which is the only proof it was "
+    "taken. Counted as unconfirmed, not verified."
+)
+
+
+def _note(outcome: dict) -> str:
+    """The detail for an unconfirmed type that advanced the screen."""
+    return MASKED_NOTE if outcome.get("masked") else ADVANCED_NOTE
+
+
+def _advanced_reply(outcome: dict, screen: object) -> dict:
+    """The success reply for an unconfirmed type whose screen moved on."""
+    reply: dict = {"error": None, "content": {"detail": _note(outcome)}}
+    if screen is not None:
+        reply["read_screen"] = screen
+    return reply
+
+
 async def reconcile_empty_field(run: _ReplayRun, acted: Acted) -> dict:
     """The outcome to act on: ``unknown`` instead of ``no`` for an empty field.
 
@@ -40,8 +60,5 @@ async def reconcile_empty_field(run: _ReplayRun, acted: Acted) -> dict:
     probe = moved_on_masked if outcome.get("masked") else moved_on_by_deadline
     moved = await probe(run.ctx, acted.screen)
     if moved.moved:
-        reply: dict = {"error": None, "content": {"detail": ADVANCED_NOTE}}
-        if moved.screen is not None:
-            reply["read_screen"] = moved.screen
-        return reply
+        return _advanced_reply(outcome, moved.screen)
     return unknown

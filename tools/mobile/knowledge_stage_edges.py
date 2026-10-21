@@ -43,6 +43,15 @@ def percentile(values: list, pct: float) -> int:
     return ordered[min(rank, len(ordered)) - 1]
 
 
+def edge_target(rec: dict) -> str:
+    """What the step aimed at: its rid, else the label it named, else its stable locator."""
+    got = str(rec.get("target_rid") or rec.get("target_text") or "")
+    if got:
+        return got[:80]
+    aim = (rec.get("flow_action") or {}).get("target") or {}
+    return str(aim.get("rid") or aim.get("text") or aim.get("label") or "")[:80]
+
+
 def collect(steps: Any) -> dict:
     """``{(from, op, target, to): [ms, ...]}`` for one run."""
     found: dict = {}
@@ -50,7 +59,7 @@ def collect(steps: Any) -> dict:
         key = (
             rec["screen_key"],
             rec.get("op", ""),
-            rec.get("target_rid", ""),
+            edge_target(rec),
             rec["after_screen_key"],
         )
         found.setdefault(key, []).append(int(rec.get("ms") or 0))

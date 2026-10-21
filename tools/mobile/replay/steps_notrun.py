@@ -55,6 +55,13 @@ def _span(first: int, last: int) -> str:
     return str(first) if first == last else str(first) + "–" + str(last)
 
 
+def _ops_of(listed: list) -> str:
+    """``(tap_text, assert, ...)``: the op names of the actions left over (H12)."""
+    ops = [str((a or {}).get("op") or "?") for a in listed if isinstance(a, dict)]
+    more = ", +%d more" % (len(ops) - 6) if len(ops) > 6 else ""
+    return " (" + ", ".join(ops[:6]) + more + ")" if ops else ""
+
+
 def _summary(entry: dict | None, index: int, span: str) -> str:
     """``stopped at step 3 (missing_element: 'Login'); not run: 3–5``."""
     outcome = str((entry or {}).get("outcome") or "stopped")
@@ -72,9 +79,10 @@ def with_not_run(run: _ReplayRun, reply: dict, index: int) -> dict:
     start = index + 1 if _ran(entry) else index
     if start >= len(run.items):
         return reply
-    note = _summary(entry, index, _span(start + 1, len(run.items)))
-    reason = str(content.get("reason") or "")
     listed = _serialize_queued(run.items[start:])
+    span = _span(start + 1, len(run.items)) + _ops_of(listed)
+    note = _summary(entry, index, span)
+    reason = str(content.get("reason") or "")
     content["not_run"] = listed
     content["not_run_from"] = start + 1
     # A credential action with text ends the list (the host writes the rest again).

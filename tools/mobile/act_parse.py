@@ -138,6 +138,13 @@ def _payload_or_refusal(raw: object) -> tuple[Any, dict | None]:
     return payload, None
 
 
+def _not_json_text(exc: json.JSONDecodeError) -> str:
+    """The refusal text; a parse error says where (line and column) and why."""
+    line, col = getattr(exc, "lineno", 0), getattr(exc, "colno", 0)
+    where = " (line %d, column %d: %s)" % (line, col, exc.msg) if line else ""
+    return "The script was not valid JSON%s and was not replayed." % where
+
+
 def _from_text(payload: str) -> tuple[object, dict | None]:
     """The JSON a reply string holds, or a refusal when it is empty or not JSON."""
     text = payload.strip()
@@ -145,8 +152,8 @@ def _from_text(payload: str) -> tuple[object, dict | None]:
         return payload, _refused("The script was empty.")
     try:
         return json.loads(text), None
-    except ValueError:
-        return payload, _refused("The script was not valid JSON and was not replayed.")
+    except json.JSONDecodeError as exc:
+        return payload, _refused(_not_json_text(exc))
 
 
 def _validated(payload: dict, max_actions: int) -> dict:

@@ -39,7 +39,8 @@ def _reason(body: dict, last: dict) -> str:
 def closed_status(body: dict) -> tuple[str, str]:
     """``(status, reason)`` a turn still in flight is closed as."""
     last = _last_outcome(body)
-    if str(last.get("outcome") or "") in FAILING_OUTCOMES:
+    in_progress = bool(last.get("in_progress"))
+    if str(last.get("outcome") or "") in FAILING_OUTCOMES and not in_progress:
         return "failed", _reason(body, last)
     return "abandoned", str(body.get("reason") or "") or ABANDONED_REASON
 

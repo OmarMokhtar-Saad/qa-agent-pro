@@ -25,9 +25,9 @@ def _limit_lines() -> list:
         + str(action_consts.MAX_WAIT_MS)
         + "; "
         + ", ".join(action_consts.WAIT_UNTIL_OPS)
-        + " take max_s <= "
+        + " take max_s (longer is clamped to "
         + str(action_consts.WAIT_UNTIL_MAX_S)
-        + " (default "
+        + "; default "
         + str(action_consts.WAIT_UNTIL_DEFAULT_S)
         + "). One step waits at most "
         + str(action_consts.MAX_TOTAL_WAIT_MS)

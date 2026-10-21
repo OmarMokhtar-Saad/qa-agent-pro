@@ -19,6 +19,15 @@ MAX_LISTING_SCROLLS = 40
 #: Wall-clock budget of one list scan (every scroll is a swipe plus a dump).
 LISTING_DEADLINE_S = 90.0
 
+#: A scan that has read NO row after this long gives up with a reason (H15:
+#: 98 s of 11 s dumps of a screen that never parsed); one with rows keeps
+#: LISTING_DEADLINE_S.
+NO_ROWS_S = 25.0
+
+#: Wall-clock cap of the blank-screen and page-drawing re-read loops: each read
+#: can be an 11 s dump, so a count of reads is not a bound on time.
+READ_BUDGET_S = 30.0
+
 #: Re-reads of a screen that parsed to no rows (not loading) before giving up.
 #: One: each is a ~11 s dump; the reread first waits (cheap foreground poll)
 #: for App Tester to be in front, so it reads a settled screen.

@@ -5,12 +5,17 @@ from __future__ import annotations
 from tools.mobile import flow_goal_fit, knowledge_inject, kstg_flow_packets
 
 _PRIO = 1
+#: Most saved flows told in the start block (one per route shape, best first).
+MAX_FLOWS = 3
 
 
-_HOW = (
+#: Said on the best flow only: the server auto-replays one flow, not each offered.
+_AUTO = (
     " The server replays it by itself when the app is on its first screen "
     "(at the start of a case, after a stopped step, and in an explore run); "
-    "flow=%s replays it on demand. flow=none turns auto-replay off for the "
+)
+_HOW = (
+    _AUTO + "flow=%s replays it on demand. flow=none turns auto-replay off for the "
     "run in a test run; an explore run honours it only when the user asked "
     "for no flow."
 )
@@ -106,16 +111,15 @@ def _why(got: list) -> str:
 
 
 def flows(snap: dict, key) -> list:
-    """ONE item: the best saved flow (packets grouped), said why; stable block only."""
+    """The best saved flows, one per route shape (packets grouped), said why; stable block only."""
     if key is not None:
         return []
     run = str(snap.get("run_goal") or "")
     best = _best_per_goal(_groups(_offerable(snap)), run)
-    if not best:
-        return []
-    base, got = max(best.items(), key=lambda kv: _rank(kv[1], run))
-    item = _item(base, got)
-    return [dict(item, text=item["text"] + _why(got))]
+    ranked = sorted(best.items(), key=lambda kv: _rank(kv[1], run), reverse=True)
+    items = [_item(base, got) for base, got in ranked[:MAX_FLOWS]]
+    out = [dict(i, text=i["text"] + _why(g)) for i, (_, g) in zip(items, ranked)]
+    return out[:1] + [dict(i, text=i["text"].replace(_AUTO, " ")) for i in out[1:]]
 
 
 knowledge_inject.register_source("flows", flows)
