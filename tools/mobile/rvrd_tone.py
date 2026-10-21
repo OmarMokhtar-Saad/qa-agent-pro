@@ -50,6 +50,8 @@ VERDICT_TONE = {
     "needs_tester": ("void", "s-void", "p-void", "Needs the tester"),
     "needs_model": ("void", "s-void", "p-void", "Needs the model"),
     "planning": ("void", "s-void", "p-void", "Planning"),
+    "failed": ("gap", "s-gap", "p-gap", "Failed (run ended on it)"),
+    "abandoned": ("void", "s-void", "p-void", "Abandoned (run ended)"),
     "unknown": ("void", "s-void", "p-void", "No verdict"),
 }
 

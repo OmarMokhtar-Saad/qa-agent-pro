@@ -33,6 +33,8 @@ LIVE_ENV: frozenset = frozenset(
         "QA_LOG_RETENTION_DAYS",
         "QA_LOG_RETENTION_MAX_FILES",
         "QA_AUTO_FLOW_REPLAY",
+        "QA_RELEASE_PINNED_SHA",
+        "QA_RELEASE_STATE",
         "API_AUTH_TOKEN",
         "GITHUB_TOKEN",
     }
@@ -54,6 +56,10 @@ ENV_RESIDUAL: dict = {
     "QA_FORCE": "read by the installer/launcher shell templates, not by Python",
     "QA_INSTALL_DIR": "installer/launcher shell template variable",
     "QA_PY": "installer/launcher shell template variable",
+    "QA_RELEASE_STATE": (
+        "release-flow env read through the STATE_ENV constant in "
+        "scripts/dist_build/release_state.py, so no line names it beside environ"
+    ),
 }
 
 

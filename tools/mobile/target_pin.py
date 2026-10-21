@@ -7,6 +7,7 @@ no app: the sets are the platform's own surfaces.
 
 from __future__ import annotations
 
+from tools.mobile import system_packages
 from tools.mobile.render_install import APP_TESTER_PACKAGES
 from tools.mobile.replay.screen_pkg import (
     LAUNCHER_PACKAGES,
@@ -35,7 +36,11 @@ def real_app(package: object) -> bool:
 
 def repin(ctx: object, foreground: str) -> bool:
     """Move a transient pin of *ctx* to the real foreground app; True when moved."""
-    if transient(getattr(ctx, "package", "")) and real_app(foreground):
+    if (
+        transient(getattr(ctx, "package", ""))
+        and real_app(foreground)
+        and not system_packages.is_system(foreground)
+    ):
         ctx.package = foreground  # type: ignore[attr-defined]
         return True
     return False

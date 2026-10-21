@@ -42,14 +42,14 @@ class TestCase(BaseModel):
         min_length=1, description="Ordered steps numbered sequentially from 1"
     )
     postconditions: Optional[str] = Field(
-        None, description="Expected system state after test execution"
+        default=None, description="Expected system state after test execution"
     )
     automation_status: AutomationStatus = Field(
         default=AutomationStatus.MANUAL,
         description="Exactly one of: Automated, Manual, To Be Automated, Cannot Be Automated, Not Applicable",
     )
     requirement_id: Optional[str] = Field(
-        None, description="Linked Jira ticket or requirement ID"
+        default=None, description="Linked Jira ticket or requirement ID"
     )
     risk_score: int = Field(
         default=0,

@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import time
 
-from tools.mobile import ime_proof, run_consts, run_io, step_timing
+from tools.mobile import ime_proof, run_consts, run_goal_intake, run_io, step_timing
 
 logger = logging.getLogger("tools.mobile.run_store")
 
@@ -27,6 +27,7 @@ def create_run(run_id: str, manifest: dict) -> dict:
         root = run_io.run_path(run_id)
         (root / run_consts.CASES_DIR).mkdir(parents=True, exist_ok=True)
         payload = dict(manifest or {})
+        run_goal_intake.register_goals(payload, run_id)
         payload.setdefault("run_id", run_id)
         payload.setdefault("created", time.time())
         run_io._write_json(root / run_consts.MANIFEST_FILE, payload)

@@ -16,7 +16,12 @@ import logging
 import sqlite3
 from typing import Any
 
-from tools.mobile import app_knowledge, knowledge_limits, knowledge_schema
+from tools.mobile import (
+    app_knowledge,
+    knowledge_limits,
+    knowledge_schema,
+    knowledge_scope,
+)
 from tools.mobile.knowledge_db_args import (  # noqa: F401
     Counter,
     Ev,
@@ -49,7 +54,7 @@ def open_rw(package: Any):
     """A write connection to the app's knowledge db, or ``None``. Never raises."""
     try:
         path = app_knowledge._store_path(package)
-        if path is None:
+        if path is None or not knowledge_scope.allowed(package):
             return None
         return app_knowledge._connect(path, write=True)
     except ERRORS:

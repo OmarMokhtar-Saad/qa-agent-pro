@@ -53,7 +53,7 @@ def mark_state(key: RunKey, state: str, error: str = "") -> bool:
         conn.close()
 
 
-def _finished(run_id: str, started: float, now: float) -> bool:
+def run_finished(run_id: str, started: float, now: float) -> bool:
     """A run is finished when its manifest records ``final``, or it began more
     than STALE_RUN_S ago (abandoned runs never get a ``final``)."""
     try:
@@ -72,7 +72,7 @@ def _candidates(conn, skip: set) -> list[str]:
     ).fetchall()
     now = time.time()
     return [
-        r[0] for r in rows if r[0] not in skip and _finished(r[0], r[1] or 0.0, now)
+        r[0] for r in rows if r[0] not in skip and run_finished(r[0], r[1] or 0.0, now)
     ]
 
 

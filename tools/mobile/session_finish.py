@@ -18,6 +18,7 @@ from tools.mobile import (
     preflight,
     restore_outcomes,
     run_finalize,
+    run_idle_close,
     run_lease_release,
     stop_goal,
     stop_run,
@@ -86,6 +87,16 @@ def idle_ports() -> lock_reaper.ReleasePorts:
         stop_heartbeat=heartbeat.stop,
         finalize=_finalizer(run_finalize.STOP_IDLE),
         release_lock=release_restoring,
+    )
+
+
+def timeout_ports() -> SimpleNamespace:
+    """The ports ``run_idle_close`` needs to end a run the server found abandoned."""
+    return SimpleNamespace(
+        stop_heartbeat=heartbeat.stop,
+        release=release_restoring,
+        serial_of=serial_of,
+        live_runs=heartbeat.active,
     )
 
 
@@ -174,4 +185,5 @@ async def _restore_run_state(owner: str) -> tuple[dict, dict, dict]:
 
 async def _sweep_stale_state(owner: str) -> tuple[dict, dict, dict]:
     """Restore what earlier crashed runs left: ``(ime, animations, a11y)``."""
+    await run_idle_close.close_dead_runs(owner, timeout_ports())
     return await sweep_stale(serial_of, owner)

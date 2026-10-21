@@ -5,6 +5,10 @@ from handlers.mobile.device_requests import AppArgs, UpdateArgs
 from tools.mobile import host_way_on
 
 
+def _tgt(device_id: str, package: str) -> host_way_on.Target:
+    return host_way_on.Target(device_id, package)
+
+
 def _register_mobile_stop_tool(mcp, Context, rt) -> None:
     """Register qa_mobile_stop (mobile lane)."""
 
@@ -34,7 +38,7 @@ def _register_mobile_app_info_tool(mcp, Context, rt) -> None:
                 AppArgs(app, package, device_id), **rt._make_elicitors(ctx)
             ),
         )
-        return host_way_on.with_way_on("qa_app_info", reply, device_id)
+        return host_way_on.with_way_on("qa_app_info", reply, _tgt(device_id, package))
 
 
 def _register_mobile_update_app_tool(mcp, Context, rt) -> None:
@@ -56,4 +60,4 @@ def _register_mobile_update_app_tool(mcp, Context, rt) -> None:
                 UpdateArgs(app, package, device_id, source), **rt._make_elicitors(ctx)
             ),
         )
-        return host_way_on.with_way_on("qa_update_app", reply, device_id)
+        return host_way_on.with_way_on("qa_update_app", reply, _tgt(device_id, package))

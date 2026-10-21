@@ -6,6 +6,7 @@ import asyncio
 
 from handlers import _lane
 from handlers.mcp_srv_drift import _inflight_exit
+from handlers.mcp_srv_progress import keepalive
 from handlers.mcp_srv_toolcall import _capture_error, _close_tool_call, _open_tool_call
 from tools import dispatch_guard, tool_briefs
 
@@ -41,7 +42,7 @@ async def _tracked(name, ctx, coro):
     ok = True
     error_type = None
     try:
-        return await coro
+        return await _kept(name, ctx, coro)
     except asyncio.CancelledError:
         ok = False
         error_type = "cancelled"
@@ -92,3 +93,9 @@ async def _tracked_mobile(name, ctx, coro):
 async def _tracked_mobile_noted(name, ctx, coro):
     """``_tracked_noted`` plus the host's way on after a stop reply."""
     return _lane.host_way_on.with_way_on(name, await _tracked_noted(name, ctx, coro))
+
+
+async def _kept(name, ctx, coro):
+    """Await *coro* with the call's ONE keepalive running beside it (fix/1580 C01)."""
+    async with keepalive(name, ctx):
+        return await coro

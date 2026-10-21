@@ -25,4 +25,4 @@ def is_server_release(release: dict) -> bool:
 def highest_server_release(releases: list) -> Optional[dict]:
     """The published release with the highest ``vX.Y.Z`` tag, or None."""
     found = [r for r in releases if isinstance(r, dict) and is_server_release(r)]
-    return max(found, key=lambda r: server_tag_key(r["tag_name"]), default=None)
+    return max(found, key=lambda r: server_tag_key(r["tag_name"]) or (), default=None)

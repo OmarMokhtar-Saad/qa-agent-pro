@@ -82,7 +82,7 @@ def _checklist_item(number: int, entry: ChecklistEntry):
         tag = "ubiquitous"
     return ChecklistItem(
         item_id=f"CL-{number:03d}",
-        text=entry.text,
+        text=str(entry.text),
         ears_pattern=tag,
         source=normalize_source(entry.source),
     )

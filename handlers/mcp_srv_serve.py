@@ -1,0 +1,21 @@
+"""Run the stdio server with the event-loop stall detector beside it."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import anyio
+
+from tools.loop_stall import watch_loop
+
+
+async def _serve(server: Any) -> None:
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(watch_loop)
+        await server.run_async(show_banner=False)
+        tg.cancel_scope.cancel()
+
+
+def run_server(server: Any) -> None:
+    """Blocking replacement for ``server.run(show_banner=False)``."""
+    anyio.run(_serve, server)

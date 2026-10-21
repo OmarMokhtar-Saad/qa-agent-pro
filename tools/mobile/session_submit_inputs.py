@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import held_inputs, lock_reaper
+from tools.mobile import held_inputs, lock_reaper, run_idle_timer
 from tools.mobile.replay.context import SUBMIT_BUDGET_S, Context
 from tools.mobile.session_audit import MOBILE_MAX_TESTER_INPUTS
 from tools.mobile.session_core import PACKET_RESERVE_S
@@ -121,6 +121,7 @@ def prepare_submit(
 ) -> tuple[Context, dict, str] | dict:
     """The replay Context, run body and field name for *call*, or an error dict."""
     lock_reaper.touch_activity(call.run_id)
+    run_idle_timer.arm(call.run_id)
     body = resolved["content"] or {}
     ctx = context_for(body)
     _cap_submit_budget(ctx, call.budget)

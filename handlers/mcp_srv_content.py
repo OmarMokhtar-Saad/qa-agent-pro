@@ -105,9 +105,11 @@ class MobileReplySpec(NamedTuple):
     handler: Callable
 
 
-def _device_of(fields: dict) -> str:
-    """The ``device_id`` a mobile call named, or ``""``."""
-    return str(fields.get("device_id") or "")
+def _target_of(fields: dict) -> "_lane.host_way_on.Target":
+    """The ``device_id`` and ``package`` a mobile call named (``""`` if none)."""
+    return _lane.host_way_on.Target(
+        str(fields.get("device_id") or ""), str(fields.get("package") or "")
+    )
 
 
 async def _mobile_reply(spec: MobileReplySpec, ctx, fields: dict, **extra) -> list:
@@ -126,5 +128,5 @@ async def _mobile_reply(spec: MobileReplySpec, ctx, fields: dict, **extra) -> li
             spec.handler(**fields, **extra, progress=_make_progress(ctx)),
         )
     # a stop never leaves the host without a way on (fix/1490)
-    text = _lane.host_way_on.with_way_on(spec.name, text, _device_of(fields))
+    text = _lane.host_way_on.with_way_on(spec.name, text, _target_of(fields))
     return [TextContent(type="text", text=text)]

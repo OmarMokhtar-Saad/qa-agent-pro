@@ -32,4 +32,8 @@ def at_rest(serial: str, quiet: int) -> bool:
 def quiet_exit(serial: str, quiet: int) -> bool:
     """True when the screen is at rest AND silent for ``EARLY_EXIT_MS``."""
     clock = a11y_events.latest(serial)
-    return at_rest(serial, quiet) and clock.quiet_ms() >= EARLY_EXIT_MS
+    return (
+        clock is not None
+        and at_rest(serial, quiet)
+        and clock.quiet_ms() >= EARLY_EXIT_MS
+    )

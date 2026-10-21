@@ -25,6 +25,7 @@ from tools.mobile import (
     app_knowledge,
     knowledge_db,  # noqa: F401
     knowledge_limits,  # noqa: F401
+    knowledge_scope,
     run_store,
 )
 from tools.mobile.knowledge_run_args import (  # noqa: F401
@@ -40,9 +41,9 @@ from tools.mobile.knowledge_run_env import (  # noqa: F401
     parse_env_checked,
 )
 from tools.mobile.knowledge_run_state import (  # noqa: F401
-    _finished,
     mark_state,
     pending_runs,
+    run_finished,
 )
 from tools.mobile.knowledge_run_store import (  # noqa: F401
     MAX_VERSIONS_SEEN,
@@ -114,14 +115,27 @@ async def _read_facts(ctx: object, run_id: str, package: str) -> RunFacts:
     return RunFacts(run_id, package, str(name), str(code), dict(env), lane)
 
 
+async def _early(run_id: str, package: str) -> RunFacts | None:
+    """The cached facts, or knowledge-OFF facts (C10: no db, no flows; the run goes
+    on) for an out-of-scope package; ``None`` when the run needs a real begin."""
+    if run_id and run_id in _FACTS:
+        return _FACTS[run_id]
+    why = knowledge_scope.knowledge_scope(package)
+    if not why:
+        await asyncio.to_thread(knowledge_scope.purge_once)
+        return None
+    return RunFacts(run_id, package, knowledge_off=why)
+
+
 async def begin_run(ctx: object, resume: Callable | None = None) -> RunFacts:
     """Facts for this run, read ONCE (cached by run_id). Writes the ``runs`` row
     and fires the background ``resume`` (supplied by the caller) when given. Never raises, never blocks the start."""
     run_id = str(getattr(ctx, "run_id", "") or "")
     package = str(getattr(ctx, "package", "") or "")
     try:
-        if run_id and run_id in _FACTS:
-            return _FACTS[run_id]
+        early = await _early(run_id, package)
+        if early is not None:
+            return early
         facts = await _read_facts(ctx, run_id, package)
         if run_id and package:
             _remember(facts)

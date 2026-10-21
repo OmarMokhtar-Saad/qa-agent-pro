@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import shlex
 from typing import Any, NamedTuple
 from urllib.parse import urlsplit
@@ -42,9 +43,14 @@ async def swipe(serial: str, move: Swipe) -> dict:
             "error": "Refusing to swipe with " + repr(tuple(move)),
             "content": None,
         }
-    return await host().shell(
+    # Lazy: a11y_next -> a11y_dump -> adb -> adb_input is an import cycle.
+    held = importlib.import_module("tools.mobile.a11y_next").generation_of(serial)
+    done = await host().shell(
         serial, ["input", "swipe"] + [str(p) for p in points] + [str(duration)]
     )
+    if not done.get("error"):  # our own swipe is an expected change (C04)
+        await importlib.import_module("tools.mobile.a11y_scrolled").after(serial, held)
+    return done
 
 
 async def keyevent(serial: str, code: object) -> dict:

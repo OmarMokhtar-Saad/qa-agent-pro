@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from tools.mobile.action_consts import (
@@ -85,7 +86,7 @@ def total_wait_ms(actions: object) -> int:
 def condition_wait_ms(actions: object) -> int:
     """The ``max_s`` ceilings of every condition wait in *actions*, in ms."""
     total = 0
-    for action in list(actions or []):
+    for action in actions if isinstance(actions, Iterable) else ():
         if str(getattr(action, "op", "") or "") in WAIT_UNTIL_OPS:
             total += int(float(getattr(action, "max_s", 0) or 0) * 1000)
     return total

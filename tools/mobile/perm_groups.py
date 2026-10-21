@@ -8,6 +8,9 @@ name. A group maps to the Android permissions revoked at setup; its keywords
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Any
+
 _P = "android.permission."
 
 #: Group name -> the runtime permissions it covers (short names, ``_P`` prefixed below).
@@ -69,9 +72,14 @@ def _canonical(value: object) -> str:
     return key if key in GROUPS else ALIASES.get(key, "")
 
 
+def _listed(values: object) -> list[Any]:
+    """*values* as a list: ``[]`` when it is not iterable."""
+    return list(values) if isinstance(values, Iterable) else []
+
+
 def _items(values: object) -> list[str]:
     """The comma-split, non-empty entries of a list (or one string)."""
-    raw = [values] if isinstance(values, str) else list(values or [])
+    raw = [values] if isinstance(values, str) else _listed(values)
     return [p.strip() for v in raw for p in str(v).split(",") if p.strip()]
 
 
@@ -93,7 +101,7 @@ def parse_deny(values: object) -> tuple[list[str], str]:
 def perms_of(names: object) -> list[str]:
     """The Android permission names the canonical *names* cover, in order, unique."""
     out: list[str] = []
-    for name in names or ():
+    for name in _listed(names):
         for perm in GROUPS.get(name) or (name,):
             if perm not in out:
                 out.append(perm)
@@ -103,5 +111,6 @@ def perms_of(names: object) -> list[str]:
 def groups_of(names: object) -> frozenset:
     """The groups the canonical *names* belong to (a raw name via its owner group; one no group owns stays itself)."""
     return frozenset(
-        name if name in GROUPS else _RAW_OWNER.get(name, name) for name in names or ()
+        name if name in GROUPS else _RAW_OWNER.get(name, name)
+        for name in _listed(names)
     )

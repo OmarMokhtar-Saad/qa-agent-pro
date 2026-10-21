@@ -7,6 +7,8 @@ from tools.mobile.report_verdict import _goal_result, _unify_verdict
 from tools.mobile.report_widgets import _segbar, _tile_order
 from tools.mobile.rjny_args import _ResultsIn
 from tools.mobile.rjny_words import RESULTS, SUMMARY_ID, _count, _result_pill
+from tools.mobile.run_mask_cue import mask_cues
+from tools.mobile.run_mask_id import mask_id
 
 
 def _issue_item(f: dict, kinds: dict) -> str:
@@ -42,7 +44,7 @@ def _goal_lines(groups: list) -> list:
         '<li class="result">'
         + _result_pill(_goal_result(group["cases"]))
         + '<span dir="auto">'
-        + esc(group["goal"], 400)
+        + esc(mask_id(mask_cues(group["goal"])), 400)
         + "</span></li>"
         for group in groups
     ]

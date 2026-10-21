@@ -104,10 +104,10 @@ def _attach_rtm_data(
     """Carry the traceability data OUT on private attrs of the suite."""
     acs, source_acs = prepared.acs, prepared.source_acs
     try:
-        suite._rtm_trace = rtm_trace(acs, renumbered)
+        setattr(suite, "_rtm_trace", rtm_trace(acs, renumbered))
         # The submit-side nudge NAMES a few orphans: the FINAL ids, capped in
         # tools/rtm.orphan_case_ids.
-        suite._rtm_orphan_ids = orphan_case_ids(acs, renumbered)
+        setattr(suite, "_rtm_orphan_ids", orphan_case_ids(acs, renumbered))
         # F06: the workbook's traceability sheet; `derived` (acs set, source_acs
         # empty) means the host SYNTHESIZED them, and the sheet says so.
         suite._rtm_artifacts = {

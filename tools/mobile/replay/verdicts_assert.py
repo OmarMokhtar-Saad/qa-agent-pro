@@ -13,6 +13,7 @@ from tools.mobile.replay.screen import (
     _texts,
     _typed_by_script,
 )
+from tools.mobile.replay.verdicts_wait_evidence import wait_verdict
 
 
 class AssertView(NamedTuple):
@@ -126,6 +127,9 @@ def _assert_new_text(action: Any, view: AssertView) -> tuple[bool, str]:
 
 def _assert_screen_changed(screen: Any, trace: list[dict]) -> tuple[bool, str]:
     """``assert screen_changed`` (weak: compares ids, see ``_evaluate_assert``)."""
+    waited = wait_verdict(trace)
+    if waited is not None:
+        return waited
     seen = [
         entry.get("before_screen_id")
         for entry in trace

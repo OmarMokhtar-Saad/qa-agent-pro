@@ -26,16 +26,16 @@ from collections.abc import Awaitable
 from dataclasses import dataclass, field
 
 from handlers.mobile import run_background_flags as flags
+from handlers.mobile.run_background_still import still_running
 from tools.mobile import lock_reaper, locks, locks_devices, session_finish
 
-#: Longest an adopting call waits for a still-running setup (a cold install).
-ADOPT_DEADLINE_S = 600.0
+#: Longest an adopting call waits for a setup; under the host timeout (fix/1580).
+ADOPT_DEADLINE_S = 90.0
 
 _NOTE = (
     "(Picked up the setup your previous call started before it was "
     "cancelled; nothing was downloaded twice.)\n\n"
 )
-_STILL = "The setup from your previous call is still running; call again."
 
 
 @dataclass
@@ -45,6 +45,7 @@ class Job:
     orphaned: bool = False
     flags: dict = field(default_factory=dict)
     done_at: float = 0.0
+    started: float = field(default_factory=time.time)
     serial: str = ""
     run_id: str = ""
     reply: str = ""
@@ -142,7 +143,7 @@ def _gone(job: Job) -> bool:
 async def _adopt_wait(job: Job) -> str | None:
     done, _ = await asyncio.wait({job.task}, timeout=ADOPT_DEADLINE_S)
     if not done:
-        return _STILL
+        return still_running(job.started)
     if _gone(job):
         _drop(job)
         return None

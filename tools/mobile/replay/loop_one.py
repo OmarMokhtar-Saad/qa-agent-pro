@@ -137,7 +137,8 @@ async def _present_cur(run: _ReplayRun, turn: Turn, cur: Cur) -> Cur | dict | No
         return _interrupted_reply(run, at, interruption)
     if found and resolve_optional_text(action.text, screen)["element"] is not None:
         return Cur(Aim("tap_text", action), at)
-    return _skipped(run, at, _skip_detail(action.text, found))
+    _skipped(run, at, _skip_detail(action.text, found))
+    return None
 
 
 def _skip_detail(text: str, found: bool) -> str:

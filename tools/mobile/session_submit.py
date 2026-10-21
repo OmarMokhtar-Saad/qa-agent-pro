@@ -82,5 +82,5 @@ async def _submit_explore_held(call: ExploreCall) -> dict:
     explored = await submit_explore(call)
     content = explored.get("content") if isinstance(explored, dict) else None
     if isinstance(content, dict) and content.get("state") == STATE_REPORT:
-        held_inputs.forget(call.run_id)
+        held_inputs.forget(call.run_id, secrets=False)  # the finish scan reads them
     return explored

@@ -20,7 +20,7 @@ def _stale(step: dict, screen: object) -> bool:
     live = isinstance(screen, dict) and bool(screen.get("elements"))
     if not live or step.get("op") != "wait_until_text":
         return False
-    return not _screen_has(screen, step.get("text"))
+    return not _screen_has(screen, str(step.get("text") or ""))
 
 
 def _capped(step: dict) -> dict:

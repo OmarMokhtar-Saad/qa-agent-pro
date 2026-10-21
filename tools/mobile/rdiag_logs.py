@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
-from tools.mobile import run_finalize
+from tools.mobile import run_finalize, run_idle_close
 from tools.mobile.rdiag_findings import _findings_section
 from tools.mobile.report_text import esc
 from tools.mobile.report_verdict import error_classes, error_phrase, explore_stop
+
+
+def _stop_line(book: dict) -> str:
+    """Why the run stopped; the server's own closes carry their recorded reason."""
+    stop = explore_stop(book) or run_finalize.stop_text(book)
+    if stop in run_idle_close.STOP_WORDED:
+        stop = stop + ": " + str(run_finalize.recorded(book).get("reason") or "")
+    return stop
 
 
 def _logs_section(manifest: object, facts: object, turns: int) -> str:
@@ -17,7 +25,7 @@ def _logs_section(manifest: object, facts: object, turns: int) -> str:
     """
     book = manifest if isinstance(manifest, dict) else {}
     body = _findings_section(book, turns) or ""
-    stop = explore_stop(book) or run_finalize.stop_text(book)
+    stop = _stop_line(book)
     if stop:
         body += '<div class="guard"><p class="gapterm">why this run stopped</p>'
         body += '<p class="gsub">' + esc(stop, 300) + "</p></div>"

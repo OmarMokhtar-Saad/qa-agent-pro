@@ -3,22 +3,7 @@
 from __future__ import annotations
 
 from tools.mobile import case_runner, locks, run_finalize, run_store
-
-
-def last_checkpoint_ts(run_id: str) -> float | None:
-    """When the newest case checkpoint of *run_id* was written, or None.
-
-    The idle release's persisted clock for a holder this process no longer
-    tracks (evicted from the reaper table, or the server restarted). Never the
-    lease stamp: the heartbeat refreshes that for as long as the run lives.
-    Never raises.
-    """
-    try:
-        cases = run_store.run_path(run_id) / run_store.CASES_DIR
-        stamps = [p.stat().st_mtime for p in cases.glob("TC-*.json")]
-    except (OSError, ValueError):
-        return None
-    return max(stamps, default=None)
+from tools.mobile.checkpoint_clock import last_checkpoint_ts  # noqa: F401
 
 
 def awaits_tester(run_id: str) -> bool:

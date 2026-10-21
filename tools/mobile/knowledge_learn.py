@@ -60,6 +60,10 @@ def _learn(conn, key: RunKey) -> dict:
     row = _ensure(conn, key.run_id)
     if row.get("learn_state") in ("learned", "skipped"):
         return {"state": row["learn_state"], "noop": True}
+    if not knowledge_run.run_finished(
+        key.run_id, row.get("started") or 0.0, time.time()
+    ):
+        return {"state": "open", "reason": "run still open", "noop": True}
     steps = knowledge_trace.load_steps(key.run_id)
     why = kstg_foreign.package_problem(key.package, steps)
     if why:

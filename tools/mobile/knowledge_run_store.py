@@ -46,8 +46,8 @@ def init_manifest(run_id: str, env: object = None) -> bool:
         return False
 
 
-def store_state(run_id: str, state: str) -> None:
-    """Mirror ``runs.learn_state`` on the manifest. Never raises."""
+def store_state(run_id: str, state: str, reason: str = "") -> None:
+    """Mirror ``runs.learn_state`` (and why) on the manifest. Never raises."""
     try:
         read = run_store.read_manifest(run_id) or {}
         body = read.get("content")
@@ -56,6 +56,7 @@ def store_state(run_id: str, state: str) -> None:
         know = body.setdefault("knowledge", {})
         if isinstance(know, dict) and know.get("learn_state") != state:
             know["learn_state"] = state
+            know["learn_reason"] = reason
             run_store.write_manifest(run_id, body)
     except Exception:
         logger.exception("knowledge run: store_state failed")

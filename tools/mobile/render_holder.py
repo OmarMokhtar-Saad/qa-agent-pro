@@ -30,7 +30,7 @@ from __future__ import annotations
 import time
 
 from config.settings_guard import never_raise
-from tools.mobile import locks, prerun_inflight, run_store, session_resolve
+from tools.mobile import locks, prerun_inflight, render_busy, run_store, session_resolve
 from tools.mobile.session_core import STATE_REPORT
 
 _NO_LOCK_TEXT = (
@@ -98,7 +98,7 @@ def _holder_label(body: dict) -> str:
     return who
 
 
-def _holder_finished(who: str) -> bool:
+def holder_finished(who: str) -> bool:
     """Whether the holder run has reached its report. Never raises.
 
     THE HOLDER'S OWN STATE, asked once, of the producer that answers the
@@ -190,7 +190,8 @@ def device_busy_block(refusal: object) -> str:
         return _NO_LOCK_TEXT
     lines = [
         "## Another run is using the device\n",
-        _holder_paragraph(who, same, _holder_finished(who)),
+        _holder_paragraph(who, same, holder_finished(who)),
+        render_busy.facts_block(who),
         _ONE_LOCK_NOTE,
     ]
     return "\n".join(lines)

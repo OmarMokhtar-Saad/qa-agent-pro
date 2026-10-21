@@ -22,6 +22,7 @@ import re
 from collections.abc import Iterable
 
 from tools.mobile import run_consts
+from tools.mobile.run_mask_cue import GOAL_KEYS, mask_cues
 
 _ID_RE = re.compile(r"(?<![\w.-])\d{8,}(?![\w-]|\.\d)")
 # A Saudi National ID / Iqama: 10 digits starting 1 or 2, optional single space or
@@ -88,3 +89,5 @@ def mask_node(out: dict) -> None:
             out[key] = mask_id(out[key])
     for key in _strings(out, [k for k in out if str(k).lower() in _PROSE_KEYS]):
         out[key] = mask_id(out[key])
+    for key in _strings(out, [k for k in out if str(k).lower() in GOAL_KEYS]):
+        out[key] = mask_id(mask_cues(out[key]))

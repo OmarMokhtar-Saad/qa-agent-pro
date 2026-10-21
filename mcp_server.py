@@ -30,7 +30,7 @@ from pathlib import Path
 os.chdir(Path(__file__).resolve().parent)
 
 import tools.selfcheck as selfcheck_module  # noqa: E402, F401, I001  (public name)
-from handlers import mcp_srv_build, mcp_srv_main  # noqa: E402
+from handlers import mcp_srv_build, mcp_srv_main, mcp_srv_serve  # noqa: E402
 from handlers.mcp_srv_settings import settings  # noqa: E402, F401
 from handlers.mcp_srv_build import (  # noqa: E402, F401
     _new_fastmcp,
@@ -92,12 +92,13 @@ def main() -> None:
         return
     mcp_srv_main.disclose_degraded_llm()
     mcp_srv_main.announce_startup()
+    mcp_srv_main.install_wire_tap()
     server = build_server()
     _register_mobile_defaults()
     mcp_srv_main.announce_server_start()
     mcp_srv_main.start_drift_thread(_drift_watch)
     logger.info("Starting the qa-agents MCP server over stdio…")
-    server.run(show_banner=False)
+    mcp_srv_serve.run_server(server)
 
 
 if __name__ == "__main__":

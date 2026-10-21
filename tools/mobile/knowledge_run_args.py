@@ -30,3 +30,4 @@ class RunFacts:
     version_code: str = ""
     env: dict = field(default_factory=dict)
     lane: str = ""
+    knowledge_off: str = ""  # why knowledge is off for this run (C10), else ""

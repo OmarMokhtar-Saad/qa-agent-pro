@@ -22,7 +22,7 @@ Middleware base is not importable, and the caller also guards on
 from __future__ import annotations
 
 import logging
-from typing import Any, cast
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -31,16 +31,20 @@ from tools import mcp_arg_tolerance
 from tools import mcp_rejection_hint as rejection_hint
 
 try:
-    from fastmcp.server.middleware import Middleware
+    from fastmcp.server.middleware import Middleware as _Middleware
+
+    Middleware: Any = _Middleware
 except ImportError as exc:  # no fastmcp, or one without middleware
     if (exc.name or "").split(".")[0] != "fastmcp":
         raise
-    Middleware = cast("Any", None)
+    Middleware = None
 
 try:
-    from fastmcp.exceptions import ToolError
+    from fastmcp.exceptions import ToolError as _ToolError
+
+    ToolError: Any = _ToolError
 except ImportError:  # no fastmcp
-    ToolError = cast("Any", None)  # type: ignore[misc]
+    ToolError = None
 
 logger = logging.getLogger("qa_agents.mcp")
 MAX_NAMES = 8

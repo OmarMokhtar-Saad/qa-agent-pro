@@ -7,6 +7,7 @@ from typing import cast
 from handlers import _common, mobile_gate
 from handlers.mobile import run as mobile_run
 from handlers.mobile import step as mobile_step
+from handlers.mobile import stop_cap
 from handlers.mobile.device_requests import AppArgs, UpdateArgs
 from tools.mobile import (
     app_pick,
@@ -23,17 +24,23 @@ from tools.untrusted import wrap_untrusted
 async def _stop_result(target: str, choose: _common.ChooseCb):
     """Ask ``stop_run.stop`` to stop the run *target* names (None = ask)."""
 
-    return await stop_run.stop(
-        str(target or "").strip() or None,
+    named = str(target or "").strip()
+    stopping = stop_run.stop(
+        named or None,
         session_finish.stop_ports(),
         stop_run.StopOpts(ask=mobile_run._mobile_ask(choose)),
     )
+    # No target = the stop may ask the user which run: never cap a question.
+    return await (stop_cap.capped(stopping) if named else stopping)
 
 
 def _stop_reply(result) -> str:
     """The reply for a stop *result*: the verdict word, then its message."""
 
-    head = "Stopped." if result.ok else "⚠️ Not stopped."
+    pending = result.message.startswith(stop_cap.PENDING_HEAD)
+    head = (
+        "Stopped." if result.ok else "⚠️ Stop pending." if pending else "⚠️ Not stopped."
+    )
     return (
         head
         + "\n"
@@ -54,8 +61,6 @@ async def handle_mobile_stop(
         result = await _stop_result(target, choose)
     except mobile_step._MOBILE_TOOL_FAILURES as exc:
         return mobile_step._mobile_tool_failed(exc, "qa_mobile_stop")
-    if result.ok:
-        mobile_step._mobile_learn_after(str(getattr(result, "run_id", "") or ""))
     return _stop_reply(result)
 
 

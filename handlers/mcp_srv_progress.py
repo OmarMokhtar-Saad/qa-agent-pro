@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from contextlib import asynccontextmanager
 
 from config.settings_guard import never_raise
 from handlers import _lane
@@ -27,6 +29,7 @@ def _ping_sender(ctx, state):
 
     async def progress(message: str) -> None:
         state["n"] += 1
+        state["last"] = time.monotonic()
         with never_raise(
             logger, "mcp report_progress failed for %r", message, exc_info=True
         ):
@@ -66,7 +69,44 @@ def _bind_watch(progress) -> None:
 def _make_progress(ctx):
     """Adapt a FastMCP Context into the handlers' ``(message)->awaitable`` callback."""
     _note_client(ctx)  # every tool builds one of these — cheap host detection
-    state = {"n": 0}
+    state = state_of(ctx)
     progress = _ping_sender(ctx, state)
     _bind_watch(progress)
     return progress
+
+
+#: Silence after which a running tool call is pinged; well under the host's
+#: ~120 s idle timeout (fix/1580 C01).
+KEEPALIVE_S = 20.0
+
+
+def state_of(ctx) -> dict:
+    """The progress counter and last-send clock shared by every sender of *ctx*."""
+    state = getattr(ctx, "_qa_progress_state", None)
+    if not isinstance(state, dict):
+        state = {"n": 0, "last": time.monotonic()}
+        with never_raise():
+            ctx._qa_progress_state = state
+    return state
+
+
+async def _pulse(name: str, ctx) -> None:
+    state, started = state_of(ctx), time.monotonic()
+    send = _ping_sender(ctx, state)
+    while True:
+        await asyncio.sleep(max(0.1, state["last"] + KEEPALIVE_S - time.monotonic()))
+        if time.monotonic() - state["last"] >= KEEPALIVE_S:
+            await send(f"still working: {name} {int(time.monotonic() - started)}s")
+
+
+@asynccontextmanager
+async def keepalive(name: str, ctx):
+    """ONE keepalive per tool call: pings while the body runs silent, ends with it."""
+    if ctx is None:
+        yield
+        return
+    task = asyncio.ensure_future(_pulse(name, ctx))
+    try:
+        yield
+    finally:
+        task.cancel()

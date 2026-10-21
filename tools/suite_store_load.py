@@ -117,7 +117,7 @@ def suite_from_rows(suite_id: str, case_rows: list) -> TestSuite | None:
     # dropped count must reach the tester, not just the log. Private attr, the
     # same channel _checklist_artifacts already uses.
     if skipped:
-        suite._load_skipped = skipped
+        setattr(suite, "_load_skipped", skipped)
     return suite
 
 

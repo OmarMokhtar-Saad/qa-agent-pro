@@ -27,7 +27,8 @@ def target_text(action: dict) -> str:
 
 
 def _target(action: dict, snap: dict | None = None) -> dict:
-    raw = action.get("target") if isinstance(action.get("target"), dict) else {}
+    raw = action.get("target")
+    raw = raw if isinstance(raw, dict) else {}
     out = {k: str(raw[k])[:200] for k in _TARGET_KEYS if raw.get(k)}
     if out or not isinstance(snap, dict):
         return out

@@ -7,9 +7,9 @@ import logging
 from handlers import _common, mobile_gate
 from handlers.mobile.device_requests import StatusArgs, StatusView
 from handlers.mobile.device_runs import _mobile_status_listing
+from tools.mobile import knowledge_close, session_packets, session_records, session_runs
 from tools.mobile import render as mobile_render
 from tools.mobile import report as mobile_report
-from tools.mobile import session_packets, session_records, session_runs
 from tools.mobile.replay import stop_shot
 from tools.mobile.session_core import STATE_ABANDONED
 from tools.untrusted import single_line as _safe
@@ -95,7 +95,9 @@ def _mobile_status_text(view: StatusView) -> str:
     hardware = session_records.device_line(view.body)
     summary = _summary_text(view, coverage)
     head = relay + mobile_render.status_block(view.body, coverage)
-    return head + hardware + "\n\n" + summary
+    learn = knowledge_close.learn_line(view.run_id)
+    learn = "\n\nKnowledge: " + learn if learn else ""
+    return head + hardware + learn + "\n\n" + summary
 
 
 async def _status_reply(request: StatusArgs) -> str:

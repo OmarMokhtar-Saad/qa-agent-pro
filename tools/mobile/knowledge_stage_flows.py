@@ -19,6 +19,7 @@ from typing import NamedTuple
 from tools.mobile import (
     app_flows,
     flow_goal_migrate,
+    knowledge_scope,
     kstg_flow_build,
     kstg_flow_cut,
     kstg_flow_dedupe,
@@ -49,6 +50,8 @@ class _Outcome(NamedTuple):
 
 
 def _save(package: str, packet: _Packet) -> _Outcome:
+    if not knowledge_scope.allowed(package):
+        return _Outcome(knowledge_scope.knowledge_scope(package), "", "")
     got = app_flows.template_from_script({"actions": packet.acts})
     if got.get("error"):
         return _Outcome(str(got["error"])[:120], "", "")

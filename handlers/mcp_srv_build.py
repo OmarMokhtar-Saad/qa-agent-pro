@@ -8,7 +8,7 @@ that patch a facade name still bite.
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple
 
 from config.settings_guard import never_raise
 from handlers import (
@@ -96,12 +96,19 @@ def _register_first(mcp, kit: _Kit, rt) -> None:
 
 
 try:
-    from fastmcp import Context, FastMCP
-    from mcp.types import ContentBlock, ToolAnnotations
+    from fastmcp import Context as _Ctx
+    from fastmcp import FastMCP as _Mcp
+    from mcp.types import ContentBlock as _Block
+    from mcp.types import ToolAnnotations as _Annot
+
+    Context: Any = _Ctx
+    FastMCP: Any = _Mcp
+    ContentBlock: Any = _Block
+    ToolAnnotations: Any = _Annot
 except ImportError as exc:
     if (exc.name or "").split(".")[0] not in ("fastmcp", "mcp"):
         raise
-    Context = FastMCP = ContentBlock = ToolAnnotations = cast("Any", None)
+    Context = FastMCP = ContentBlock = ToolAnnotations = None
 
 
 def _register_rest(mcp, kit: _Kit, rt) -> None:

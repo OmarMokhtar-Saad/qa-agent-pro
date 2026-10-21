@@ -10,15 +10,20 @@ from tools.mobile import wait_ceiling
 from tools.mobile.action_consts import WAIT_UNTIL_OPS
 
 
-def samples(ctx: Any, op: str, screen: Any) -> list:
-    """The learned OK-wait samples (ms) for *op* on *screen*; ``[]`` when none."""
+def samples(ctx: Any, target: Any, screen: Any) -> list:
+    """The learned OK-wait samples (ms) of a wait on *screen*; ``[]`` when none.
+
+    *target* is ``(op, target_rid)`` (a bare op means no rid): rows are stored per
+    target, so the lookup must name the same rid the learner recorded.
+    """
+    op, rid = (target, "") if isinstance(target, str) else target
     if op not in WAIT_UNTIL_OPS:
         return []
     snap = (getattr(ctx, "knowledge", None) or {}).get("snap") or {}
     waits = snap.get("waits") or {}
     if not waits:
         return []
-    return list(waits.get((plug.key_of(ctx, screen), op, "")) or [])
+    return list(waits.get((plug.key_of(ctx, screen), op, rid)) or [])
 
 
 def bounded(spec: Any, learned: list) -> Any:

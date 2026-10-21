@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from tools.mobile import actions as actions_mod
+from tools.mobile import knowledge_plug_timings as plug
 from tools.mobile import wait_ceiling_lookup
 from tools.mobile.replay.context import _ReplayRun, _Step
 from tools.mobile.replay.device_ops import _perform
@@ -31,6 +32,11 @@ from tools.mobile.replay.waits_types import ChangedStep, CondStep
 CALM_PROOFS = frozenset({"wait_until_idle", "wait_until_gone"})
 
 
+def _op_rid(step: _Step) -> tuple:
+    """``(op, target_rid)`` of the wait, the key its learned rows are stored under."""
+    return step.op, plug.step_op_rid(step.action)[1]
+
+
 async def _wait_step(
     run: _ReplayRun, step: _Step, screen: Any
 ) -> tuple[Any, dict | None]:
@@ -39,7 +45,7 @@ async def _wait_step(
     Every wait is a condition with a bound (S17): the legacy `wait` maps onto
     the same four through `_wait_spec`. The bound is the learned ceiling (B16).
     """
-    learned = wait_ceiling_lookup.samples(run.ctx, step.op, screen)
+    learned = wait_ceiling_lookup.samples(run.ctx, _op_rid(step), screen)
     declared = _wait_spec(step.action, run.items)
     spec = wait_ceiling_lookup.bounded(declared, learned)
     began = time.monotonic()

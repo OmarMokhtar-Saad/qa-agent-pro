@@ -14,6 +14,7 @@ host then asks. The block names no app, package or screen of any one app.
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 #: A reply that already carries this (App Tester's own ``host_next``) is left as is.
 MARK = "**You decide the next step"
@@ -29,6 +30,8 @@ _STOP_HEADS = (
 #: A case verdict line (``❌ `TC-1` title — **fail**``): the test's outcome, not a stop.
 _VERDICT = re.compile(r"\S+ `[^`\n]*`[^\n]* — \*\*")
 
+_PACKAGE = re.compile(r"[A-Za-z][\w.]*")
+
 _WARN = "⚠"
 
 _ASK = (
@@ -39,12 +42,24 @@ _ASK = (
 )
 
 
-def _drive(device_id: str) -> str:
+class Target(NamedTuple):
+    """What the stopped call named: its device and the app package it was about."""
+
+    device_id: str = ""
+    package: str = ""
+
+
+def _drive(device_id: str, package: str = "") -> str:
     """The call that opens the app on screen as a run the host drives itself."""
     device = device_id or "<device>"
+    app = (
+        package
+        if _PACKAGE.fullmatch(package)
+        else "<app under test, not the installer>"
+    )
     return (
         '`qa_mobile_test(device_id="' + device + '", source="installed_package", '
-        'package="<app under test, not the installer>", apply=true, '
+        'package="' + app + '", apply=true, '
         'goal="<what to do>")`, then '
         "`qa_submit_mobile_step` per screen and `qa_mobile_stop` at the end"
     )
@@ -57,7 +72,7 @@ def _again(tool: str) -> str:
     return "call `" + tool + "` again with the missing or corrected argument"
 
 
-def _step_options(tool: str, device_id: str) -> str:
+def _step_options(tool: str, target: Target) -> str:
     """A step that could not go on: read, resend, start over, or ask."""
     return (
         "(1) read the screen in this reply or with `qa_mobile_status(run_id=...)`; "
@@ -67,7 +82,7 @@ def _step_options(tool: str, device_id: str) -> str:
     )
 
 
-def _status_options(tool: str, device_id: str) -> str:
+def _status_options(tool: str, target: Target) -> str:
     """A status lookup that failed: list the runs, then name one by run id."""
     return (
         "(1) `qa_mobile_status()` with no run id lists the runs; (2) call "
@@ -75,7 +90,7 @@ def _status_options(tool: str, device_id: str) -> str:
     )
 
 
-def _runs_options(tool: str, device_id: str) -> str:
+def _runs_options(tool: str, target: Target) -> str:
     """A stop that failed: list the runs, then name one."""
     return (
         "(1) `qa_mobile_status()` with no run id lists the runs; (2) call `"
@@ -85,18 +100,18 @@ def _runs_options(tool: str, device_id: str) -> str:
     )
 
 
-def _store_options(tool: str, device_id: str) -> str:
+def _store_options(tool: str, target: Target) -> str:
     """A saved-data tool that refused: call again, or ask."""
     return "(1) " + _again(tool) + ' (`action="list"` shows what is saved); (2) ' + _ASK
 
 
-def _device_options(tool: str, device_id: str) -> str:
+def _device_options(tool: str, target: Target) -> str:
     """Any device tool: call again, drive the screen as a run, or ask."""
     return (
         "(1) "
         + _again(tool)
         + "; (2) drive the screen yourself: "
-        + _drive(device_id)
+        + _drive(target.device_id, target.package)
         + "; (3) "
         + _ASK
     )
@@ -112,9 +127,9 @@ _BY_TOOL = {
 }
 
 
-def _options(tool: str, device_id: str) -> str:
+def _options(tool: str, target: Target) -> str:
     """The numbered options for *tool*'s stop; any other tool is a device tool."""
-    return _BY_TOOL.get(tool, _device_options)(tool, device_id)
+    return _BY_TOOL.get(tool, _device_options)(tool, target)
 
 
 def _head(text: str) -> str:
@@ -140,14 +155,18 @@ def as_note(text: str) -> str:
     return "ℹ️" + text[len(_WARN) :].lstrip("️")
 
 
-def with_way_on(tool: str, text: str, device_id: str = "") -> str:
-    """*text*, plus the host's options when it is a stop reply of *tool*."""
+def with_way_on(tool: str, text: str, target: Target | str = "") -> str:
+    """*text*, plus the host's options when it is a stop reply of *tool*.
+
+    *target* is the device id, or a `Target` that also names the app package.
+    """
     if not isinstance(text, str) or not is_stop(text):
         return text
+    target = Target(target) if isinstance(target, str) else target
     return (
         text.rstrip()
         + "\n\n"
         + MARK
         + "; the server could not go on by itself.** Pick one: "
-        + _options(tool, device_id)
+        + _options(tool, target)
     )

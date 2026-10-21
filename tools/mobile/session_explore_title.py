@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tools.mobile.run_mask_cue import mask_cues
 from tools.mobile.session_explore_ids import EXPLORE_TITLE_PREFIX, explore_turn_number
 
 
@@ -13,7 +14,7 @@ def explore_turn_title(state: object, goal: str) -> str:
     body = state if isinstance(state, dict) else {}
     turn = explore_turn_number(body)
     tag = _replay_tag(body.get("auto_replay"))
-    named = " ".join(str(body.get("sub_goal") or "").split()) or goal
+    named = mask_cues(" ".join(str(body.get("sub_goal") or "").split())) or goal
     return (EXPLORE_TITLE_PREFIX + str(turn) + tag + " \u2014 " + named)[:250]
 
 

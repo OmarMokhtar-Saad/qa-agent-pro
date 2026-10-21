@@ -87,6 +87,18 @@ from pathlib import Path as _PathLib
 
 INSTALL_DIR = _PathLib(os.path.dirname(os.path.abspath(__file__)))
 
+try:
+    from tools.wire_log import open_wire_log
+
+    WIRE = open_wire_log("launcher", INSTALL_DIR, track_replies=True)
+except Exception:  # wire logging is optional: never block startup
+
+    class WIRE:  # type: ignore[no-redef]
+        @staticmethod
+        def seen(direction, line):
+            return None
+
+
 log = logging.getLogger("qa_agent_pro.launcher")
 
 
@@ -576,6 +588,7 @@ class Supervisor:
         out = sys.stdout.buffer
         for line in iter(child.stdout.readline, b""):
             self.last_activity = time.time()
+            WIRE.seen("out", line)
             if self.swallow_id is not None:
                 try:
                     if json.loads(line).get("id") == self.swallow_id:
@@ -644,6 +657,7 @@ class Supervisor:
         stdin = sys.stdin.buffer
         for line in iter(stdin.readline, b""):
             self.last_activity = time.time()
+            WIRE.seen("in", line)
             msg = _as_dict(line)
             method = msg.get("method")
             if method == "initialize":

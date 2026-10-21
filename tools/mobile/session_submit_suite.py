@@ -66,7 +66,7 @@ async def _finish_report(target: _SuiteTarget) -> None:
     """The run reached its report: gather the evidence, drop the held inputs."""
 
     await _finish_evidence(target.run_id, target.body)
-    held_inputs.forget(target.run_id)
+    held_inputs.forget(target.run_id, secrets=False)  # the finish scan reads them
 
 
 def _suite_reply(target: _SuiteTarget, state: str, parts: tuple) -> dict:

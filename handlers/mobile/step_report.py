@@ -6,10 +6,11 @@ import asyncio
 import logging
 from typing import Any
 
-from handlers.mobile.step_support import _mobile_learn_after
 from tools.mobile import (
+    act_scrub,
     finish_evidence,
     finish_secret_scan,
+    knowledge_close,
     media,
     session_finish,
     session_records,
@@ -70,7 +71,6 @@ async def _finish_run(run_id: str, session_token: str, body: dict) -> tuple:
     await step_timing.timed("media_flush", media.flush(run_id))
     finishing = session_finish.finish_device(run_id, lease=str(session_token or ""))
     await step_timing.timed("finish_device", finishing)
-    _mobile_learn_after(run_id)
     listed = step_timing.timed_call("run_summary", session_runs.summary, run_id)
     resolved = body.get("resolved")
     rows_for_relay = listed.get("content") or []
@@ -120,8 +120,12 @@ def _summary_kwargs(run_id: str, coverage: str) -> dict[str, Any]:
 
 
 def _finish_extras_sync(run_id: str, rows: list) -> str:
-    return finish_secret_scan.scan_line(run_id) + finish_evidence.evidence_table(
-        run_id, rows
+    know = knowledge_close.learn_line(run_id)
+    know = "\n\nKnowledge: " + know if know else ""
+    return (
+        finish_secret_scan.scan_line(run_id)
+        + finish_evidence.evidence_table(run_id, rows)
+        + know
     )
 
 
@@ -139,9 +143,11 @@ async def _mobile_report_text(run_id: str, session_token: str, body: dict) -> st
         **_relay_kwargs(resolved, rows),
         typed_field_line=mobile_render.typed_field_tally(rows),
     )
-    return (
+    text = (
         relay
         + mobile_render.summary_block(rows, mobile_render.SummaryOpts(**summary))
         + await _finish_extras(run_id, rows)
         + RUN_OVER_NOTE
     )
+    act_scrub.drop(run_id)  # the scan above is remembered; a re-render reuses it
+    return text

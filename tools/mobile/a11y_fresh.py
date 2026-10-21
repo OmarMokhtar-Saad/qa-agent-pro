@@ -31,6 +31,7 @@ from tools.mobile import (
     a11y_dump,
     a11y_early,
     a11y_reread,
+    a11y_scrolled,
     a11y_strikes,
     dump_reuse,
     step_timing,
@@ -41,15 +42,12 @@ from tools.mobile.a11y_pkgs import is_ime
 
 logger = logging.getLogger("tools.mobile.a11y")
 
-#: The dump-latency source of the freshness confirmation dump.
-CONFIRM_SOURCE = "uia-fresh-confirm"
-#: The ledger note and refusal for a fast tree uiautomator contradicted.
+CONFIRM_SOURCE = "uia-fresh-confirm"  # the dump-latency source of the confirmation
+# Ledger notes and refusals: a contradicted fast tree, an unchecked repeat, a confirmed one.
 STALE_NOTE = "a11y_stale"
 STALE_REFUSAL = "the a11y tree repeated across an action and uiautomator disagrees"
-#: The ledger note and refusal for a repeat that could not be checked.
 UNCHECKED_NOTE = "a11y_repeat_unchecked"
 UNCHECKED_REFUSAL = "the a11y tree repeated across an action and could not be checked"
-#: The ledger note for a repeat uiautomator confirmed.
 CONFIRMED_NOTE = "a11y_repeat_confirmed"
 
 #: serial -> (generation after the last a11y dump, its node digest).
@@ -63,7 +61,6 @@ _PKGS: dict[str, frozenset] = {}
 
 MAX_STALE_STRIKES = a11y_strikes.MAX_STALE_STRIKES
 
-#: The refusal and ledger note while fast reading waits for the screen to change.
 SUSPENDED_NOTE = "a11y_suspended"
 SUSPENDED_REFUSAL = "the a11y tree is suspended until the screen changes"
 
@@ -78,6 +75,7 @@ def forget(serial: str) -> None:
     a11y_strikes.reset(str(serial))
     a11y_bench.forget(serial)
     a11y_clock.forget(serial)
+    a11y_scrolled.forget(serial)
 
 
 def _digest(xml: str) -> str:
@@ -153,10 +151,13 @@ async def _resume(serial: str, xml: str, judge: Confirm) -> dict | None:
 async def _verdict(serial: str, read: tuple[str, int], judge: Confirm) -> dict | None:
     """``None`` when *xml* may be served, else the refusal (suspended, stale, unchecked)."""
     xml, started_under = read
-    if serial in _SUSPENDED:
+    scrolled = a11y_scrolled.take(serial, started_under)  # our own swipe, no tap since
+    if scrolled:
+        _SUSPENDED.pop(serial, None)  # a swipe is an expected change: no stale refusal
+    elif serial in _SUSPENDED:
         return await _resume(serial, xml, judge)
     digest = _digest(xml)
-    if not _repeats(serial, digest, started_under):
+    if scrolled or not _repeats(serial, digest, started_under):
         return None
     refused = await a11y_clock.judged(serial, digest, judge)
     if refused is None:

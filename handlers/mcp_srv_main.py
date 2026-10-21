@@ -9,6 +9,8 @@ from handlers import mcp_srv_settings
 from handlers.mcp_srv_state import logger
 from tools import telemetry
 from tools.host_llm import warn_once_if_degraded
+from tools.log_setup_env import INSTALL_ROOT
+from tools.wire_tap import install_stdin_tap
 
 
 def gate_open() -> bool:
@@ -51,3 +53,9 @@ def announce_server_start() -> None:
 def start_drift_thread(target) -> None:
     """Start the drift watcher (the facade's ``_drift_watch``) as a daemon."""
     threading.Thread(target=target, daemon=True).start()
+
+
+def install_wire_tap() -> None:
+    """Log one line per request read from stdin (method, id, size; never params)."""
+    with never_raise(logger, "wire tap not installed"):
+        install_stdin_tap(INSTALL_ROOT)

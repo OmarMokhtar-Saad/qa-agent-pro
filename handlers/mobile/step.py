@@ -61,13 +61,12 @@ from handlers.mobile.step_state import (  # noqa: F401
     _mobile_route_kwargs,
     _note_mobile_step_case,
 )
-from handlers.mobile.step_support import (  # noqa: F401
-    _mobile_learn_after,
-    _mobile_tool_failed,
-    _mobile_unresolved,
-)
 from handlers.mobile.step_support import (
     _mobile_start_heartbeat as mobile_start_heartbeat,  # noqa: F401
+)
+from handlers.mobile.step_support import (  # noqa: F401
+    _mobile_tool_failed,
+    _mobile_unresolved,
 )
 from tools.mobile import step_arm
 from tools.mobile.session_core import new_budget

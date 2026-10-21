@@ -105,12 +105,18 @@ def held_fields(run_id: str, *, now: float | None = None) -> list[str]:
     return sorted(recall(run_id, now=now))
 
 
-def forget(run_id: str) -> None:
-    """Drop everything held for *run_id*. Never raises."""
+def forget(run_id: str, *, secrets: bool = True) -> None:
+    """Drop everything held for *run_id*. Never raises.
+
+    ``secrets=False`` keeps the run's scrub registry: the finish secret scan
+    (rendered with the report, after the submit returns) reads its needles from
+    it, and :func:`handlers.mobile.step_report._mobile_report_text` drops it.
+    """
     with never_raise(logger, "held_inputs.forget failed"):
         with _LOCK:
             _HELD.pop(str(run_id or ""), None)
-        act_scrub.drop(str(run_id or ""))
+        if secrets:
+            act_scrub.drop(str(run_id or ""))
 
 
 def clear() -> None:

@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.146.0] - 2026-10-20
+## [1.147.0] - 2026-10-21
 
 ### Added
 
@@ -33,6 +33,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The launcher and the server each write a small wire log under
+  `data/logs` (`wire-*.log`): one line per MCP message with direction,
+  method, id and size, never the arguments. A request with no reply
+  after 110 s is logged as "no reply for id ...", so a lost call can
+  be located. A stall of the server's event loop over 2 s is logged as
+  "event loop stalled", so a delayed call is told from a lost one.
 - A mobile setup call the chat cancels (device being picked, booted
   or the app installed) gives the device back at once. Its clean-up
   (accessibility and keyboard restore) finishes in the background, so
@@ -63,6 +69,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
   credential, so the run video has a gap there.
 - A device recorder that ignores its stop is now killed on the device,
   not left recording the steps that follow.
+- After the server scrolls or swipes, the screen read waits for the
+  device's next event and serves a tree that did not change (end of a
+  list, a short scroll) as unchanged, instead of refusing it as stale.
 - Deleting a recording segment on the device is retried once, and a
   delete that still fails is logged.
 - A step clip recorded again under the same name is joined into the
@@ -134,6 +143,46 @@ project adheres to [Semantic Versioning](https://semver.org/).
   no longer fails on a stale local main; the mypy baseline records the
   environment it was made in, and the release check refuses lost or
   reconstructed review files.
+- A goal's ID-shaped numbers and the values after password, PIN, OTP,
+  ID or username words are hidden when the run is created, in the
+  manifest, charter and cases, even if the run never types them.
+- The host's drive option after an install stop names the real app
+  package, and the App Tester APK read prefers the google_app_id
+  string over the first id-shaped value.
+- A learned wait limit now matches the wait's own target, so it takes
+  effect; it still only tightens the declared limit.
+- Learned knowledge and saved flows now follow one scope rule: system
+  apps (Play Store, browsers, Google services, settings) and the
+  installer, App Tester and launcher surfaces never get a knowledge
+  store or flows, and never auto-replay a flow; the run goes on with
+  knowledge off and its start reply says so. Stores that already exist
+  for such packages are dropped once.
+- Learning now runs when a run closes (done, stop, idle, server died),
+  exactly once. An open run is never learned or marked finished. The
+  status and the report show Knowledge: learned, pending (run still
+  open) or skipped with the reason; starting the next run only learns
+  closed runs that were missed.
+- A long tool call now sends a 'still working: <tool> N s' ping every
+  20 s, so a quiet call is no longer cut off by the host's timeout.
+- A call waiting on a setup that is still running answers after 90 s
+  with when it started, its age and the options. A call on a busy device
+  names the holder run, the running tool, its idle time, the auto-release
+  time and the next calls (qa_mobile_stop target=, qa_mobile_test
+  run_id=). qa_mobile_stop answers within 60 s and never waits on the
+  lease; the stop itself goes on in the background. A pending stop is
+  headed 'Stop pending', a stop without a target is never capped while
+  it asks which run, and a failure after the cap is logged. The busy
+  answer also says when the holder run started.
+- Any tool call that carried an argument the tool does not take now
+  names it in the reply ('ignored argument(s) ...: query').
+- A run that ends with turns still open now marks them failed (a wait
+  timed out, the app was left, a system dialog) or abandoned, never
+  done. Media recorded for a case that never landed a step is kept as an
+  abandoned case instead of being dropped.
+- A run nobody drives for 300 s closes itself as idle_timeout, and a run
+  whose server died is closed on the next start; the report says why.
+- screen_changed after only waits is judged by the wait's own result,
+  and the reply says it is weak and to use assert text_absent.
 
 ### Known
 
@@ -141,10 +190,6 @@ project adheres to [Semantic Versioning](https://semver.org/).
   real page dump had an id); only the APK read is proven. The Open
   wait after an install re-reads the screen every 0.25 s (up to 6 s),
   not on a screen event.
-- When an App Tester install cannot finish, the option to drive the
-  app as a host run shows a placeholder package; the host fills in
-  the app under test. The app id read from an APK is the first
-  id-shaped value; a wrong one only falls back to the list scan.
 - A learned wait limit only ever shortens a step's declared limit;
   it never waits longer than the flow declares.
 - If the server process is killed, the QA keyboard stays selected

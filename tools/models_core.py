@@ -58,7 +58,7 @@ class TestStep(BaseModel):
     step_number: int = Field(ge=1, description="Sequential step number starting at 1")
     action: str = Field(min_length=5, description="What the tester should do")
     test_data: Optional[str] = Field(
-        None, description="Concrete test data, e.g. 'email: test@example.com'"
+        default=None, description="Concrete test data, e.g. 'email: test@example.com'"
     )
     expected_result: str = Field(
         min_length=5, description="Observable, verifiable outcome"

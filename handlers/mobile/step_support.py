@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from config.settings_guard import never_raise
 from handlers import _common
-from handlers.mobile.step_state import _MOBILE_LEARN_TASKS, _MOBILE_TOOL_FAILURES
-from tools.mobile import app_tools, knowledge_runner, session_runs
+from tools.mobile import app_tools
 from tools.mobile import heartbeat as mobile_heartbeat
 from tools.untrusted import wrap_untrusted
 
@@ -23,25 +21,6 @@ def _mobile_start_heartbeat(run_id: str, token: str) -> None:
     """
     with never_raise(logger, "mobile heartbeat could not start", exc_info=True):
         mobile_heartbeat.start(run_id, token)
-
-
-def _mobile_learn_after(run_id: str) -> None:
-    """Schedule per-app learning for a finished run. Never raises, never waits."""
-    try:
-        if not run_id or not _common.mobile_lane_enabled():
-            return
-
-        body = (session_runs.resolve(run_id) or {}).get("content") or {}
-        package = str(body.get("package") or "")
-        if not package:
-            return
-        task = asyncio.get_running_loop().create_task(
-            knowledge_runner.after_result(package, run_id)
-        )
-        _MOBILE_LEARN_TASKS.add(task)
-        task.add_done_callback(_MOBILE_LEARN_TASKS.discard)
-    except _MOBILE_TOOL_FAILURES:
-        logger.exception("mcp mobile: could not schedule learning for %s", run_id)
 
 
 def _mobile_tool_failed(exc: BaseException, tool: str) -> str:

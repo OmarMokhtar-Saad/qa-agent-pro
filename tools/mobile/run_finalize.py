@@ -19,10 +19,15 @@ reported instead of a success-shaped reply.
 from __future__ import annotations
 
 import logging
-import time
 
 from config.settings_guard import never_raise
-from tools.mobile import media_pending, run_store
+from tools.mobile import (
+    knowledge_close,
+    run_finalize_cases,
+    run_finalize_media,
+    run_idle_handles,
+    run_store,
+)
 
 logger = logging.getLogger("tools.mobile.session")
 
@@ -30,6 +35,10 @@ logger = logging.getLogger("tools.mobile.session")
 STOP_TESTER = "stopped_by_tester"
 #: Written when a new run took the device from a holder that had gone idle.
 STOP_IDLE = "released_idle"
+#: Written when the server's own idle timer closed a run nobody was driving.
+STOP_IDLE_TIMEOUT = "idle_timeout"
+#: Written when a run's server died and the next start found it unfinished.
+STOP_SERVER_DIED = "server_died"
 
 #: Characters of any one recorded text field; the verdict reason is short already.
 MAX_TEXT_CHARS = 300
@@ -71,26 +80,6 @@ def _mark_explore(manifest: dict, stop: str) -> None:
         explore["stop"] = _clip(stop)
 
 
-#: The in-flight statuses a stopped run must not leave on a turn. A turn the
-#: model never came back to (the run ended on a later turn) is over, not waiting.
-_IN_FLIGHT = ("needs_model", "planning")
-
-
-def _finalized(body: dict) -> dict | None:
-    """The turn *body* closed out, or ``None`` when it needs no change."""
-    if str(body.get("status") or "") not in _IN_FLIGHT:
-        return None
-    # The verdict is left as recorded: only the run's own done() turn earns
-    # one, so a closed turn is "done" with no verdict, never a pass.
-    closed_from = str(body.get("status") or "")
-    return {
-        **body,
-        "status": "done",
-        "ended_as": closed_from,
-        "updated": time.time(),
-    }
-
-
 def finalize_explore_cases(run_id: str) -> bool:
     """Close every turn still "needs_model" once the run has stopped. Never raises.
 
@@ -102,7 +91,9 @@ def finalize_explore_cases(run_id: str) -> bool:
         level=logging.WARNING,
     ):
         for body in run_store.list_cases(run_id).get("content") or []:
-            closed = _finalized(body) if isinstance(body, dict) else None
+            closed = (
+                run_finalize_cases.finalized(body) if isinstance(body, dict) else None
+            )
             if closed is not None:
                 run_store.write_case(run_id, str(closed["tc_id"]), closed)
         done = True
@@ -116,16 +107,18 @@ def finalize(run_id: str, verdict: object, *, stop: str = "") -> bool:
     ``RuntimeError`` when the manifest cannot be read or written.
     """
     manifest = _read(run_id)
+    run_idle_handles.cancel(run_id)
     if manifest.get("lane") == "explore":
         finalize_explore_cases(run_id)
     if isinstance(manifest.get("final"), dict):
-        media_pending.drop_run(run_id)
+        run_finalize_media.close_held_media(run_id)
         return False
     manifest["final"] = _final_of(verdict, stop)
     _mark_explore(manifest, stop)
     if run_store.write_manifest(run_id, manifest).get("error"):
         raise RuntimeError("the run verdict could not be written")
-    media_pending.drop_run(run_id)  # the run ended: no case will drain these
+    run_finalize_media.close_held_media(run_id)  # no case will drain these
+    knowledge_close.on_close(run_id)  # C11: learn once, at every close path
     return True
 
 

@@ -48,7 +48,8 @@ def reached(template: dict) -> bool:
 
 
 def _label(step: dict) -> str:
-    target = step.get("target") if isinstance(step.get("target"), dict) else {}
+    target = step.get("target")
+    target = target if isinstance(target, dict) else {}
     named = target.get("text") or target.get("label") or step.get("text") or ""
     named = "" if str(named).startswith("{") else str(named)[:30]
     return ("%s %s" % (step.get("op"), named)).strip()

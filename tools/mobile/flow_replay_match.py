@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from tools.mobile import app_flows, flow_inert, flow_stats, screen_key
+from tools.mobile import app_flows, flow_inert, flow_stats, knowledge_scope, screen_key
 from tools.mobile import flow_replay_match_anchor as anchor
 from tools.mobile.app_flows_consts import PLACEHOLDER_RE
 
@@ -55,6 +55,8 @@ def _sk2_with(screen: dict, package: str, activity: str) -> str:
 
 
 def _templates(package: str) -> list:
+    if not knowledge_scope.allowed(package):
+        return []  # C09: the native driver owns these screens
     rows = (app_flows.list_flows(package).get("content")) or []
     out = []
     for row in rows:
