@@ -40,7 +40,7 @@ class _SeqParts:
     detail: str
 
 
-# The case shows ONE picture, the screen it ended on (fix/1550), so a row
+# The case shows ONE picture, the screen it ended on, so a row
 # carries no frame of its own; ``screens`` and ``app`` stay for the callers.
 def _seq_rows(rows: list, screens: object = None, app: str = "") -> str:
     """The run sequence: one row per action, in the order it ran."""
@@ -90,7 +90,7 @@ def _seq_head(row: dict) -> str:
 
 
 def _seq_detail(row: dict) -> str:
-    """The folded detail of a step: full text and screen change (fix/1550: no frame)."""
+    """The folded detail of a step: full text and screen change."""
     detail = ""
     if row["detail"]:
         detail = '<p class="seqfull" dir="auto">' + esc(row["detail"]) + "</p>"

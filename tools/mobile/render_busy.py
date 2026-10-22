@@ -1,4 +1,4 @@
-"""The facts and exact next calls of a busy answer (fix/1580 C02/C13).
+"""The facts and exact next calls of a busy answer.
 
 A call that cannot start because another run holds the device used to say who
 holds it and nothing else, so the host retried blindly. This block adds what a

@@ -1,41 +1,23 @@
 [project]
 name = "qa-agent-pro"
-version = "1.154.0"
+version = "1.155.0"
 requires-python = ">=3.10"
+license = {file = "LICENSE"}
 dependencies = [
-    "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
-    # The product surface is the MCP stdio server (mcp_server.py + fastmcp).
-    "fastmcp>=2.0",
-    # mcp_server.py does `from mcp.types import ContentBlock`, so mcp is a DIRECT
-    # dependency, not merely fastmcp's. The floor mirrors fastmcp's own bound
-    # (mcp<2.0,>=1.24.0); ContentBlock is present in 1.24.0 (verified).
+    "pyyaml>=6.0,<7",  # contracts + OpenAPI specs are YAML (api_test agent)
+    "fastmcp>=2.0,<4",
     "mcp>=1.24,<2.0",
-    # Telemetry runtime (tools/telemetry.py): anonymous machine id + PostHog
-    # SDK error grouping. Both degrade gracefully and never raise.
-    "py-machineid>=0.6",
-    "posthog>=7.29",
-    "anthropic>=0.25",
-    "pydantic>=2.0",
-    "pydantic-settings>=2.0",
-    "httpx>=0.27",
-    "beautifulsoup4>=4.12",
-    "lxml>=5.0",
-    "python-dotenv>=1.0",
-    "xlsxwriter>=3.1",
-    # Ed25519 release-signature verification in tools/updater.py (auto-update
-    # trust root). Widely wheeled; the dist build pins it too via patch_pyproject.
-    "cryptography>=41.0",
-    # Pillow: tools/mobile/screenshot.py downscales the attached screen PNG
-    # before it is base64'd into the reply, which is 76% off what the image
-    # channel costs the tester's own model (measured 1513 tokens at the long
-    # edge a vision model downscales to, against 363 at 768). Imported LAZILY
-    # and degraded around -- an install that predates this line attaches the
-    # full-size picture rather than losing it -- but a DIRECT dependency, not
-    # an optional extra, because the saving is the default behaviour and an
-    # extra nobody installs is an untested path. scripts/build_dist.py's
-    # patch_pyproject copies this dependency set verbatim, so qa-agent-pro
-    # picks it up with no second edit.
-    "pillow>=10.0",
+    "py-machineid>=0.6,<2",
+    "posthog>=7.29,<8",
+    "pydantic>=2.0,<3",
+    "pydantic-settings>=2.0,<3",
+    "httpx>=0.27,<1",
+    "beautifulsoup4>=4.12,<5",
+    "lxml>=5.0,<7",
+    "python-dotenv>=1.0,<2",
+    "xlsxwriter>=3.1,<4",
+    "cryptography>=41.0,<51",
+    "pillow>=10.0,<13",
 ]
 
 [project.optional-dependencies]
@@ -45,13 +27,6 @@ dev = [
     "pytest-cov>=5.0",
     "pytest-xdist>=3.5",
     "respx>=0.21",
-    # PINNED to one minor series, not an open floor. `ruff format --check .` is a
-    # GATE, and the formatter's output changes between minor releases, so `>=0.4`
-    # meant whichever ruff happened to be installed decided whether the gate was
-    # green: measured at v1.79.8 with ruff 0.15.6, two files nobody had touched
-    # came back "would reformat" (line joins only) at a commit whose author had
-    # run the gate clean. Raise the ceiling deliberately, reformatting in the same
-    # commit, so the reformat is reviewed rather than discovered.
     "ruff>=0.15,<0.16",
     "openpyxl>=3.1",
     "pyyaml>=6.0",
@@ -73,106 +48,3 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agents*", "tools*", "config*", "handlers*"]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
-# Unknown marks are errors and a strict xfail that passes fails the run, so an
-# acceptance test cannot linger once its feature exists. Set here, not in
-# addopts, for the reason given below.
-strict_markers = true
-xfail_strict = true
-# Pydantic models named Test* (TestCase, TestSuite, ...) are not test classes.
-python_classes = ["Test*Case", "*Tests", "*TestCase"]
-filterwarnings = ["ignore::pytest.PytestCollectionWarning"]
-# The `eval` marker lived here until 2026-08-15, when dead-code deletion Phase 2
-# (Decision A) deleted evals/ and the nightly CI job that was its only user.
-#
-# `live` (2026-08-31) marks tests/live -- sweeps that drive a RUNNING MCP server
-# through a real chat model. Registered so `-m live` works and the mark is not
-# an unknown-marker warning. There is deliberately NO `addopts` deselecting it:
-# an addopts filter would rewrite every pytest invocation in the repo, and a
-# future `-m` of someone else's would silently fight it. The skip lives in
-# tests/live/conftest.py, gated on QA_LIVE_SWEEP=1, where it can affect nothing
-# outside that directory.
-markers = [
-    "live: drives a running MCP server through a real chat model; costs model calls. Needs QA_LIVE_SWEEP=1.",
-    "story: a Hermes story test (acceptance or integration); see tests/conftest.py --story-progress.",
-    "acceptance: a story acceptance test written before the feature; xfail(strict=True) until it exists.",
-    "integration: a story integration test across the pieces a story touched.",
-    "dispatch_guard_bare: opts a test OUT of conftest.py's autouse dispatch-guard entry, so tools.dispatch_guard.require_dispatched reflects reality for it (needed by tests driving a real mcp_server._tracked() dispatch or stdio handshake).",
-]
-
-[tool.ruff]
-target-version = "py310"
-# `.claude/` is agent harness and per-session scratch -- ops configs, build_ops_*
-# scripts, mutation probes and replay harnesses. It is NOT product code and is
-# never shipped (scripts/build_dist.py copies a whitelist and excludes .claude
-# outright), so it is not this project's code to keep formatted.
-#
-# It was ALSO never gated in practice: every session verifies with
-# `ruff check tools/ agents/ config/ tests/ mcp_server.py llm.py scripts/`, which
-# passes, while the then-CI ran the repo-wide `ruff check .` / `ruff format --check .`
-# (CI is gone; the Hermes card DoD and merge gate run them now). Those two disagreed, so CI was red on
-# main while every local check was green: 104 lint findings and 49 unformatted
-# files at 4208e90, ALL of them under .claude/. Measured across commits, the
-# format step was green at 75d2635 and broke at 688e870 when the finding
-# programme began committing harness scripts; the check step had been red since
-# well before that.
-#
-# 56 of the 104 findings are F821 (undefined name) in deliberately partial
-# fragments, so formatting could not have fixed them -- the scope was the bug,
-# not the formatting. Excluding here makes the repo-wide command mean exactly
-# what the scoped one already meant, so the gate checks the product and nothing else.
-# `.tmp/` is scratch from live validation runs -- the TICKET-9311 generation
-# scripts and their outputs. Kept on disk as run evidence, never shipped, and
-# not this project's code to keep formatted. It is gitignored as well, but that
-# alone does NOT stop ruff: ruff walks an untracked directory regardless, which
-# is exactly how `ruff check .` -- the gate CLAUDE.md documents -- went red for
-# everyone the moment those artifacts appeared.
-extend-exclude = [".claude", ".tmp"]
-
-# The release gate refuses when its own code changed since the last wrapper
-# release (AGENTS.md, Quality gates), and a reformat is such a change. These
-# are therefore left exactly as released and kept out of `ruff format --check .`;
-# `ruff check .` still lints them. Drop an entry when that file is next changed
-# on purpose and format it in the same commit. scripts/dist_build holds the
-# build templates, which must stay byte-verbatim.
-[tool.ruff.format]
-exclude = ["scripts/release.py", "scripts/build_dist.py", "scripts/dist_build"]
-
-# mypy had NO configuration at all, so `mypy .` -- the lint_cmd the pre-push
-# hook runs -- walked into the ops executor's own backups/ directories, found
-# two copies of every module and died on duplicate module names before checking
-# a single line of product code. These are the same trees ruff excludes, plus
-# the backup dirs, which are generated output and never imported.
-[tool.mypy]
-exclude = "^(backups/|\\.claude/|\\.tmp/|\\.worktrees/|build/|dist/)"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "W", "T201"]
-ignore = ["E501"]
-
-# Rule 5 of AGENTS.md's Hard Rules ("No bare print() -- use logging"), scoped
-# to PRODUCT code per docs/agents-hard-rules-enforcement.md. T201 (bare
-# print) is enabled repo-wide above and then switched back off for every
-# path that is not product code and legitimately prints by design: CLI
-# scripts (scripts/), the test suite itself (fixtures/harnesses that print
-# diagnostic output on purpose, e.g. tests/live/sweep.py and
-# tests/test_ops_parse_gate.py's synthetic source strings), and the harness
-# trees ruff already excludes from formatting (.claude/, .tmp/) or that are
-# not shipped. agents/, tools/, config/, mcp_server.py, llm.py and
-# launcher.py are NOT listed here, so T201 stays enforced there.
-[tool.ruff.lint.per-file-ignores]
-"scripts/*" = ["T201"]
-"tests/*" = ["T201"]
-
-# Clean-code limits: the Clean Code book's (see AGENTS.md "Quality gates"),
-# stricter than ruff's defaults and CODE_QUALITY_STANDARD.md's max-args 5. The rules are NOT in
-# `select` above: the existing breaches would turn `ruff check .` red. They are
-# enforced as a per-file ratchet by tests/test_code_quality_ratchet.py instead.
-[tool.ruff.lint.mccabe]
-max-complexity = 10
-
-[tool.ruff.lint.pylint]
-max-args = 3

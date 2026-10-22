@@ -37,7 +37,7 @@ def _record_refusal(serial: str, remote: str) -> dict | None:
 
 # The device shell prints its own pid, then ``exec`` turns itself into the
 # recorder, so that pid IS the recorder's: a stop can ``kill -INT`` this one
-# recording instead of every ``screenrecord`` on the device (fix/1560).
+# recording instead of every ``screenrecord`` on the device.
 def _record_cmd(serial: str, remote: str, seconds: int) -> list[str]:
     """The ``adb shell screenrecord`` argv for one bounded recording."""
     return [

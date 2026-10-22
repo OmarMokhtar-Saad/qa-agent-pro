@@ -36,7 +36,7 @@ SIDECAR_RETAINABLE = _SIDECAR_RETAINABLE  # public alias (additive)
 # confusing full-suite parse error. With no meta (module-level and legacy
 # callers) the checklist falls back to the checklist_enabled() seam -- read
 # rather than inlined so every checklist surface answers to the one switch
-# tests/conftest.py pins.
+# the test suite pins.
 #
 # Phase 3a's two post_merge fold fields (`risk_scores` / `test_plan_report`)
 # left this function on 2026-08-16 with the jobs themselves (dead-code

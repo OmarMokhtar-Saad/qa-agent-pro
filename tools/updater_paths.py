@@ -57,7 +57,7 @@ _LOCK_EXTRA = ("MANIFEST.sha256", "MANIFEST.sig", "launcher.py", "VERSION")
 # Files apply_update must NEVER prune, even when a release drops them from its
 # tree: release metadata plus the launcher the client spawns (`python
 # launcher.py` must keep working across a bad release). Operator state -- .env,
-# data/, corpus/, .claude/ -- is already covered by _is_protected.
+# data/, corpus/, local editor config -- is already covered by _is_protected.
 _NEVER_PRUNE = frozenset(_LOCK_EXTRA) | {".env.example"}
 
 #: Name of the release-shipped list of paths a PAST release installed and a

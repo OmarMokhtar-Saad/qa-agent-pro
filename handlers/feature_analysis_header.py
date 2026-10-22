@@ -53,7 +53,7 @@ def _fa_reply_header(mode: str, capture: _FaCapture) -> str:
     if mode != "jira":
         header = f"_Mode: {mode} · screens captured: {capture.screens_captured}_\n\n"
     if capture.forwarded:
-        # Owner rule (fix/1630, G05): no screenshot ever reaches the host.
+        # Owner rule: no screenshot ever reaches the host.
         header += (
             "> ℹ️  "
             f"{len(capture.forwarded)} screen(s) were captured but screenshots "

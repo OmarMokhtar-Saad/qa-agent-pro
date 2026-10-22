@@ -1,4 +1,4 @@
-"""Before a repeated a11y tree is called stale: is it just an early read? (fix/1570 B09)
+"""Before a repeated a11y tree is called stale: is it just an early read?
 
 After a cross-app tap the a11y service may not have heard the new window yet, so
 the tree repeats. Judging that as stale cost a strike plus a slow uiautomator dump

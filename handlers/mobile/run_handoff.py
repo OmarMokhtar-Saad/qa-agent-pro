@@ -58,7 +58,7 @@ async def _mobile_hand_off(
     rendered = await mobile_step.mobile_next(
         run_id, token, mobile_step.NextOpts(progress=progress, first_packet=True)
     )
-    for note in (*notes, knowledge_close.off_note(run_id)):  # never a stop (fix/1490)
+    for note in (*notes, knowledge_close.off_note(run_id)):  # never a stop
         if note:
             rendered = host_way_on.as_note(note) + "\n\n" + rendered
     return rendered + _start_timing_line(run_id), True

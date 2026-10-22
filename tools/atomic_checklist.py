@@ -19,7 +19,7 @@ checklist:
 ``checklist_enabled()`` is LIVE and load-bearing -- a True constant since
 2026-08-14, when QA_ATOMIC_CHECKLIST_ENABLED was DELETED and the behaviour
 hardcoded ON. handlers/ reads it at call time to decide whether
-CHECKLIST_JOB ships to the host. tests/conftest.py pins it False suite-wide.
+CHECKLIST_JOB ships to the host. the test suite pins it False suite-wide.
 
 TRUNCATION IS NEVER SILENT. ``format_checklist_prompt_block`` returns BOTH the
 prompt block and the exact list of item ids that fitted inside
@@ -131,7 +131,7 @@ from tools.untrusted import wrap_untrusted  # noqa: F401
 # ONE flag in that batch whose value really changed on every install.
 #
 # A named SEAM rather than a literal inlined at the read site, for two
-# reasons: tests/conftest.py pins it False suite-wide (unpinned, every
+# reasons: the test suite pins it False suite-wide (unpinned, every
 # generation test would decompose and make a real ask_json call), and a
 # revival is one line here.
 #

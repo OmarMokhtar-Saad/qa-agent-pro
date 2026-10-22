@@ -1,7 +1,7 @@
 """A stable identity for a screen, built from structure and never from text.
 
 Version ``sk3``: the activity is NO LONGER part of the key. It was read once per
-context and changed under a screen, so one screen got several keys (fix/1210).
+context and changed under a screen, so one screen got several keys.
 The activity stays on :class:`ScreenKey` as metadata only (the degraded
 ``sk1d`` key drops it too). ``sk2`` keys (which hashed the activity) stay stored
 and link to their ``sk3`` twin through ``screens.remap_of``; ``sk2_key`` rebuilds

@@ -165,7 +165,7 @@ async def _start_notes(serial: str) -> str:
 async def _mobile_new_run(req: _MobileTestRequest) -> str:
     """The new-run path: adopt an abandoned setup, else pick, claim, prepare, start.
 
-    The setup body runs as a background job (fix/1530): when the host abandons
+    The setup body runs as a background job: when the host abandons
     this call the setup goes on, and the next call for the same request adopts it.
     """
     adopted = await run_background.adopt(req)

@@ -1,4 +1,4 @@
-"""The mobile brief text: an argument table plus short rules (fix/1570 B18).
+"""The mobile brief text: an argument table plus short rules.
 
 It rides once per chat in the first mobile reply (joined in ``tools.tool_briefs``).
 Prose that only restated the tool schema or the step format is gone; every rule

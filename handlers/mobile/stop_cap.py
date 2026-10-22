@@ -1,4 +1,4 @@
-"""``qa_mobile_stop`` never keeps the host waiting on a lock or a slow close (fix/1580 C13).
+"""``qa_mobile_stop`` never keeps the host waiting on a lock or a slow close.
 
 The stop itself (verdict write, heartbeat, lease release) is shielded and goes on
 past the cap; only the REPLY is bounded, so closing is unchanged.

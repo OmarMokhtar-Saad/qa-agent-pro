@@ -2,7 +2,7 @@
 
 The ``finally`` of ``_mobile_new_run`` lands here. A call that handed its hold
 to a run keeps nothing; every other ending gives the device back, and it has
-to do so even when the host has CANCELLED the call (fix/1520).
+to do so even when the host has CANCELLED the call.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ logger = logging.getLogger("tools.mcp_handlers")
 # file" pin can be absolute rather than a list of
 # exceptions somebody has to keep correct.
 #
-# CANCEL-SAFE (fix/1520). When the host gives up on the call, anyio's
+# CANCEL-SAFE. When the host gives up on the call, anyio's
 # cancellation is level-triggered: every await below raises again, so
 # an unshielded finish died at its first await and the device stayed
 # held for the life of the server (pid 34583 held R5CR207KY7H for ever

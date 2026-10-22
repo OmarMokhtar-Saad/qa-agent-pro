@@ -1,4 +1,4 @@
-"""The host's way on after any mobile tool stops (fix/1490, every app, every case).
+"""The host's way on after any mobile tool stops.
 
 A server step that cannot go on (an unknown screen, a page that needs the
 tester's choice, a refused install, a run that is gone) used to end in a reply

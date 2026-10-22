@@ -3,7 +3,7 @@
 Every teardown path in this lane ends here, directly or through :func:`reap`:
 a normal stop, a failure mid-run, a crashed process, a disconnected device, the
 next run's startup reap, and a second caller interleaved with the first on one
-serial. See ``.claude/plans/plan-mobile-api-capture.md`` (Phase 3, T3.3) for
+serial. See the mobile API capture plan (Phase 3, T3.3) for
 the six-path contract this module is graded against.
 
 **THIS IS THE ONLY MODULE IN ``tools/mobile_capture`` THAT MAY TERMINATE A

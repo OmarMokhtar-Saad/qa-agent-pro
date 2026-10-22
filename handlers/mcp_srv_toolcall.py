@@ -142,7 +142,7 @@ async def _close_tool_call(name, start, run) -> None:
     while telemetry and FastMCP's result serialization still had work to do,
     and os._exit does not flush buffered stdout.
 
-    Runs shielded (fix/1520), i.e. in a COPY of the caller's context, so
+    Runs shielded, i.e. in a COPY of the caller's context, so
     `tool_status.finish` cannot reset the marks token there (it swallows the
     ValueError) and the caller's context keeps its marks list until the next
     `begin()` replaces it. Harmless, and known."""

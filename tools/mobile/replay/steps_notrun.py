@@ -1,4 +1,4 @@
-"""Replay engine: the actions a stopped script did not run (fix/1460 W2).
+"""Replay engine: the actions a stopped script did not run.
 
 Every stop except the budget stop names them on the reply as ``not_run``.
 They are NOT ``queued_actions``: a queue is replayed first on the next submit

@@ -63,7 +63,7 @@ async def _tracked(name, ctx, coro):
 
 
 # A cancelled call is NOT an Exception, so `_tracked` used to log it "ok"; it
-# now logs "error cancelled" (fix/1520). Under anyio's level-triggered cancel
+# now logs "error cancelled". Under anyio's level-triggered cancel
 # every later await raises again, so an unshielded close died at its audit
 # await and the dispatch/in-flight slots never came back. The close runs as
 # its own task; the slots are released in `_tracked`'s own task (this
@@ -90,7 +90,7 @@ async def _tracked_noted(name, ctx, coro):
 
 async def _tracked_mobile(name, ctx, coro):
     """``_tracked`` for a mobile tool: a stop reply ends with the host's way on
-    (``tools/mobile/host_way_on``, fix/1490)."""
+."""
     return _lane.host_way_on.with_way_on(name, await _tracked(name, ctx, coro))
 
 
@@ -100,6 +100,6 @@ async def _tracked_mobile_noted(name, ctx, coro):
 
 
 async def _kept(name, ctx, coro):
-    """Await *coro* with the call's ONE keepalive running beside it (fix/1580 C01)."""
+    """Await *coro* with the call's ONE keepalive running beside it."""
     async with keepalive(name, ctx):
         return log_reply(name, await coro)

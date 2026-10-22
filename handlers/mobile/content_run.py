@@ -121,7 +121,7 @@ def _disarm(tokens: tuple) -> None:
 
 
 # ``(markdown, [])``: the tuple shape is kept for the tool layer, but a mobile
-# reply never carries an image (fast steps, WP-D); the screen reaches the report
+# reply never carries an image; the screen reaches the report
 # only through ``run_shots.write_shot``.
 #
 # ``emulator`` (list/boot/create/delete an AVD) is answered BEFORE the run is

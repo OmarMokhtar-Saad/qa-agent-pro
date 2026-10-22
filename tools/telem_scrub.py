@@ -21,8 +21,34 @@ except ImportError as _exc:
 logger = logging.getLogger("qa_agents.telemetry")
 
 
+# Allowlists (S02): a crash event keeps ONLY these frame / exception-entry keys,
+# so local variables or source context a future SDK adds are never sent.
+_FRAME_KEYS = frozenset(
+    {
+        "abs_path",
+        "filename",
+        "function",
+        "module",
+        "lineno",
+        "colno",
+        "in_app",
+        "platform",
+    }
+)
+_ENTRY_KEYS = frozenset(
+    {"type", "value", "module", "mechanism", "stacktrace", "thread_id"}
+)
+
+
+def _keep_only(d: dict, allowed: frozenset) -> None:
+    """Delete every key of ``d`` that is not in ``allowed``."""
+    for key in [k for k in d if k not in allowed]:
+        del d[key]
+
+
 def _scrub_frame_paths(frame: dict, root: str) -> None:
     """Make a stack frame's ``abs_path`` / ``filename`` install-relative or a bare name."""
+    _keep_only(frame, _FRAME_KEYS)
     for key in ("abs_path", "filename"):
         path = frame.get(key)
         if not isinstance(path, str):
@@ -35,12 +61,21 @@ def _scrub_frame_paths(frame: dict, root: str) -> None:
 
 def _scrub_exception_entry(entry: dict, root: str) -> None:
     """Force the entry's ``value`` to its type name and scrub every frame path."""
+    _keep_only(entry, _ENTRY_KEYS)
     if entry.get("type"):
         entry["value"] = str(entry["type"])
     frames = (entry.get("stacktrace") or {}).get("frames") or []
     for frame in frames:
         if isinstance(frame, dict):
             _scrub_frame_paths(frame, root)
+
+
+def _no_geo(event) -> None:
+    """Never send an IP and always ask PostHog to skip GeoIP enrichment."""
+    props = event.get("properties") if isinstance(event, dict) else None
+    if isinstance(props, dict):
+        props.pop("$ip", None)
+        props["$geoip_disable"] = True
 
 
 def _exception_list(event):
@@ -62,6 +97,7 @@ def _scrub_event_paths(event):
     with never_raise(
         logger, "telemetry: before_send scrub failed - dropping event", exc_info=True
     ):
+        _no_geo(event)
         exc_list = _exception_list(event)
         if not exc_list:
             return event

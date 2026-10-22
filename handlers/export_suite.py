@@ -62,6 +62,16 @@ _MOVE_FAILED_NOTE = (
 # exporter was the one exception -- it wrote a PAIR into a directory and took
 # the folder directly -- and it was DELETED on 2026-08-15 (dead-code
 # deletion batch D4), so every surviving format is relocated by this function.
+def _free_name(dest: Path) -> Path:
+    """``dest``, or ``name (2).ext`` etc. so an existing file is never overwritten."""
+    n = 2
+    cand = dest
+    while cand.exists():
+        cand = dest.with_name(f"{dest.stem} ({n}){dest.suffix}")
+        n += 1
+    return cand
+
+
 def _relocate_export(path: str, target_dir: str) -> tuple[str, str]:
     """Move a written export into the folder the tester named."""
     try:
@@ -71,6 +81,7 @@ def _relocate_export(path: str, target_dir: str) -> tuple[str, str]:
         dest = dest_dir / src.name
         if src.resolve() == dest.resolve():
             return str(dest), ""
+        dest = _free_name(dest)
         shutil.move(str(src), str(dest))
         return str(dest), ""
     except (OSError, RuntimeError, ValueError, TypeError):
@@ -136,4 +147,5 @@ async def _export_suite_reply(job: ExportJob) -> str:
     except Exception as exc:
         logger.exception("mcp export failed")
         return f"⚠️ Export to {job.fmt} failed: {exc}"
-    return await _export_done(job, _relocated(path, target_dir, dir_note))
+    placed = await asyncio.to_thread(_relocated, path, target_dir, dir_note)
+    return await _export_done(job, placed)

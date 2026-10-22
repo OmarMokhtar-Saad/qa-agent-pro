@@ -14,7 +14,7 @@ logger = logging.getLogger("tools.mcp_handlers")
 def _mobile_status_listing() -> str:
     """The status reply when no run id was given: the newest runs on disk."""
 
-    # A device being set up has no run dir yet (fix/1520): list it first.
+    # A device being set up has no run dir yet: list it first.
     setting_up = "\n".join(device_setup_rows.setup_rows())
     if setting_up:
         setting_up += "\n\n"

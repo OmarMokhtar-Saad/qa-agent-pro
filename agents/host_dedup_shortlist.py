@@ -26,7 +26,7 @@ from config.settings_guard import never_raise
 # there is still exactly ONE implementation and F08's constants are
 # untouched, because the F08 note above rejected threshold-tuning on
 # measurement and the D4 replay reproduced that result on a second suite
-# (see .claude/plans/plan-d4-d5-TICKET5646-2026-08-21.md for the sweep).
+# (see the D4/D5 plan for the sweep).
 #
 # The original contract, unchanged:
 #

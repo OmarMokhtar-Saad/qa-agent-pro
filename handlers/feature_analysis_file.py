@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -58,7 +59,7 @@ async def _write_feature_analysis_file(task_id: str, markdown: str) -> str:
         if not export_dir:
             return ""
         path = _fa_report_path(export_dir, task_id)
-        path.write_text(markdown, encoding="utf-8")
+        await asyncio.to_thread(path.write_text, markdown, encoding="utf-8")
         # LOGGED, not audited: the mcp_feature_analysis row is this submission's
         # audit event and tests pin it as the last one, so a second row here
         # would make the artifact write look like the submission.

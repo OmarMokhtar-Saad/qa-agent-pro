@@ -1,4 +1,4 @@
-"""Replay engine: a ``fill`` or ``clear`` whose work is already done (fix/1460 W4).
+"""Replay engine: a ``fill`` or ``clear`` whose work is already done.
 
 Narrow on purpose: only a plainly readable field is judged. A masked field
 (password, ``secure``) reads empty or bullets whatever it holds, a ``secret``

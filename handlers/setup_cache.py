@@ -1,4 +1,4 @@
-"""Per-process cache of the doctor report (fix/1210 G5).
+"""Per-process cache of the doctor report.
 
 A second qa-doctor call in the same run returns the first report with a note
 instead of re-probing the machine. fix=True always runs fresh, a different

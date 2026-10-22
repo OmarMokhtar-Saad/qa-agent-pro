@@ -128,7 +128,7 @@ def _holder_pid(who: str) -> str:
     return parts[1] if len(parts) >= 2 and parts[1].isdigit() else "?"
 
 
-# THREE TRUTHS, not one promise (fix/1520). This used to say the step
+# THREE TRUTHS, not one promise. This used to say the step
 # "finishes within the call that started it, so call again in a moment";
 # a cancelled call left the hold for the life of the server, and every
 # retry read that line. Now the same-server hold says whether its call is

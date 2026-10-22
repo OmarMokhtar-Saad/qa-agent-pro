@@ -93,7 +93,7 @@ def image_job_flags(host_img: bool, host_images: list, attested: int) -> _ImageF
 # and its _prepare_generation parameter were deleted (P2-F2, 2026-08-16), so
 # this decides ONE thing: whether CHECKLIST_JOB ships to the host. True on
 # every install since 2026-08-14 (QA_ATOMIC_CHECKLIST_ENABLED hardcoded ON).
-# Reads the SEAM, not a literal, so tests/conftest.py's pin governs it.
+# Reads the SEAM, not a literal, so the test suite's pin governs it.
 def checklist_job_on() -> bool:
     """Whether CHECKLIST_JOB ships to the host on this prepare."""
     return bool(

@@ -36,7 +36,7 @@ from tools.mobile import render as mobile_render
 # it looks like it should: the next call decides from the same
 # `adb devices` answer, so serialising two calls that read the same
 # state produces the same outcome twice. See
-# `.claude/plans/plan-emulator-lock-2026-09-04.md` §5.2.
+# the emulator-lock plan, §5.2.
 # ---------------------------------------------------------------------------
 
 
@@ -131,7 +131,7 @@ async def _new_run_open(req: _MobileTestRequest) -> tuple[str, str, str]:
     if not taken.get("acquired"):
         return picked, owner, mobile_render.device_busy_block(taken)
     # From here the hold is this call's and its setup call is RUNNING; the
-    # heal in `take_device_lock` leaves a running owner alone (fix/1520).
+    # heal in `take_device_lock` leaves a running owner alone.
     prerun_inflight.enter(owner)
     return picked, owner, ""
 

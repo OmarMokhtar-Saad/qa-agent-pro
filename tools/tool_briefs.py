@@ -150,6 +150,6 @@ def append_tool_note(name: str, result: object) -> object:
     return result
 
 
-# Detail moved out of the tool descriptions (fix/1510 WP-G): once per chat.
+# Detail moved out of the tool descriptions: once per chat.
 MOBILE_BRIEF += tool_details.MOBILE_TOOL_DETAIL
 FLOW_BRIEF += tool_details.FLOW_TOOL_DETAIL

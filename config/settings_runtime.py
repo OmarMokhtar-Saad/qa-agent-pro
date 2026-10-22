@@ -65,12 +65,13 @@ class RuntimeSettings(BaseModel):
     # Release-signature enforcement for auto-updates (Ed25519). When ON, an
     # update or self-heal is REFUSED unless the release ships a MANIFEST.sig
     # that verifies against ANY public key in the keyring embedded in
-    # tools/updater._RELEASE_PUBLIC_KEYS_HEX. Default OFF for exactly ONE
-    # migration release so installs predating signing still update (they log a
-    # prominent unsigned-release warning); an INVALID signature is ALWAYS
-    # rejected regardless of this flag. Releases ship UNSIGNED now, so keep it
-    # OFF: ON refuses every update. Lenient never-raising bool coercion.
-    qa_update_require_signature: bool = False
+    # tools/updater_keys.RELEASE_PUBLIC_KEYS_HEX. Default ON: every release is
+    # signed by scripts/release.py. An INVALID signature is ALWAYS rejected
+    # regardless of this flag. Emergency escape hatch (e.g. a lost signing key):
+    # QA_UPDATE_REQUIRE_SIGNATURE=false in .env accepts an unsigned release
+    # while still rejecting a bad one; see docs/HANDOFF.md. Lenient never-raising
+    # bool coercion.
+    qa_update_require_signature: bool = True
 
     # --- Usage analytics (telemetry) - opt-out; ON only in the dist. ---
     # Anonymous usage metrics via tools/telemetry.py (PostHog). Sends only

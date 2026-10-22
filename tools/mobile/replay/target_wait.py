@@ -1,4 +1,4 @@
-"""Replay engine: wait for the next step's target after the screen changed (fix/1460 W3).
+"""Replay engine: wait for the next step's target after the screen changed.
 
 A script spans several screens. When the previous action changed the screen, the
 next target may simply not have drawn yet; stopping at once costs the host a whole

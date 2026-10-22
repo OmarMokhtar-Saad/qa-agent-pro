@@ -32,9 +32,9 @@ def _add_stderr_handler(root: logging.Logger) -> logging.Handler:
 
 def _open_file_log(log_dir: Path):
     """The file handler and ``process_log_path`` (or ``(None, None)``)."""
+    if log_setup is None:
+        return None, None  # module absent: reported by the caller as "no file log"
     with never_raise():
-        # ``log_setup`` is None when the module is absent: the attribute error
-        # lands in the guard and reads as "no file log" (reported by the caller).
         return log_setup.configure_file_logging(log_dir), log_setup.process_log_path
     return None, None
 

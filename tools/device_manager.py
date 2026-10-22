@@ -142,7 +142,7 @@ ADB_START_SERVER_TIMEOUT_S = 8.0
 DISCOVERY_CACHE_TTL_S = 60.0
 
 #: ``(cached_at, result)`` from the last successful ``list_devices`` probe, or
-#: ``None`` before the first call. Process-local; ``tests/conftest.py`` resets
+#: ``None`` before the first call. Process-local; the test suite resets
 #: it between tests.
 _discovery_cache: tuple[float, dict] | None = None
 

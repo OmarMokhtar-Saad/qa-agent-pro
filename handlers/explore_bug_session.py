@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from handlers import _agents, _common, export
+from handlers import _agents, _common, explore_sessions
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ def _fold_tester_response(sess: dict, tester_response: str) -> None:
     """Fold the tester's observation of the previous step into the session."""
     resp = (tester_response or "").strip()
     if resp:
-        sess["history"].append({"role": "user", "content": resp})
+        explore_sessions.append_history(sess, "user", resp)
         sess["memory"] = _agents.update_coverage(
             sess["memory"], _agents.CoverageTurn(resp)
         )
@@ -39,10 +39,10 @@ def _explore_session_update(
 ) -> dict:
     """Find or create the coaching session and fold in this turn's input."""
     feature = (feature or "").strip()
-    sess = export._SESSIONS.get(session_id)
+    sess = explore_sessions.get_session(session_id)
     if sess is None:
         sess = _new_session(feature)
-        export._SESSIONS[session_id] = sess
+        explore_sessions.put_session(session_id, sess)
     if feature:
         sess["feature"] = feature
     _fold_tester_response(sess, tester_response)

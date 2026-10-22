@@ -68,7 +68,7 @@ class ApiPushSettings(BaseModel):
     # test cases and not just an internal critique. The checklist-driven branch
     # is unaffected, exactly as before: its "critique" is the deterministic
     # external matcher, so there is nothing there to merge.
-    # See .claude/plans/plan-remediation-cap.md and docs/FEATURE_FLAGS.md.
+    # See docs/FEATURE_FLAGS.md.
     # Enterprise Feature Analysis Report. QA_FEATURE_ANALYSIS_ENABLED was
     # DELETED on 2026-08-14 (flag-surface reduction, batch 8c) and the
     # feature hardcoded ON -- the flag policy's "promote to default ON,

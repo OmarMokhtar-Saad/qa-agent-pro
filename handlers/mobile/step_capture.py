@@ -120,7 +120,7 @@ def _blind_note(turn: ShotTurn, stored: bool) -> str:
     return BLIND_NOTE + SAVED_NOTE
 
 
-# Fast steps (WP-D): a plain step takes NO picture and no reply carries one.
+# Fast steps: a plain step takes NO picture and no reply carries one.
 # Only `screenshot=true`, a `visual` assert stop, or a screen with no readable
 # elements (canvas / WebView) writes ONE PNG into the run folder for the
 # report. The blind case also returns a text line, so the host can switch to

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+from handlers import explore_sessions as _explore_sessions
 from handlers.export_auto import (  # noqa: F401
     AutoExportRequest,
     _auto_export_reply,
@@ -84,8 +85,8 @@ from tools.xlsx_generator import generate_test_case_xlsx
 
 # In-process exploratory-session store keyed by the caller-supplied session_id.
 # The MCP server is a long-running stdio process, so this dict persists across
-# tool calls within one session — the coach_memory module itself is stateless.
-_SESSIONS: dict[str, dict] = {}
+# tool calls within one session; bounded by handlers/explore_sessions.py.
+_SESSIONS = _explore_sessions.SESSIONS
 
 # Each entry is a thin lambda (not a direct function reference) so the
 # exporter is looked up from this module's global namespace at *call* time.

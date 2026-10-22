@@ -226,7 +226,9 @@ def deps_present(python: str) -> bool:
 
 
 def _pip_step() -> list:
-    return [str(VENV_PYTHON), "-m", "pip", "install", "--quiet", "-e", "."]
+    argv = [str(VENV_PYTHON), "-m", "pip", "install", "--quiet", "-e", "."]
+    pins = INSTALL_DIR / "constraints.txt"
+    return argv + ['-c', str(pins)] if pins.is_file() else argv
 
 
 def run_step(argv: list) -> bool:
@@ -537,6 +539,80 @@ def idle_out(sup, child) -> None:
         _resend(sup, lost)
 
 
+RESUME_FILE = INSTALL_DIR / 'backups' / 'handshake-resume.jsonl'
+
+
+def _resume_path_ok(path: str) -> bool:
+    """--resume is honoured only for the one file this launcher writes."""
+    try:
+        return os.path.realpath(path) == os.path.realpath(str(RESUME_FILE))
+    except (OSError, ValueError):
+        return False
+
+
+def _launcher_compiles() -> bool:
+    """True when the launcher.py now on disk at least parses."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            compile(fh.read(), os.path.abspath(__file__), 'exec')
+        return True
+    except (OSError, SyntaxError, ValueError):
+        return False
+
+
+def _drop_resume(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _new_code_rejected(sup) -> bool:
+    """True (and the hash stamped) when the new launcher.py does not parse."""
+    if _launcher_compiles():
+        return False
+    log.error('New launcher.py does not parse; keeping the running one.')
+    sup.self_hash = _self_hash()
+    return True
+
+
+def _exec_or_recover(sup, args: list, resume: str) -> None:
+    """Re-exec; if execv fails keep this launcher and bring the child back."""
+    try:
+        os.execv(sys.executable, args)
+    except OSError as exc:
+        log.error('Launcher re-exec failed (%s); keeping the current one.', exc)
+        sup.self_hash = _self_hash()
+        sup.restarting = False
+        if resume:
+            _drop_resume(resume)
+        sup.spawn(replay=bool(sup.handshake))
+
+
+def install_tampered() -> bool:
+    """Cheap integrity check for the --resume path (no update, no network)."""
+    try:
+        from tools.updater import integrity_problems
+
+        return bool(integrity_problems(INSTALL_DIR))
+    except ImportError:
+        return False  # an older updater cannot check; the start already did
+    except Exception:
+        return True
+
+
+def _resume_usable(path: str) -> bool:
+    """True when --resume names our handshake file and the tree is intact."""
+    if not _resume_path_ok(path):
+        log.warning('Ignoring --resume %r: not the handshake file.', path)
+        return False
+    if install_tampered():
+        log.warning('Integrity check failed; dropping the resume file.')
+        _drop_resume(path)
+        return False
+    return True
+
+
 def _self_hash() -> str:
     try:
         with open(os.path.abspath(__file__), "rb") as fh:
@@ -756,6 +832,8 @@ class Supervisor:
                 "start (Windows cannot re-exec in place)."
             )
             return
+        if _new_code_rejected(self):
+            return
         log.info("Launcher code changed on disk — re-exec (%s).", reason)
         with self.intake, self.child_lock:
             if self.client_busy():  # retried on the next update tick
@@ -767,11 +845,7 @@ class Supervisor:
                     self.child.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     self.child.kill()
-            resume = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "backups",
-                "handshake-resume.jsonl",
-            )
+            resume = str(RESUME_FILE)
             try:
                 os.makedirs(os.path.dirname(resume), exist_ok=True)
                 with open(resume, "wb") as fh:
@@ -782,7 +856,7 @@ class Supervisor:
             args = [sys.executable, os.path.abspath(__file__)]
             if resume and self.handshake:
                 args += ["--resume", resume]
-            os.execv(sys.executable, args)
+            _exec_or_recover(self, args, resume)
 
     def write_lost(self, line: bytes) -> bool:
         """Answer the host with a lost-request error line (wire watchdog thread)."""
@@ -1244,6 +1318,8 @@ def main() -> int:
             resume_path = sys.argv[sys.argv.index("--resume") + 1]
         except IndexError:
             resume_path = ""
+    if resume_path and not _resume_usable(resume_path):
+        resume_path = ''
     if not resume_path:
         try:
             from tools.updater import run_update_check, verify_integrity

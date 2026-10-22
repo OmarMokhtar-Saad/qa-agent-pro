@@ -1,4 +1,4 @@
-"""Which pre-run owners have a setup call RUNNING or ENDED in this process (fix/1520).
+"""Which pre-run owners have a setup call RUNNING or ENDED in this process.
 
 A pre-run (provisioning) owner holds the device under a label with no run and
 no lease heartbeat, for exactly one ``qa_mobile_test`` call. When the host gives

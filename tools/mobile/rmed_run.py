@@ -2,7 +2,7 @@
 
 The source is the run-long recording of :mod:`tools.mobile.media_run`: its
 ``run-seg-NNN.mp4`` segments cover the run from its first step to its end. A
-run without segments (recorded before fix/1560, or whose recorder never
+run without segments (recorded before segment recording, or whose recorder never
 started) falls back to the step clips, one per replayed step. The PAGE shows
 one video: this module joins the files, in order, into :data:`RUN_CLIP` with
 ffmpeg's concat demuxer. Every file comes from the same device at the same

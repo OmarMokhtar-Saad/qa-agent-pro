@@ -160,7 +160,7 @@ async def resolve_activity(ctx: Any) -> str:
     known = str(getattr(ctx, "activity", "") or "")
     if known:
         return known
-    # Read fresh on every dump (fix/1210): a per-context memo froze the activity
+    # Read fresh on every dump: a per-context memo froze the activity
     # under a screen that later changed it. The key no longer hashes it, so the
     # probe is metadata and an empty answer is normal.
     serial = _serial_for_activity(ctx)

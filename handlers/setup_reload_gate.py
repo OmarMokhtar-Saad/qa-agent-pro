@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import threading
@@ -93,6 +94,9 @@ def _flush_std_streams() -> None:
             stream.flush()
         except (OSError, ValueError, AttributeError):
             pass
+    # os._exit skips atexit, so flush the log file handlers here. The telemetry
+    # (posthog) atexit flush is deliberately NOT run: it can block on the network.
+    logging.shutdown()
 
 
 def _exit_after_reply() -> None:

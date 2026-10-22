@@ -1,4 +1,4 @@
-"""Case runner: hand the host the actions a stopped script did not run (fix/1460 R2).
+"""Case runner: hand the host the actions a stopped script did not run.
 
 ``replay.steps_notrun`` names them on the replay result as ``not_run`` /
 ``not_run_from``, but those indexes count the COMBINED list (the carried queue

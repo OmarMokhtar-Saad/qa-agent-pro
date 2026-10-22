@@ -22,7 +22,7 @@ logger = logging.getLogger("tools.mobile.media")
 wait_for = asyncio.wait_for
 
 
-# With the pid the spawn read (fix/1560) the interrupt reaches THIS recorder
+# With the pid the spawn read the interrupt reaches THIS recorder
 # only, so a step's stop leaves the run-long recorder of ``media_run`` running.
 # Without one it falls back to every ``screenrecord`` on the device; a run
 # segment it closes that way is pulled and the next one starts.

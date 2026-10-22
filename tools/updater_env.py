@@ -45,6 +45,9 @@ def _pip_install(install_dir: Path) -> None:
     A failure is logged, not raised: startup proceeds on the swapped code.
     """
     argv = [sys.executable, "-m", "pip", "install", "-e", "."]
+    pins = install_dir / "constraints.txt"
+    if pins.is_file():
+        argv += ["-c", str(pins)]
     result = run(argv, timeout=_PIP_TIMEOUT, opts=RunOpts(cwd=str(install_dir)))
     failure = result.exc
     if failure is None and result.rc:

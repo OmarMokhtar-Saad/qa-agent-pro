@@ -89,14 +89,8 @@ def _distinct_id() -> str:
     return _email() or host().install_id()
 
 
-def _base_properties(client_name: str = "", client_version: str = "") -> dict:
-    """Build the common event properties (best-effort)."""
-    props: dict[str, Any] = {
-        "dist_version": host()._dist_version(),
-        "platform": f"{platform.system()} {platform.release()}".strip(),
-        "arch": platform.machine(),
-        "$lib": "qa-agent-pro-telemetry",
-    }
+def _add_identity(props: dict, client_name: str, client_version: str) -> None:
+    """Add machine id, MCP client and email (all optional) to ``props``."""
     mid = host()._machine_id()
     if mid:
         props["machine_id"] = mid
@@ -107,4 +101,17 @@ def _base_properties(client_name: str = "", client_version: str = "") -> dict:
     email = _email()
     if email:
         props["$set"] = {"email": email}
+
+
+def _base_properties(client_name: str = "", client_version: str = "") -> dict:
+    """Build the common event properties (best-effort)."""
+    props: dict[str, Any] = {
+        "dist_version": host()._dist_version(),
+        "platform": f"{platform.system()} {platform.release()}".strip(),
+        "arch": platform.machine(),
+        "$lib": "qa-agent-pro-telemetry",
+        # No IP-derived location: PostHog skips GeoIP enrichment on every event.
+        "$geoip_disable": True,
+    }
+    _add_identity(props, client_name, client_version)
     return props

@@ -1,8 +1,7 @@
 """The ``update_trust`` row of the machine report (B22).
 
-Three states are meant: unsigned by design, refusing, and signed. No release is
-signed today (2026-10-06 decision), so the ``signed`` row is not built: nothing
-could reach it.
+Two states: refusing unsigned releases (the default) and not requiring a
+signature (the emergency escape hatch). A present signature is always verified.
 """
 
 from __future__ import annotations
@@ -10,8 +9,8 @@ from __future__ import annotations
 from tools import settings_port
 from tools.machine_report_core import Row
 
-UNSIGNED = "unsigned by design (releases carry no MANIFEST.sig)"
-REFUSING = "refusing unsigned releases (QA_UPDATE_REQUIRE_SIGNATURE is on)"
+UNSIGNED = "signature NOT required (QA_UPDATE_REQUIRE_SIGNATURE is off)"
+REFUSING = "signed releases only (QA_UPDATE_REQUIRE_SIGNATURE is on)"
 
 
 def update_trust_row() -> Row:

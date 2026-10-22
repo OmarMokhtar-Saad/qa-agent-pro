@@ -18,6 +18,9 @@ from typing import TYPE_CHECKING, Tuple, Type, TypedDict, Union
 if TYPE_CHECKING:
     from typing_extensions import Unpack
 
+_FALLBACK_LOG = logging.getLogger("qa.never_raise")
+_PROGRAMMING = (AttributeError, TypeError, NameError)
+
 Catch = Union[Type[BaseException], Tuple[Type[BaseException], ...]]
 
 
@@ -28,12 +31,16 @@ class GuardOptions(TypedDict, total=False):
     exc_info: bool
     with_exc: bool
     catch: Catch
+    expected: bool
 
 
 class never_raise:
     """Swallow ``catch`` (default ``Exception``) and log it at the caller's level.
 
-    ``log=None`` swallows silently. ``with_exc`` appends the exception to the
+    ``log=None`` records the swallow on the ``qa.never_raise`` logger (DEBUG
+    with the exception type; a programming error -- AttributeError, TypeError,
+    NameError -- is WARNING with traceback unless ``expected=True``). Logs go
+    to stderr, never stdout. ``with_exc`` appends the exception to the
     message args; ``exc_info`` attaches the traceback. ``KeyboardInterrupt``,
     ``SystemExit`` and ``asyncio.CancelledError`` pass through by default.
     """
@@ -68,7 +75,20 @@ class never_raise:
         self.exc = exc
         if self._log is not None:
             self._emit(self._log, exc)
+        else:
+            self._emit_unlogged(exc)
         return True
+
+    def _emit_unlogged(self, exc: BaseException) -> None:
+        loud = isinstance(exc, _PROGRAMMING) and not self._options.get("expected")
+        _FALLBACK_LOG.log(
+            logging.WARNING if loud else logging.DEBUG,
+            "swallowed %s: %s",
+            type(exc).__name__,
+            exc,
+            exc_info=exc if loud else None,
+            stacklevel=3,
+        )
 
     def _emit(self, log: logging.Logger, exc: BaseException) -> None:
         opts = self._options

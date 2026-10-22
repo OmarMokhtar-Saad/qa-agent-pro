@@ -13,9 +13,8 @@ from tools.updater_paths import _MANIFEST_NAME, _MANIFEST_SIG_NAME
 # Ed25519 release-signing PUBLIC keys (hex, 32 bytes each): the KEYRING. A
 # release is trusted when ANY key here verifies its MANIFEST.sig. The matching
 # PRIVATE keys are held ONLY by the release maintainer and never live in this
-# repo. Releases now ship UNSIGNED (publisher signing was removed; see
-# docs/DECISIONS.md), so this verifier is dormant. Empty => no embedded
-# key => signature verification is inert (logged) and the
+# repo (scripts/dist_build/sign.py reads $QA_RELEASE_SIGNING_KEY). Empty => no
+# embedded key => verification is inert (logged) and the
 # QA_UPDATE_REQUIRE_SIGNATURE gate decides whether an unsigned release proceeds.
 #
 # NEVER replace a key outright. An install trusts only the keys it already

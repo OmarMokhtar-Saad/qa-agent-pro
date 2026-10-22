@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from handlers import _agents, _common, _reply, export
+from handlers import _agents, _common, _reply, explore_sessions
 from handlers.explore_bug_session import _record_covered_area
 from tools import host_llm as _host_llm
 
@@ -30,7 +30,7 @@ async def _apply_step(
 ) -> str:
     """Record the host's step in the session, audit it, and shape the reply."""
     clean, coach_meta = step_result
-    sess["history"].append({"role": "assistant", "content": clean})
+    explore_sessions.append_history(sess, "assistant", clean)
     _record_covered_area(sess, coach_meta)
     await _common.audit(
         "mcp_explore_step",
@@ -60,7 +60,7 @@ async def submit_coach_step(task_id: str, step: str) -> str:
     # host cannot write findings into another tester's session.
     session_id = str(meta.get("session_id") or "")
     step_result = _agents.finalize_coach_step(str(content.get("raw") or ""))
-    sess = export._SESSIONS.get(session_id)
+    sess = explore_sessions.get_session(session_id)
     if sess is None:
         return _session_lost_reply(step_result[0])
     return await _apply_step(session_id, sess, step_result)

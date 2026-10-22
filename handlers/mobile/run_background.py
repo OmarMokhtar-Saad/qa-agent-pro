@@ -1,6 +1,6 @@
-"""A setup call the host abandoned keeps running; the next call adopts it (fix/1530).
+"""A setup call the host abandoned keeps running; the next call adopts it.
 
-fix/1520 gave the device back when the host (Cursor) cancelled a
+An earlier release gave the device back when the host (Cursor) cancelled a
 ``qa_mobile_test`` setup call, which threw away the work in flight (an App
 Tester download/install) and made the next call start over. Now the setup body
 runs as its own task, shielded from the caller:
@@ -29,7 +29,7 @@ from handlers.mobile import run_background_flags as flags
 from handlers.mobile.run_background_still import still_running
 from tools.mobile import lock_reaper, locks, locks_devices, session_finish
 
-#: Longest an adopting call waits for a setup; under the host timeout (fix/1580).
+#: Longest an adopting call waits for a setup; under the host timeout.
 ADOPT_DEADLINE_S = 90.0
 
 _NOTE = (

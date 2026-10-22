@@ -65,7 +65,7 @@ class RagSettings(BaseModel):
     #           similarity scoring, no matcher). A requirement_id with no
     #           tracing case is reported as an orphaned requirement.
     # The named seam is tools/atomic_checklist.checklist_enabled(), a True
-    # constant, and tests/conftest.py pins it False suite-wide -- unpinned,
+    # constant, and the test suite pins it False suite-wide -- unpinned,
     # every generation test would decompose and make a real ask_json call.
     # See docs/FEATURE_FLAGS.md.
     # QA_CHECKLIST_REMEDIATION_ENABLED was DELETED on 2026-08-14

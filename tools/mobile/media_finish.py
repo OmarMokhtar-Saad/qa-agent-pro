@@ -73,7 +73,7 @@ async def _pull_deferred(ref: ClipRef, job: _PullJob) -> None:
 # ``content`` is the list of records written. Never raises, and no branch here
 # can change a verdict: the caller ignores the result by design.
 async def finish_step(ref: ClipRef, handle: object, screen_id: str = "") -> dict:
-    """Stop the clip and store its record on the case. No per-step frame (WP-D)."""
+    """Stop the clip and store its record on the case. No per-step frame."""
     held = handle if isinstance(handle, dict) else {}
     records = []
     with never_raise(

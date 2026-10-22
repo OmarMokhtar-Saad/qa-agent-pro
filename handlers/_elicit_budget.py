@@ -19,7 +19,7 @@ logger = logging.getLogger("tools.mcp_handlers")
 # ``mcp_server._make_elicitors`` -- a duck-typed private attribute rather than a
 # parameter, so none of the ~15 handler signatures had to change. Both ends are
 # cross-referenced: see ``_make_elicitors`` in mcp_server.py. A callback without
-# one (tests, .claude/local/mcp_matrix.py) simply gets per-dialog bounding, which
+# one (tests, local matrix scripts) simply gets per-dialog bounding, which
 # fails safe.
 #
 # The FIRST dialog of a call is floored at ELICIT_FLOOR_S even on an exhausted

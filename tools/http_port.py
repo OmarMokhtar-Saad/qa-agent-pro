@@ -9,7 +9,8 @@ Timeouts are parameters, never module constants.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 import httpx
@@ -18,6 +19,17 @@ import httpx
 def get(url: str, headers: Mapping[str, str], timeout: float) -> httpx.Response:
     """GET following redirects."""
     return httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+
+
+@contextmanager
+def stream_get(
+    url: str, headers: Mapping[str, str], timeout: float
+) -> Iterator[httpx.Response]:
+    """Streaming GET following redirects; the body is read by the caller."""
+    with httpx.stream(
+        "GET", url, headers=headers, timeout=timeout, follow_redirects=True
+    ) as resp:
+        yield resp
 
 
 def post_json(url: str, payload: Mapping[str, Any], timeout: float) -> httpx.Response:

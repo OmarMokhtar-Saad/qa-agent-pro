@@ -1,6 +1,6 @@
 """Replay engine: the one report PNG of a stop (done, end of script, failed assert).
 
-Fast steps (WP-D): a step takes NO picture. The screen is photographed only
+Fast steps: a step takes NO picture. The screen is photographed only
 where a run is judged, and the PNG goes to the run folder for the report --
 never into a reply. Best-effort and never raises: a lost picture may not
 change a verdict.

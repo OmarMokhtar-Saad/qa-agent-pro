@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 import time
@@ -112,6 +113,7 @@ def _exit_if_idle() -> tuple:
         busy = _INFLIGHT["n"] + _mobile_runs_active()
         idle = time.monotonic() - _INFLIGHT["last_finish"]
         if not busy and idle >= _DRAIN_IDLE_S:
+            logging.shutdown()  # os._exit skips atexit: flush log files
             os._exit(DRIFT_RESTART_EXIT_CODE)
     return busy, idle
 

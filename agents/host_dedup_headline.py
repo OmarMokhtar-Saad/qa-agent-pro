@@ -33,7 +33,7 @@ def _headline_cap_note(n: int, total) -> str:
 # TRIMMABLE section, ``build_dup_contradiction_pairs``: the claim about
 # whether the deliverable is what it appears to be must survive the reply
 # budget, the list backing it need not. See the reply-budget section of
-# .claude/plans/plan-d4-d5-TICKET5646-2026-08-21.md for the measurements.
+# the D4/D5 plan for the measurements.
 #
 # HONESTY BOUND, stated here because it is the reason the wording is a FLOOR
 # rather than a finding. Measured on the stored TICKET-5646 suite (96 cases,

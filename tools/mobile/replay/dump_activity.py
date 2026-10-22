@@ -1,6 +1,6 @@
 """Replay activity state: which dump path a device is on and what its last dump said about focus.
 
-WHY THIS EXISTS (fix/1510-b). The qa-ime accessibility tree carries only the
+WHY THIS EXISTS. The qa-ime accessibility tree carries only the
 root ``package`` (QaA11yService.kt), never the activity, and the old code paid
 one ``dumpsys window | grep mCurrentFocus`` (~100 ms) beside EVERY dump and
 every focus probe. Now:

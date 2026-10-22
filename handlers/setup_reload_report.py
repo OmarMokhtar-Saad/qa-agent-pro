@@ -59,16 +59,14 @@ _DRIFT_CODE_NOTE = (
     "**This server is running older code than is on disk.** Another "
     "process updated this install after this one started, so it is "
     "serving stale modules -- and anything reported below describes "
-    "the OLD code. Restart the MCP server (`python3 "
-    ".claude/operations/scripts/qa-restart.py`, or reconnect it in "
+    "the OLD code. Restart the MCP server (or reconnect it in "
     "your client) to pick the new code up."
 )
 
 _DRIFT_ENV_NOTE = (
     "**`.env` was edited after this server started.** The settings "
     "reported above are the ones this process booted with, NOT what "
-    "the file says now. Restart the MCP server (`python3 "
-    ".claude/operations/scripts/qa-restart.py`, or reconnect it in "
+    "the file says now. Restart the MCP server (or reconnect it in "
     "your client) to apply them."
 )
 

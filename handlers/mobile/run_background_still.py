@@ -1,4 +1,4 @@
-"""The reply of an adopting call whose setup is still running past the cap (fix/1580)."""
+"""The reply of an adopting call whose setup is still running past the cap."""
 
 from __future__ import annotations
 

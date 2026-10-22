@@ -43,7 +43,7 @@ def _fa_call(rt, ctx, args: tuple) -> FeatureAnalysisCall:
 
 def _fa_blocks(rt, reply) -> list:
 
-    # Owner rule (fix/1630, G05): text only, never an image to the host.
+    # Owner rule: text only, never an image to the host.
     return [TextContent(type="text", text=str(reply))]
 
 

@@ -1,4 +1,4 @@
-"""Give back a same-process pre-run hold whose setup call has ENDED (fix/1520).
+"""Give back a same-process pre-run hold whose setup call has ENDED.
 
 A pre-run (provisioning) owner is a label one ``qa_mobile_test`` call mints; it
 has no run and no lease heartbeat, so the ONLY thing that can release it is

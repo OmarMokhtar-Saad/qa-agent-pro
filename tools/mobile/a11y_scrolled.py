@@ -1,4 +1,4 @@
-"""A server-issued scroll/swipe is an EXPECTED change of the screen (fix/1580 C04).
+"""A server-issued scroll/swipe is an EXPECTED change of the screen.
 
 After the server swipes, :func:`after` waits (bounded, event-driven) for the a11y
 service's next event generation and remembers the swipe. The next a11y read that

@@ -1,4 +1,4 @@
-"""Tool-description detail moved out of the ``qa_*`` descriptions (fix/1510 WP-G).
+"""Tool-description detail moved out of the ``qa_*`` descriptions.
 
 A tool description is billed on EVERY request of every chat (the whole
 ``list_tools`` JSON, ~27k chars before this change). The descriptions now keep a

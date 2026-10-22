@@ -151,7 +151,7 @@ def mobile_modules_present() -> bool:
 # install produced all three. The whole point of shipping the lane and
 # pinning the IME was to reach a tester, so the term is gone and
 # ``mobile_modules_present()`` carries the argument alone -- which is what
-# ``.claude/plans/mobile-programme.md`` specified in the first place.
+# the mobile programme plan specified in the first place.
 #
 # Read fresh on every call, never cached: a test may patch the module probe,
 # and a cached answer would make the absent path unobservable.

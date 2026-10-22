@@ -1,4 +1,4 @@
-"""``qa_mobile_status`` rows for a device BEING SET UP by this server (fix/1520).
+"""``qa_mobile_status`` rows for a device BEING SET UP by this server.
 
 The run listing reads run dirs, and a pre-run hold has no run dir yet: a
 device held under a provisioning label was invisible to ``qa_mobile_status``

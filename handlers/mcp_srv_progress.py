@@ -76,7 +76,7 @@ def _make_progress(ctx):
 
 
 #: Silence after which a running tool call is pinged; well under the host's
-#: ~120 s idle timeout (fix/1580 C01).
+#: ~120 s idle timeout.
 KEEPALIVE_S = 20.0
 
 

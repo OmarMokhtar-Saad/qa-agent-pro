@@ -12,7 +12,7 @@ from handlers.mcp_srv_progress import _make_progress
 from handlers.mcp_srv_track import _tracked
 
 
-# Owner rule (fix/1630, G05): the server sends NO image to the MCP host, ever.
+# Owner rule: the server sends NO image to the MCP host, ever.
 # The specs stay in the server (report, grounding); the reply is text only.
 def _prepare_payload_to_content(result):
     """Convert a PreparePayloadResult into the qa_prepare_test_cases TEXT blocks."""
@@ -53,7 +53,7 @@ def _screenshot_note(fields: dict) -> str:
 async def _mobile_reply(spec: MobileReplySpec, ctx, fields: dict, **extra) -> list:
     """Run a mobile ``*_content`` handler under `_tracked` and shape its reply.
 
-    The reply is ONE text block and never an image (fast steps, WP-D): the
+    The reply is ONE text block and never an image: the
     screen reaches the report only through `run_shots.write_shot`, at done and
     at a failed assert.
     """
@@ -65,7 +65,7 @@ async def _mobile_reply(spec: MobileReplySpec, ctx, fields: dict, **extra) -> li
             ctx,
             spec.handler(**fields, **extra, progress=_make_progress(ctx)),
         )
-    # a stop never leaves the host without a way on (fix/1490)
+    # a stop never leaves the host without a way on
     text = _lane.host_way_on.with_way_on(spec.name, text, _target_of(fields))
     # no reply echoes a tester input the run holds (E08)
     text = _lane.act_scrub.scrub(text) + _screenshot_note(fields)
