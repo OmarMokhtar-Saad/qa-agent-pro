@@ -79,12 +79,28 @@ def _fetch_step(ctx: DirectiveCtx, target: str) -> str:
         + ctx.token
         + "', part='issue', json=<STRINGIFIED result of THIS fetch "
         "only>)` before doing anything else - do not wait to collect "
-        "the parent or siblings."
+        "the parent or siblings. If the result is over 20 KB, save it "
+        "to a file (or use the file your host already spilled it to) and "
+        "pass `path=<absolute file>` instead of `json`."
     )
 
 
-def _directive_head(ctx: DirectiveCtx, target: str) -> list[str]:
-    """The opening of the fetch directive: the auth hard-stop and step 1."""
+def _step_zero(url: str) -> list[str]:
+    """Step 0: confirm the `atlassian` MCP is connected before anything else."""
+    return [
+        "0. FIRST confirm the `atlassian` MCP server is connected: its tools "
+        "must exist in your tool list and the first call below must succeed. "
+        "If the tools do not exist, or that call fails with an auth error, do "
+        "NOT guess the ticket contents and do NOT generate test cases from "
+        "the URL alone - STOP and show the user this instead:",
+        "",
+        not_connected_message((urlparse(url).hostname or "")),
+        "",
+    ]
+
+
+def _directive_head(ctx: DirectiveCtx, target: str, url: str = "") -> list[str]:
+    """The opening of the fetch directive: step 0, the auth hard-stop, step 1."""
     return [
         "\U0001f517 **Fetch this Jira ticket with your own Atlassian MCP "
         "connection, then call me back.**",
@@ -97,6 +113,7 @@ def _directive_head(ctx: DirectiveCtx, target: str) -> list[str]:
         "Never read tokens, keychains, credential files, or other "
         "workspaces' files to get around it:",
         "",
+        *_step_zero(url),
         _fetch_step(ctx, target),
     ]
 
@@ -121,25 +138,19 @@ def _tail_rules() -> list[str]:
         "Stage each fetch VERBATIM. Do NOT summarise, reword, translate "
         "or truncate it, and do NOT strip fields - `fields.updated` in "
         "particular is how I tell whether the payload you sent is a fresh "
-        "read or a cached copy, and I say so in the reply.",
+        "read or a cached copy, and I say so in the reply. If the result is "
+        "too big to pass as `json` (over 20 KB), save the raw result to a "
+        "file UNCHANGED and call `qa_stage_jira` with `path=<absolute file>` "
+        "instead of `json`; I read it and trim bulky fields myself.",
         "",
         "RULES: qa_* MCP tools are the only path - never import handlers "
         "or spawn your own MCP client; never read tokens/keychains; "
         "generate NEW cases, never resubmit an old export; never edit or "
         "strip the staged ticket content.",
         "",
-        "**If you have no `atlassian` MCP server connected** (the tools above "
-        "do not exist in your tool list), do NOT guess the ticket contents and "
-        "do NOT generate test cases from the URL alone. Show the user this "
-        "instead:",
-        "",
     ]
 
 
-def _directive_tail(step: int, token: str, url: str) -> list[str]:
+def _directive_tail(step: int, token: str) -> list[str]:
     """The closing step, the verbatim-staging rules and the not-connected text."""
-    return [
-        _tail_step(step, token),
-        *_tail_rules(),
-        not_connected_message((urlparse(url).hostname or "")),
-    ]
+    return [_tail_step(step, token), *_tail_rules()]

@@ -6,6 +6,7 @@ Never imports the facade.
 
 from __future__ import annotations
 
+from tools.mobile import permission_note
 from tools.mobile import run_packets as mobile_run
 from tools.mobile.explore_runner_consts import RUNNING
 from tools.mobile.explore_runner_state import _record_scope, remaining
@@ -42,6 +43,7 @@ def packet_turn(run_id: str, held: Held, now: float | None) -> dict:
     note = (body.get("auto_replay") or {}).get("note")
     if note and isinstance(packet, dict):
         packet["auto_replay"] = note
+    permission_note.annotate(packet, screen)
     return turn_result(RUNNING, body, TurnParts(screen, packet, left))
 
 

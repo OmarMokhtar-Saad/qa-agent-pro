@@ -37,16 +37,25 @@ def advice(count: int, element: dict) -> str:
     )
 
 
+#: Said on the tap's own reply: the settled read equals the one before the tap.
+DEAD_TAP = (
+    "The tap went through but the screen did not change; it may not have "
+    "registered. Check the screen before relying on it."
+)
+
+
 def note_if_ambiguous(entry: dict, step: Any, before: Any) -> None:
-    """Append the advice to a tap entry that did nothing on an ambiguous name."""
-    element = getattr(step, "element", None)
-    if (
-        step.op not in TAP_OPS
-        or entry.get("outcome") != "no_change"
-        or not isinstance(element, dict)
-    ):
+    """Append the advice to a tap entry that did nothing: the ambiguity hint when
+    several controls share the name, else the plain "screen did not change"
+    (said only when the auto-settle proved it: a bare re-dump may just be early)."""
+    if step.op not in TAP_OPS or entry.get("outcome") != "no_change":
         return
+    element = getattr(step, "element", None)
     count = same_named(before, element)
-    if count > 1:
-        said = f"{entry.get('detail') or ''} {advice(count, element)}"
-        entry["detail"] = said.strip()
+    if count > 1 and isinstance(element, dict):
+        said = advice(count, element)
+    elif entry.get("settled_unchanged") is True:
+        said = DEAD_TAP
+    else:
+        return
+    entry["detail"] = f"{entry.get('detail') or ''} {said}".strip()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from config.settings_guard import never_raise
 from handlers import (
@@ -27,15 +28,31 @@ async def _mobile_doctor_section() -> list:
     """The qa-doctor lines for the mobile lane. Never raises, never blocks."""
     if not _common.mobile_lane_enabled():
         return []
+    attached = await _attached_or_none()
+    physical = setup_mobile_emulator.has_physical(attached)
     lines = [
-        "### Mobile emulator lane",
+        _lane_heading(physical),
         "- Device actions go through `qa_mobile_test` (goal=... starts an exploration"
         " run), not raw adb: it owns the safety guard, keyboard handling and"
         " evidence.",
     ]
-    lines += await _mobile_sdk_ime_lines()
-    lines += await setup_mobile_emulator._mobile_emulator_lines()
+    lines += await _mobile_sdk_ime_lines(physical, attached)
+    lines += await setup_mobile_emulator._mobile_emulator_lines(physical)
     return lines
+
+
+def _lane_heading(physical: bool) -> str:
+    """The section title; a phone on the cable is named, not called an emulator."""
+    if physical:
+        return "### Mobile device lane (a physical phone is attached)"
+    return "### Mobile emulator lane"
+
+
+async def _attached_or_none() -> Optional[dict]:
+    """The doctor run's ONE devices read; None when the probe fails."""
+    with never_raise(logger, "qa-doctor device probe skipped", exc_info=True):
+        return await setup_mobile_devices._mobile_attached_devices()
+    return None
 
 
 def _sdk_line(root: str, located: dict, render) -> str:
@@ -53,7 +70,9 @@ def _sdk_line(root: str, located: dict, render) -> str:
     )
 
 
-async def _mobile_sdk_ime_lines() -> list:
+async def _mobile_sdk_ime_lines(
+    physical: bool = False, attached: Optional[dict] = None
+) -> list:
     """SDK, AVD, device-lock and keyboard lines; one note when they cannot be read."""
     lines: list = []
     with never_raise(
@@ -63,8 +82,8 @@ async def _mobile_sdk_ime_lines() -> list:
         root = str(located.get("sdk_root") or "")
         lines.append(_sdk_line(root, located, doctor_render))
         if root:
-            lines += await setup_mobile_emulator._mobile_avd_rows()
-        await _mobile_lock_ime_lines(lines)
+            lines += await setup_mobile_emulator._mobile_avd_rows(physical)
+        await _mobile_lock_ime_lines(lines, attached)
     if g.failed:
         lines.append("- ⬜ Mobile support modules could not be inspected")
     return lines
@@ -85,10 +104,13 @@ async def _mobile_sdk_ime_lines() -> list:
 # a fact about this BUILD; it says nothing about whether any attached
 # device can type a character, which is what a tester whose script typed
 # nothing is actually asking.
-async def _mobile_lock_ime_lines(lines: list) -> None:
-    """Append the per-device lock rows and the QA keyboard rows to *lines*."""
+async def _mobile_lock_ime_lines(lines: list, attached: Optional[dict] = None) -> None:
+    """Append the per-device lock rows and the QA keyboard rows to *lines*.
 
-    attached = await setup_mobile_devices._mobile_attached_devices()
+    *attached* is the caller's one devices read (None: read it here)."""
+
+    if attached is None:
+        attached = await setup_mobile_devices._mobile_attached_devices()
     lines += setup_mobile_devices._mobile_lock_rows(attached)
     pinned = (ime.manifest_status() or {}).get("content") or {}
     lines.append(setup_mobile_ime.pinned_row(pinned))

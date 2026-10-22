@@ -41,7 +41,7 @@ qa_prepare_test_cases: feature_or_url is a description, a Jira/issue URL, a web 
 
 qa_generate_test_cases: continue exactly as for qa_prepare_test_cases (qa_get_category_job(prep_id, "all") once, qa_submit_category per category, qa_submit_suite to finalize). Relay the .xlsx path; do NOT ask which export format or offer to push.
 
-qa_stage_jira: call it after each getJiraIssue/JQL call the directive asked for; part is 'issue', 'parent' or 'siblings'; `json` is that ONE result, stringified, under ~20KB.
+qa_stage_jira: call it after each getJiraIssue/JQL call the directive asked for; part is 'issue', 'parent' or 'siblings'; `json` is that ONE result, stringified, under ~20KB; for a bigger result save it to a file and pass `path=<absolute file>` instead.
 
 qa_get_category_job: generation runs 6.5-24 minutes per category in your own chat model: tell the tester "Generating <category>..." before you start writing each one, so a long gap is never silent.
 

@@ -11,6 +11,7 @@ from handlers.mobile.step_capture import (
     _screen_unusable,
 )
 from handlers.mobile.step_memo import MemoCtx, _mobile_shown_packet
+from tools.mobile import flow_replay_note
 from tools.mobile import render as mobile_render
 from tools.tool_briefs import MOBILE_BRIEF, MOBILE_REMINDER
 
@@ -87,7 +88,24 @@ async def _mobile_packet_text(ask: PacketAsk) -> str:
     run_id = str(body.get("run_id") or "")
     memo = MemoCtx(run_id, str(session_token or ""), _screen_unusable(packet), note)
     shown, brief_needed = _packet_shown(packet, memo)
-    return _packet_block(shown, session_token, brief_needed)
+    note, shown = pop_replay_note(shown)
+    return note + _packet_block(shown, session_token, brief_needed)
+
+
+def pop_replay_note(shown: Any) -> tuple[str, Any]:
+    """``(note + blank line, packet without it)``: an auto-replay note leads the reply (E-04)."""
+    note = shown.get("auto_replay") if isinstance(shown, dict) else None
+    if not note:
+        return "", shown
+    return str(note) + "\n\n", {k: v for k, v in shown.items() if k != "auto_replay"}
+
+
+def lead_with_note(head: str, tail: str) -> str:
+    """``head + tail``, but a note opening *tail* moves above *head* (E-04)."""
+    if not tail.startswith(flow_replay_note.OPEN):
+        return head + tail
+    note, _, rest = tail.partition("\n\n")
+    return note + "\n\n" + head + rest
 
 
 STILL_CHANGING_NOTE = "screen: still changing after 3 s; use wait-until-text"

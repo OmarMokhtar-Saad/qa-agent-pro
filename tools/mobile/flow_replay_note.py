@@ -8,7 +8,10 @@ never repeated. Pure; never raises.
 
 from __future__ import annotations
 
+import re
 from typing import NamedTuple
+
+from tools.untrusted import single_line
 
 KEY_CHARS = 12
 #: What the host may do when a replay stops (B14): the stop is the host's decision.
@@ -19,6 +22,10 @@ OPTIONS = (
 )
 MAX_LISTED = 8
 MAX_GOAL = 80
+MAX_TARGET = 60
+MAX_NAME = 40
+#: The note's first words; the reply renderers hoist a note that starts with it.
+OPEN = "Before your steps"
 
 
 class Head(NamedTuple):
@@ -37,23 +44,30 @@ def short(key: object) -> str:
 
 def labelled(name: str, template: dict) -> str:
     """*name* plus the flow's own goal text (B17: advisory, lets the host spot a mismatch)."""
-    goal = " ".join(str((template.get("meta") or {}).get("goal") or "").split())
-    return "%s (goal: %s)" % (name, goal[:MAX_GOAL]) if goal else name
+    goal = single_line((template.get("meta") or {}).get("goal"), MAX_GOAL).strip()
+    return "%s (goal: %s)" % (name, goal) if goal else name
 
 
 def _target(step: dict) -> str:
     got = step.get("target")
     target: dict = got if isinstance(got, dict) else {}
     named = next((str(v) for v in target.values() if v), "")
-    return named or ("" if step.get("secret") else str(step.get("text") or ""))[:30]
+    text = named or ("" if step.get("secret") else str(step.get("text") or ""))
+    return single_line(text, MAX_TARGET if named else 30).strip()
+
+
+def _line_head(step: dict) -> str:
+    """``op target`` without a trailing space when the step has no target."""
+    return ("%s %s" % (step.get("op"), _target(step))).strip()
 
 
 def _line(template: dict, at: int) -> str:
     steps = template.get("steps") or []
     after = (template.get("meta") or {}).get("after") or []
     land = after[at] if at < len(after) else ""
-    head = "%d. %s %s" % (at + 1, steps[at].get("op"), _target(steps[at]))
-    return head + (" -> " + short(land) if land else "")
+    return "%d. %s" % (at + 1, _line_head(steps[at])) + (
+        " -> " + short(land) if land else ""
+    )
 
 
 def done_lines(head: Head, pos: int) -> list:
@@ -66,7 +80,7 @@ def _diverged(head: Head, pos: int, why: str) -> str:
     want = before[pos] if pos < len(before) else ""
     return "diverged at step %d: %s (expected screen %s, live screen %s)" % (
         pos + 1,
-        why,
+        single_line(why, 200),
         short(want),
         short(head.live),
     )
@@ -87,21 +101,77 @@ def _landed(head: Head, pos: int) -> str:
     return "all landed" if whole else "each replayed step landed"
 
 
-def text(head: Head, pos: int, why: str) -> str:
-    """The whole note for a replay that ran steps ``head.start`` .. *pos* - 1."""
-    total = len(head.template.get("steps") or [])
-    named = labelled("`%s`" % head.name, head.template)
-    base = "auto-replayed saved flow %s (from an earlier run): %s" % (
+CLOSERS = (
+    "close", "dismiss", "cancel", "got it", "×",
+    "no, later", "not now", "skip", "later", "no thanks", "ok",
+)  # fmt: skip
+CLOSE_WORDS = ("close", "dismiss")
+
+
+def _has_close_word(low: str) -> bool:
+    """Whether a lower-cased label has a whole close word (``close_icon``, not ``disclose``)."""
+    return any(t in CLOSE_WORDS for t in re.split(r"[^a-z0-9]+", low))
+
+
+def _label_closes(step: dict) -> bool:
+    """Whether the tapped control reads as a close control (a guess, never proof)."""
+    got = step.get("target")
+    target: dict = got if isinstance(got, dict) else {}
+    for key, value in target.items():
+        low = str(value or "").strip().lower()
+        if low in CLOSERS or (key != "text" and _has_close_word(low)):
+            return True
+    return False
+
+
+def _closes(step: dict) -> bool:
+    """Whether *step* may have closed a sheet, dialog or popup (back, or a close-like tap)."""
+    op = str(step.get("op") or "")
+    if op == "back":
+        return True
+    return op.startswith("tap") and "present" not in op and _label_closes(step)
+
+
+def closed_lines(head: Head, pos: int) -> list:
+    """One hedged note line per replayed step that may have closed a sheet or dialog."""
+    steps = head.template.get("steps") or []
+    return [
+        "It may have closed a sheet, dialog or popup at step %d (%s)."
+        % (i + 1, _line_head(steps[i]))
+        for i in range(head.start, min(pos, len(steps)))
+        if _closes(steps[i])
+    ][:MAX_LISTED]
+
+
+def _opening(head: Head, pos: int, why: str) -> str:
+    """The first sentence: what ran before the host's steps (E-04)."""
+    named = labelled("'%s'" % single_line(head.name, MAX_NAME), head.template)
+    if pos <= head.start:
+        return "%s, saved flow %s was tried but ran no steps." % (OPEN, named)
+    ran = "; ".join(done_lines(head, pos))
+    done = "" if why else ", " + _landed(head, pos)
+    return "%s, saved flow %s ran %s%s: %s." % (
+        OPEN,
         named,
         _span(head, pos),
+        done,
+        ran,
     )
-    ran = done_lines(head, pos)
-    steps = "\nreplayed: " + "; ".join(ran) if ran else ""
+
+
+def _stopped(head: Head, pos: int, why: str) -> str:
+    """The stop tail: the steps left, where it diverged, and the host's options."""
+    total = len(head.template.get("steps") or [])
+    skipped = "\nnot replayed: %d step(s) left (from step %d)." % (total - pos, pos + 1)
+    return skipped + "\n%s. %s" % (_diverged(head, pos, why), OPTIONS)
+
+
+def text(head: Head, pos: int, why: str) -> str:
+    """The whole note for a replay that ran steps ``head.start`` .. *pos* - 1.
+
+    It OPENS with what ran before the host's own steps (E-04).
+    """
+    extra = "".join("\n" + x for x in closed_lines(head, pos))
     for said in head.said:
-        steps += "\n" + said + "."
-    if not why:
-        return "%s, %s.%s" % (base, _landed(head, pos), steps)
-    left = total - pos
-    skipped = "\nnot replayed: %d step(s) left (from step %d)." % (left, pos + 1)
-    stop = "\n%s. %s" % (_diverged(head, pos, why), OPTIONS)
-    return base + "." + steps + skipped + stop
+        extra += "\n" + single_line(said, 200) + "."
+    return _opening(head, pos, why) + extra + (_stopped(head, pos, why) if why else "")

@@ -43,8 +43,8 @@ def _too_large_result(load_error: str) -> dict:
         "for each part you still need and stage that ONE "
         "result with `qa_stage_jira(stage_token=..., "
         "part='issue'|'parent'|'siblings', json=<that "
-        "result>)` -- request only the fields the directive "
-        "named if a part is rejected for size too -- then "
+        "result>)` -- for a result over 20 KB save it to a file and "
+        "pass `path=<absolute file>` instead of `json` -- then "
         "call `qa_prepare_test_cases` again with that SAME "
         "`stage_token`."
     )

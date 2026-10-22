@@ -78,13 +78,13 @@ def _mobile_gate_row(state: str) -> tuple[str, bool]:
     """qa-doctor's Feature-gates row for the emulator lane: LABEL and tick."""
     if state == "on":
         return (
-            "Mobile emulator lane \u2014 on: it runs your test cases on an "
+            "Mobile device lane \u2014 on: it runs your test cases on an "
             "attached Android device or an emulator and writes an HTML report",
             True,
         )
     if state == "absent":
         return (
-            "Mobile emulator lane \u2014 not included in this build. It runs "
+            "Mobile device lane \u2014 not included in this build. It runs "
             "test cases on an Android device, but its modules are not "
             "installed here, so nothing on this machine can switch it on",
             False,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from tools.mobile import case_run_start as start_mod
-from tools.mobile import run_store
+from tools.mobile import permission_note, run_store
 from tools.mobile.case_run_counts import _prior_uncharged
 from tools.mobile.case_run_evidence import _prior_content
 from tools.mobile.case_run_notrun import attach_not_run, queued_before
@@ -109,10 +109,8 @@ def _step_payload(step: _Step, view: dict, **fields: Any) -> dict:
     """
     fields.setdefault("escapes", step.used)
     queued_n = queued_before(step.run_id, step.tc_id)
-    payload = {
-        "error": None,
-        "content": _checkpoint(
-            step.run_id, step.tc_id, view, trace=step.trace, **fields
-        ),
-    }
+    content = _checkpoint(step.run_id, step.tc_id, view, trace=step.trace, **fields)
+    payload = {"error": None, "content": content}
+    if content and content.get("status") == "needs_model":
+        permission_note.annotate(content, step.new_screen)
     return attach_not_run(payload, step.result, queued_n)

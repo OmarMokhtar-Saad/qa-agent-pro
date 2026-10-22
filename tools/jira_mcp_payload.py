@@ -19,7 +19,9 @@ def _too_large() -> str:
     return (
         "That Jira payload is too large to accept "
         f"(over {MAX_PAYLOAD_BYTES // 1000} KB). Re-fetch the issue "
-        "requesting only the fields listed in the directive."
+        "requesting only the fields listed in the directive, or stage "
+        "it with `qa_stage_jira` (big result: save it to a file, pass "
+        "`path=<absolute file>`)."
     )
 
 

@@ -12,14 +12,11 @@ step with a note, and the script goes on. Only a field that stays put is
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
-from tools.mobile.replay.loop_field_landed import landed_on_screen
-from tools.mobile.replay.loop_field_moved import (
-    Moved,
-    moved_on_by_deadline,
-    moved_on_masked,
-)
+from tools.mobile.replay.loop_field_landed import Typed, shows_typed
+from tools.mobile.replay.loop_field_moved import Moved, moved_on_masked
+from tools.mobile.replay.loop_field_poll import moved_or_landed
 from tools.mobile.replay.loop_settle import Acted
 
 if TYPE_CHECKING:
@@ -53,13 +50,33 @@ def _advanced_reply(outcome: dict, screen: object) -> dict:
     return reply
 
 
-def _landed(outcome: dict, acted: Acted, moved: Moved) -> bool:
+class _Read(NamedTuple):
+    """What the settled poll returned and what the step typed."""
+
+    moved: Moved
+    typed: Typed
+
+
+def _landed(outcome: dict, acted: Acted, read: _Read) -> bool:
     """Whether the settled screen shows the typed text in the same field."""
+    moved, typed = read
     if outcome.get("masked") or not moved.settled:
         return False
+    return shows_typed(moved.screen, typed, acted.screen)
+
+
+def _typed_text(acted: Acted) -> object:
+    """The text the step typed."""
     action = acted.entry.get("action")
-    typed = action.get("text") if isinstance(action, dict) else None
-    return landed_on_screen(moved.screen, typed, acted.screen)
+    return action.get("text") if isinstance(action, dict) else None
+
+
+def _typed(run: _ReplayRun, acted: Acted) -> Typed:
+    """The typed text, and whether the previous script step was a ``clear``."""
+    at = int(acted.entry.get("index", -1)) - 1
+    items = getattr(run, "items", None) or []
+    prior = items[at] if 0 <= at < len(items) else None
+    return Typed(_typed_text(acted), getattr(prior, "op", "") == "clear")
 
 
 def _landed_reply(screen: object) -> dict:
@@ -78,9 +95,12 @@ async def reconcile_empty_field(run: _ReplayRun, acted: Acted) -> dict:
     unknown = outcome.get("if_screen_changed")
     if not (outcome.get("error") and isinstance(unknown, dict)):
         return outcome
-    probe = moved_on_masked if outcome.get("masked") else moved_on_by_deadline
-    moved = await probe(run.ctx, acted.screen)
-    if _landed(outcome, acted, moved):
+    typed = _typed(run, acted)
+    if outcome.get("masked"):
+        moved = await moved_on_masked(run.ctx, acted.screen)
+    else:
+        moved = await moved_or_landed(run.ctx, acted.screen, typed)
+    if _landed(outcome, acted, _Read(moved, typed)):
         return _landed_reply(moved.screen)
     if moved.moved:
         return _advanced_reply(outcome, moved.screen)

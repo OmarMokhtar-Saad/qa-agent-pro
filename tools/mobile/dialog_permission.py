@@ -146,10 +146,11 @@ def is_permission_button(text: object) -> bool:
 _CONTROLLER = frozenset(p for p in PERMISSION_PACKAGES if "permissioncontroller" in p)
 
 GRANT_HINT = (
-    " The front window is the runtime-permission dialog: rerun with "
-    "`grant_permissions=true` (the default) to grant the app's permissions "
-    "up front (test setup, not a settings change); pass `false` only when "
-    "the test is the permission prompt itself."
+    " The front window is the runtime-permission dialog: answer it now with its "
+    "own Allow or Deny button, and rerun with `grant_permissions=true` (the "
+    "default) to grant the app's permissions up front (test setup, not a "
+    "settings change); pass `false` only when the test is the permission "
+    "prompt itself."
 )
 
 

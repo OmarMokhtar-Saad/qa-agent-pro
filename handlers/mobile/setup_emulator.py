@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Optional
 
 from config.settings_guard import never_raise
 from handlers import _reply
@@ -59,8 +60,12 @@ def _avd_weight_lines(names: list, sdk_locator, avd_guard) -> list:
 
 async def _physical_attached() -> bool:
     """True when adb lists a usable device that is not an emulator."""
-    found = await setup_devices._mobile_attached_devices()
-    serials = found.get("content") or []
+    return has_physical(await setup_devices._mobile_attached_devices())
+
+
+def has_physical(found: object) -> bool:
+    """True when the devices read *found* lists a usable non-emulator device."""
+    serials = (found.get("content") if isinstance(found, dict) else None) or []
     return any(not str(x).startswith("emulator-") for x in serials)
 
 
@@ -74,14 +79,16 @@ def _avd_extra_lines(names: list, physical: bool) -> list:
     return lines + (["- ⚠️ " + loaded] if loaded else [])
 
 
-async def _mobile_avd_rows() -> list:
+async def _mobile_avd_rows(physical: Optional[bool] = None) -> list:
     """The AVD lines of the mobile doctor section: configured emulators, heavy
-    AVDs and host load."""
+    AVDs and host load. *physical* is the caller's one adb read (None: read it)."""
 
     avds = await _list_avds(emulator)
     names = list(avds.get("content") or [])
     lines = [_avd_summary_line(avds, names, doctor_render)]
-    return lines + _avd_extra_lines(names, await _physical_attached())
+    if physical is None:
+        physical = await _physical_attached()
+    return lines + _avd_extra_lines(names, physical)
 
 
 # `provisioner` went with the AVD_NAME filter below: this probe no
@@ -98,14 +105,15 @@ async def _mobile_avd_rows() -> list:
 # probe itself failed, so this says nothing about what is booted.
 # Includes asyncio.TimeoutError, which IS an Exception on every version
 # this project supports. "not checked" is the honest word here.
-async def _mobile_emulator_lines() -> list:
-    """The line(s) for the emulators adb reports as running."""
+async def _mobile_emulator_lines(physical: Optional[bool] = None) -> list:
+    """The line(s) for the running emulators (*physical* as in ``_mobile_avd_rows``)."""
     lines: list = []
     with never_raise(logger, "qa-doctor emulator probe skipped", exc_info=True) as g:
         found = await asyncio.wait_for(
             emulator.list_running(), timeout=_reply.MOBILE_PROBE_S
         )
-        physical = await _physical_attached()
+        if physical is None:
+            physical = await _physical_attached()
         lines += _emulator_found_lines(found, sdk_locator, physical)
     if g.failed:
         lines.append(

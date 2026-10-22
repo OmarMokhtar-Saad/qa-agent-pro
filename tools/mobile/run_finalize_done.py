@@ -38,6 +38,15 @@ def _stumbled(rows: list) -> str:
     return " and ".join(said)
 
 
+def qualified_verdict(word: str, rows: list) -> str:
+    """``"pass, with 5 failed and 3 interrupted turns"`` for a hurt pass, else *word*."""
+    rows = [row for row in rows if isinstance(row, dict)]
+    hurt = _stumbled(rows) if word == "pass" else ""
+    if not hurt:
+        return word
+    return f"{word}, with {hurt} {'turn' if sum(_counts(rows)) == 1 else 'turns'}"
+
+
 def _count_line(word: str, rows: list, done: int) -> str:
     """``run passed: 5 of 15 ...``; a pass with failed turns names them first."""
     hurt = _stumbled(rows) if word == "pass" else ""

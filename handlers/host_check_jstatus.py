@@ -27,7 +27,7 @@ _JIRA_STATUS_TEMPLATES: dict[str, str] = {
     "stale": (
         "{head}\u2b1c checked {age} ago and not re-checked since. "
         "{tail} An OAuth session can expire or be revoked in that time, so "
-        "I'll re-check it the next time you ask me for a Jira ticket."
+        "the next Jira ticket request checks the connection first."
     ),
     "access_unconfirmed": (
         "{head}\u2705 signed in ({age} ago) \u2014 but I could not confirm "
@@ -37,8 +37,8 @@ _JIRA_STATUS_TEMPLATES: dict[str, str] = {
     "probe_outdated": (
         "{head}\u2b1c checked {age} ago, but only that you were "
         "signed in \u2014 not that the account can reach your Jira site. "
-        "{tail} I'll re-check it the next time you ask "
-        "me for a Jira ticket."
+        "{tail} The next Jira ticket request checks the "
+        "connection first."
     ),
     "wrong_site": (
         "{head}\u274c signed in ({age} ago), but to an Atlassian account "

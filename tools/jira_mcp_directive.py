@@ -54,10 +54,10 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
         target = _directive_target(url, issue_key)
         ctx = _directive_ctx(prefix, token)
         want_parent = bool(settings_port.get().jira_fetch_parent)
-        lines = _directive_head(ctx, target)
+        lines = _directive_head(ctx, target, url)
         optional = _directive_optional_steps(prefix, token, want_parent)
         lines += optional
-        lines += _directive_tail(2 + len(optional), token, url)
+        lines += _directive_tail(2 + len(optional), token)
         return "\n".join(lines)
     except Exception:
         logger.exception("build_fetch_directive failed - returning the fallback")

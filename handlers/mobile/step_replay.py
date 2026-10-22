@@ -14,6 +14,7 @@ from handlers.mobile.step_hooks import mobile_step
 from handlers.mobile.step_packet import (
     PacketAsk,
     _mobile_packet_text,
+    lead_with_note,
     no_assert_note,
     still_changing_note,
 )
@@ -85,7 +86,9 @@ async def _step_reply(turn: StepTurn, body: dict, previous_screen_id: str) -> st
         previous_id=previous_screen_id,
     )
     notice = str(body.get("notice") or "")
-    return line + (("\n\n" + notice) if notice else "") + "\n\n" + tail
+    note = str(body.get("permission_note") or "")
+    notes = "".join("\n\n" + n for n in (notice, note) if n)
+    return lead_with_note(line + notes + "\n\n", tail)
 
 
 def _previous_screen_id(run_id: str) -> str:

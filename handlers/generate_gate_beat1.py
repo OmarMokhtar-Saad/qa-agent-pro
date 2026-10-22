@@ -54,7 +54,7 @@ def _is_attested_skip(ctx: _GateCtx, plan: str) -> bool:
 
 # --- Jira image gate, BEAT 1 (QA_IMAGE_GATE_ENABLED) ------------------- #
 # Placed AFTER the duplicate-prep guard (an already-open prep is the
-# cheaper, more urgent signal) and BEFORE the fetch
+# cheaper, more urgent signal); since 1.154 it asks once the ticket is staged
 #
 # 2026-08-31 (F3): that ordering is still right, but it MASKED this gate
 # -- a tester re-running a ticket saw only the duplicate warning and never
@@ -101,11 +101,13 @@ def _is_attested_skip(ctx: _GateCtx, plan: str) -> bool:
 async def image_gate_beat1(args: Beat1Args) -> _Beat1:
     """Jira image gate beat 1: elicit the source plan, or audit an attested skip."""
     ctx = args.ctx
-    probe = GateProbe(
-        ctx.text, args.plan, ctx.jira_content_json, ctx.attached_images, ctx.attested
-    )
+    payload = "" if args.staged else ctx.jira_content_json
+    probe = GateProbe(ctx.text, args.plan, payload, ctx.attached_images, ctx.attested)
     if host()._image_gate_would_fire(probe):
-        return await _beat1_fire(args)
+        # 2026-10-22 (E-12c): on a Jira URL the host fetches the ticket FIRST
+        # (the fetch directive); this ask is made on the call that carries the
+        # staged ticket (`args.staged`), never before it.
+        return await _beat1_fire(args) if args.staged else _Beat1(args.plan, None)
     if _is_attested_skip(ctx, args.plan):
         await _beat1_attested_skip(ctx)
     return _Beat1(args.plan, None)

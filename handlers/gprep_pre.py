@@ -42,7 +42,7 @@ logger = logging.getLogger("tools.mcp_handlers")
 #
 # --- Jira image gate, BEAT 1 (QA_IMAGE_GATE_ENABLED) ------------------- #
 # Placed AFTER the duplicate-prep guard (an already-open prep is the
-# cheaper, more urgent signal) and BEFORE the fetch
+# cheaper, more urgent signal); since 1.154 it asks once the ticket is staged
 #
 # 2026-08-31 (F3): that ordering is still right, but it MASKED this gate
 # -- a tester re-running a ticket saw only the duplicate warning and never

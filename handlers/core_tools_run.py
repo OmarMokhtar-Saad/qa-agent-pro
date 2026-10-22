@@ -2,7 +2,7 @@
 
 from typing import Any, NamedTuple
 
-from handlers import generate_prepare, jira, wizard
+from handlers import generate_prepare, jira, jira_stage_file, wizard
 
 
 def tool_with_doc(mcp: Any, doc: str, **kwargs: Any) -> Any:
@@ -98,8 +98,12 @@ async def prepare_call(rt: Any, loc: dict[str, Any]) -> Any:
 
 async def stage_call(rt: Any, loc: dict[str, Any]) -> str:
     """Run qa_stage_jira."""
-    return await rt._tracked(
-        "qa_stage_jira",
-        loc["ctx"],
-        jira.handle_stage_jira(loc["stage_token"], loc["part"], loc["json"]),
-    )
+    if not loc.get("path") and not loc.get("json"):
+        return "Give `json` (the stringified fetch result) or `path` (the absolute path of a file holding it)."
+    if loc.get("path") and not loc.get("json"):
+        work = jira_stage_file.handle_stage_jira_file(
+            loc["stage_token"], loc["part"], loc["path"]
+        )
+    else:
+        work = jira.handle_stage_jira(loc["stage_token"], loc["part"], loc["json"])
+    return await rt._tracked("qa_stage_jira", loc["ctx"], work)

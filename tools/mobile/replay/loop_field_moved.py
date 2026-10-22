@@ -108,7 +108,14 @@ def _verdict(before: object, content: object, seen_transient: bool) -> Moved | N
     return None
 
 
-async def _read_moved(ctx: Context, before: object, deadline: float) -> Moved:
+class ReadProbe(NamedTuple):
+    """The screen before the step and the rule that judges each dump."""
+
+    before: object
+    judge: Any = _verdict
+
+
+async def _read_moved(ctx: Context, probe: ReadProbe, deadline: float) -> Moved:
     """Dump (the dump is the poll) until the app moved on or *deadline*; a failed
     dump (no window while the app transitions) is retried, not read as "did not move".
     A transient moved-on frame is polled past; at the deadline it still counts."""
@@ -118,10 +125,10 @@ async def _read_moved(ctx: Context, before: object, deadline: float) -> Moved:
         content = dumped.get("content")
         if dumped.get("error"):
             continue
-        done = _verdict(before, content, transient is not None)
+        done = probe.judge(probe.before, content, transient is not None)
         if done is not None:
             return done
-        if _moved_on(before, content):
+        if _moved_on(probe.before, content):
             transient = content
     return Moved(True, transient) if transient is not None else Moved(False)
 
@@ -168,12 +175,3 @@ async def moved_on_masked(ctx: Context, before: object) -> Moved:
     if dumped.get("error") or not _moved_on(before, content):
         return Moved(False)
     return Moved(True, content)
-
-
-async def moved_on_by_deadline(ctx: Context, before: object) -> Moved:
-    """Poll until the app is proved to have moved on; ``Moved(False)`` when nothing did.
-
-    The read that proved it is returned: it is the screen after the action, so
-    the caller's settle need not dump it again.
-    """
-    return await _read_moved(ctx, before, _deadline(ctx))

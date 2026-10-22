@@ -5,7 +5,7 @@ from __future__ import annotations
 # --------------------------------------------------------------------------- #
 # Jira image gate (QA_IMAGE_GATE_ENABLED) -- Approach C, TWO BEATS
 #
-# BEAT 1 fires BEFORE any fetch, from handle_prepare_test_cases, for a Jira
+# BEAT 1 fires AFTER the ticket is staged, from handle_prepare_test_cases, for a Jira
 # source with no source_plan: it discloses that this server cannot read images
 # out of Jira and collects a plan (attach / capture / both / text-only). BEAT 2
 # fires on the SECOND call, once the ticket is in hand, ONLY when the ticket

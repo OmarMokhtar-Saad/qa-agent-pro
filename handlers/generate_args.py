@@ -39,6 +39,7 @@ class Beat1Args(NamedTuple):
     source_plan: str
     choose: _common.ChooseCb
     ask_text: _elicit.AskCb
+    staged: bool = False
 
 
 class Beat2Args(NamedTuple):

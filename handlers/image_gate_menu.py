@@ -38,7 +38,7 @@ from handlers.image_gate_plan import _gated_not_unsupported, _rejected_plan_note
 def _image_gate_menu_markdown(elicit_status: str = "", rejected_plan: str = "") -> str:
     """Return the BEAT 1 tier-3 fallback: the menu as an instruction to the host assistant."""
     return (
-        "## Before I read the ticket: how do I get its screens?\n\n"
+        "## The ticket is staged: how do I get its screens?\n\n"
         + _rejected_plan_note(rejected_plan)
         + "> ℹ️ "
         + _IMAGE_GATE_LINE
@@ -94,7 +94,7 @@ _IMAGE_GATE_OPTIONS = (
     "Present EXACTLY these five options to the user as a multiple-choice "
     "question (use your ask-user/questions UI, not prose), then call the "
     "SAME tool again with the SAME `feature_or_url` plus `source_plan` set "
-    "to the value in brackets. Do NOT fetch the ticket first, and do not "
+    "to the value in brackets. The ticket is already staged: do NOT fetch it again, and do not "
     "invent other options. Do NOT ask the tester additional questions about "
     "which device or how many screens — pass what they gave you and let the "
     "server default the rest.\n\n"
@@ -116,11 +116,11 @@ def _image_gate_warnings(cause: str) -> str:
     return (
         "> \u23f1\ufe0f  **This reply cost a round trip.** My question "
         f"{cause}, so I had to hand it to you as text. NOTHING has been "
-        "prepared -- no fetch, no generation -- so nothing was wasted except "
+        "prepared -- no generation -- so nothing was wasted except "
         "this turn. To avoid it next time, ask the user where a Jira ticket's "
-        "screens come from BEFORE your first `qa_prepare_test_cases` / "
-        "`qa_generate_test_cases` call and pass `source_plan` on that first "
-        "call.\n\n"
+        "screens come from right after you stage the ticket, and pass "
+        "`source_plan` on the `qa_prepare_test_cases` call that carries the "
+        "`stage_token`.\n\n"
         "> \u26d4 **Only pass `source_plan` if the USER answered -- never guess "
         "it, and never send `image_gate_ack=true` unless the user explicitly "
         "said the screens do not matter.** Guessing `source_plan='jira'` skips "

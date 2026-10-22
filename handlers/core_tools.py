@@ -39,7 +39,7 @@ def _register_stage_jira_tool(mcp, kit, rt) -> None:
 
     @_run.tool_with_doc(mcp, _docs.STAGE_JIRA_DOC)
     async def qa_stage_jira(  # noqa: PLR0913 - MCP tool schema
-        ctx: Context, stage_token: str, part: str, json: str
+        ctx: Context, stage_token: str, part: str, json: str = "", path: str = ""
     ) -> str:
         return await _run.stage_call(rt, locals())
 

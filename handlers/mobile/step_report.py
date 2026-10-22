@@ -86,8 +86,9 @@ async def _finish_run(run_id: str, session_token: str, body: dict) -> tuple:
 def _relay_kwargs(resolved: Any, rows_for_relay: list) -> dict[str, Any]:
     """The verdict and reset arguments of the relay block."""
 
+    word = session_records.run_verdict(resolved, rows_for_relay)
     return {
-        "verdict": session_records.run_verdict(resolved, rows_for_relay),
+        "verdict": run_finalize_done.qualified_verdict(word, rows_for_relay),
         "reset": session_records.reset_step_status(resolved, rows_for_relay),
     }
 

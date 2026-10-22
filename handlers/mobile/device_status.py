@@ -7,7 +7,13 @@ import logging
 from handlers import _common, mobile_gate
 from handlers.mobile.device_requests import StatusArgs, StatusView
 from handlers.mobile.device_runs import _mobile_status_listing
-from tools.mobile import knowledge_close, session_packets, session_records, session_runs
+from tools.mobile import (
+    knowledge_close,
+    run_finalize_done,
+    session_packets,
+    session_records,
+    session_runs,
+)
 from tools.mobile import render as mobile_render
 from tools.mobile import report as mobile_report
 from tools.mobile.replay import stop_shot
@@ -58,8 +64,9 @@ def _status_relay(body: dict, recorded: list) -> str:
 
     if not (body.get("finished") or _abandoned(body)):
         return ""
+    word = session_records.run_verdict(body, recorded)
     return mobile_render.relay_block(
-        verdict=session_records.run_verdict(body, recorded),
+        verdict=run_finalize_done.qualified_verdict(word, recorded),
         reset=session_records.reset_step_status(body, recorded),
         typed_field_line=mobile_render.typed_field_tally(recorded),
     )

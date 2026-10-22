@@ -12,8 +12,8 @@ from tools.jira_mcp import connect_hint_line
 logger = logging.getLogger("tools.mcp_handlers")
 
 _ON_DEMAND_RECHECK = (
-    "I'll re-check it the next time you ask me for a Jira ticket, and "
-    "walk you through signing in then if it is still not connected."
+    "The next Jira ticket request starts by checking the Atlassian "
+    "connection and shows the sign-in steps if it is not connected."
 )
 
 

@@ -10,6 +10,7 @@ from handlers.mobile.step_packet import (
     PacketAsk,
     _mobile_packet_header,
     _mobile_packet_text,
+    lead_with_note,
     no_assert_note,
     still_changing_note,
 )
@@ -62,7 +63,8 @@ async def _next_packet_text(turn: NextTurn, body: dict, bounded: Any) -> str:
         )
     )
     header = _mobile_packet_header(turn.run_id, body, turn.first_packet)
-    return header + shown + still_changing_note(body) + no_assert_note(body)
+    tail = shown + still_changing_note(body) + no_assert_note(body)
+    return lead_with_note(header, tail)
 
 
 async def _next_body(turn: NextTurn, body: dict, bounded: Any) -> str:

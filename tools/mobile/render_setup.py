@@ -44,7 +44,7 @@ _COMMON_STEPS = (
     "installed from the Play Store. Pick a Google APIs image instead only "
     "if you want HTTPS traffic decrypted: a Play image cannot be rooted. "
     "Guide: " + AVD_GUIDE_URL,
-    "Run `qa-doctor` and check that the mobile emulator lane now finds the "
+    "Run `qa-doctor` and check that the mobile device lane now finds the "
     "SDK and your AVD.",
     "Call `qa_mobile_test` again.",
 )

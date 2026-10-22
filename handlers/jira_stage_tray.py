@@ -53,8 +53,9 @@ def _stage_refusal(token: str, part: str, json_text: str) -> str:
     if len(str(json_text or "").encode("utf-8", "ignore")) > _JIRA_STAGE_PART_MAX_BYTES:
         return (
             "That staged part is too large to accept (over "
-            f"{_JIRA_STAGE_PART_MAX_BYTES // 1024} KB). Re-fetch requesting "
-            "only the fields the directive named."
+            f"{_JIRA_STAGE_PART_MAX_BYTES // 1024} KB). Save the raw fetch "
+            "result to a file and call `qa_stage_jira` with `path=<absolute file>` "
+            "instead of `json` -- I read and trim it myself."
         )
     return ""
 

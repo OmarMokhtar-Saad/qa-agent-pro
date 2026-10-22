@@ -50,11 +50,11 @@ def _front_intake(a: _PrepArgs) -> _Intaken:
 
 
 async def _gate_beats(
-    a: _PrepArgs, i: _Intaken
+    a: _PrepArgs, i: _Intaken, staged: bool
 ) -> tuple[generate.PreparePayloadResult | None, Any]:
     """Image gate beat 1 and the plan nudge: (early reply or None, beat 1)."""
     b1 = await generate.image_gate_beat1(
-        Beat1Args(i.gctx, i.plan, a.source_plan, a.choose, a.ask_text)
+        Beat1Args(i.gctx, i.plan, a.source_plan, a.choose, a.ask_text, staged)
     )
     if b1.menu is not None:
         menu = _beat1_clarify(b1.menu, i.peek[3])
@@ -75,7 +75,8 @@ async def _prepare_front(
     if refusal is not None:
         return refusal
     i = _front_intake(a)
-    early, b1 = await _gate_beats(a, i)
+    staged = bool(stage_token.strip() and a.jira_content_json.strip())
+    early, b1 = await _gate_beats(a, i, staged)
     if early is not None:
         return early
     return _PrepFront(a, carry, i.intake, i.gctx, b1.plan, *i.peek)
