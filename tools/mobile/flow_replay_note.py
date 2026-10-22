@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
+from tools.mobile.flow_replay_run import MISSING_INPUT
+from tools.mobile.flow_replay_stop import DID_NOT_RUN
 from tools.untrusted import single_line
 
 KEY_CHARS = 12
@@ -75,9 +77,23 @@ def done_lines(head: Head, pos: int) -> list:
     return [_line(head.template, i) for i in range(head.start, pos)][-MAX_LISTED:]
 
 
+def _kind(why: str) -> str:
+    """Name the failure: ``device error``, ``missing value`` or ``screen differs``."""
+    low = why.lower()
+    if low.startswith(MISSING_INPUT):
+        return "missing value"
+    if "device_error" in low or low.startswith(DID_NOT_RUN):
+        return "device error"
+    return "screen differs"
+
+
 def _diverged(head: Head, pos: int, why: str) -> str:
     before = (head.template.get("meta") or {}).get("before") or []
     want = before[pos] if pos < len(before) else ""
+    kind = _kind(why)
+    lead = "stopped at step %d (%s): %s" % (pos + 1, kind, single_line(why, 200))
+    if kind != "screen differs":
+        return lead
     return "diverged at step %d: %s (expected screen %s, live screen %s)" % (
         pos + 1,
         single_line(why, 200),

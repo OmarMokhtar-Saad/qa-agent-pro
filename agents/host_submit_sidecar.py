@@ -19,6 +19,7 @@ from agents.host_prep_sidecar import (
     review_sidecar,
 )
 from agents.host_prep_sidecar_keys import (
+    GATE_ANSWER_KEYS,
     SIDECAR_RETAINABLE,
     retained_sidecar,
     sidecar_keys,
@@ -83,7 +84,8 @@ async def try_retain(req: SubReq, sidecar_obj: Any) -> bool:
 
 
 def keys_label(meta: dict) -> str:
-    return "`" + "` / `".join(sidecar_keys(meta)) + "`"
+    keys = [k for k in sidecar_keys(meta) if k not in GATE_ANSWER_KEYS]
+    return "`" + "` / `".join(keys) + "`"
 
 
 def _retained_reply(prep_id: str, label: str) -> str:
@@ -124,7 +126,7 @@ async def no_rows_reply(req: SubReq, sidecar_obj: Any, ports: SubmitPorts) -> st
 # "reviewed and found none"). No id remap for checklist or image entries: they
 # are keyed by position or server-assigned id, never by tc_id.
 def _overlay(merged: dict, sidecar_obj: Any, meta: dict) -> None:
-    for key in ("acceptance_criteria", "ambiguity_result"):
+    for key in ("acceptance_criteria", "ambiguity_result") + GATE_ANSWER_KEYS:
         if sidecar_obj.get(key) is not None:
             merged[key] = sidecar_obj.get(key)
     if meta.get("host_checklist_job"):

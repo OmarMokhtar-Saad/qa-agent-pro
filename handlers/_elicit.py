@@ -12,11 +12,13 @@ from handlers._elicit_budget import (  # noqa: F401
 )
 from handlers._elicit_gate import (  # noqa: F401
     _ELICIT_GATE_STRIKES,
+    ELICIT_GATE_TTL_S,
     _elicit_client_key,
     _elicit_client_strikes,
     _reset_elicit_client_state,
     elicit_client_current,
     elicit_client_gated,
+    elicit_clock,
     note_elicit_answered,
     note_elicit_client,
     note_elicit_timeout,

@@ -75,3 +75,25 @@ def watch(gate: Any) -> Any:
 
     watched.seen = {}  # type: ignore[attr-defined]
     return watched
+
+
+#: The trace key that marks the entry a saved-flow replay stopped on (1-based step).
+STOPPED_AT = "replay_stopped_at"
+
+
+def mark_stop(trace: list, pos: int, why: str) -> list:
+    """*trace* with its last entry marked as where the replay stopped (not for an owed input)."""
+    if not trace or not why:
+        return trace
+    return trace[:-1] + [dict(trace[-1], **{STOPPED_AT: pos + 1})]
+
+
+def stopped_at(case: object) -> int:
+    """The step a saved-flow replay stopped at in *case*'s trace, or 0."""
+    trace = case.get("trace") if isinstance(case, dict) else None
+    marks = [
+        int(t[STOPPED_AT])
+        for t in (trace if isinstance(trace, list) else [])
+        if isinstance(t, dict) and isinstance(t.get(STOPPED_AT), int)
+    ]
+    return marks[-1] if marks else 0

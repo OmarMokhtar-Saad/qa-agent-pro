@@ -101,6 +101,7 @@ def _record(
         "note": flow_replay_note.text(head, walk.pos, walk.why),
     }
     named = [dict(entry, flow=name) for entry in walk.trace]
+    named = flow_replay_record.mark_stop(named, walk.pos, "" if retry else walk.why)
     body["auto_trace"] = (list(body.get("auto_trace") or []) + named)[-MAX_TRACE:]
 
 

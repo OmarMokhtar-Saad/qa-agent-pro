@@ -44,7 +44,9 @@ class ReplyIn(NamedTuple):
 def _lead_sections(args: ReplyIn, ports: SubmitPorts) -> list:
     run, post, saved = args.run, args.post, args.saved
     sec = ports.reply.ReplySection
+    note = getattr(args.post.fin.suite, "_family_note", None) or ""
     return [
+        sec("earlier versions", "> " + note if note else "", protected=True),
         sec("ambiguity screening", run.amb.note, protected=True),
         sec("session provenance", saved.prov.session_note, protected=True),
         sec("volume floor", post.volume_note, protected=True),
@@ -96,7 +98,9 @@ def _tail_sections(args: ReplyIn, ports: SubmitPorts) -> list:
     sec = ports.reply.ReplySection
     return [
         sec("duplicate prescreen", tail.prescreen_head, protected=True),
-        sec("duplicate prescreen pairs", tail.prescreen_pairs, ports.reply.P_EXPORTED),
+        # K-12: the pairs are the evidence the host must act on (K-09),
+        # bounded by _DUP_SHORTLIST_MAX_PAIRS, so they are never dropped.
+        sec("duplicate prescreen pairs", tail.prescreen_pairs, protected=True),
         sec("traceability orphans", tail.rtm_note, protected=True),
         sec("coverage signal", tail.cov_signal_note, protected=True),
     ]

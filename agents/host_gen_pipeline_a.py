@@ -10,7 +10,6 @@ import logging
 from typing import Any
 
 from agents.host_gen_args import GenRequest
-from agents.host_gen_corpus_a import _RECENT_SUITE_WARN_WINDOW_S
 from agents.host_gen_hooks import GenerateHooks
 from agents.host_gen_types import (
     PreparePayloadResult,
@@ -71,10 +70,7 @@ def image_intake(
 # warning only warns, it never blocks generation.
 async def _stale_and_recent(text: str, updated: str, hooks: GenerateHooks) -> tuple:
     stale = await hooks.run.stale_snapshot_note(text, updated)
-    recent = await hooks.run.recent_suite_warning_note(
-        text, _RECENT_SUITE_WARN_WINDOW_S
-    )
-    return stale, recent
+    return stale, ""  # the existing-suite notice at the top of the reply replaces it
 
 
 async def ticket_recency_notes(

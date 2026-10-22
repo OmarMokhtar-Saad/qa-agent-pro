@@ -98,7 +98,7 @@ def section_note(args: SectionIn, ports: SubmitPorts) -> str:
     return dup_note
 
 
-def _prescreen_head(suite: Any, ports: SubmitPorts) -> tuple[str, Any]:
+def prescreen_head(suite: Any, ports: SubmitPorts) -> tuple[str, Any]:
     cases_json = ports.media.dup_shortlist_cases_json(
         list(getattr(suite, "test_cases", None) or [])
     )
@@ -113,7 +113,7 @@ def prescreen_notes(args: PrescreenIn, ports: SubmitPorts) -> tuple[str, str]:
     with never_raise(logger, "merged-path duplicate prescreen failed", exc_info=True):
         if args.dup.review_on and not args.dup.groups and claimed_none:
             # head is set before the pairs build, so a raise there keeps it
-            head, raw = _prescreen_head(args.suite, ports)
+            head, raw = prescreen_head(args.suite, ports)
             if head:
                 pairs = ports.media.build_dup_contradiction_pairs(raw)
     return head, pairs

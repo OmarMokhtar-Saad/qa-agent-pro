@@ -86,6 +86,12 @@ def _landed_no_with_fallback(content: dict, field: str) -> dict:
     return reply
 
 
+_RETRY_REMEDY = (
+    "To retry, tap the field first (a field that was just cleared can keep a "
+    "stale focus), then type again. "
+)
+
+
 def _landed_no_reply(typed: object, field: str) -> dict:
     """The device_error reply for a field that took none of the typed text."""
     return {
@@ -95,6 +101,7 @@ def _landed_no_reply(typed: object, field: str) -> dict:
             + " character(s) into "
             + repr(field[:60])
             + " but the field did not take it, so the step did not happen. "
+            + _RETRY_REMEDY
             + NO_FABRICATION_NOTE
         ),
         "content": None,

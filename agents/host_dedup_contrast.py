@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from agents.host_dedup_consts import _UNTRUSTED_ERRORS
 
 # F5 (2026-08-30, MEASURED): across three live runs the prescreen surfaced 8
@@ -131,4 +133,30 @@ def _is_boundary_contrast(tokens_a: frozenset, tokens_b: frozenset) -> bool:
             return False
         return all(t in _DUP_DISCRIMINATORS for t in diff)
     except _UNTRUSTED_ERRORS:  # pragma: no cover - a filter never breaks the prescreen
+        return False
+
+
+# K-09: two titles that each name a DIFFERENT quoted UI literal
+# ('Cancel order' vs 'Return order') verify different controls, however many
+# surrounding words they share. Generic: no app wording is involved.
+# An apostrophe inside a word (user's, isn't) is not a quote: an opening quote
+# must not follow a word character and a closing one must not precede one.
+_QUOTED_RE = re.compile(r"""(?<!\w)['"‘“](.+?)['"’”](?!\w)""")
+
+
+def _norm_literal(text: str) -> str:
+    return " ".join(text.lower().split()).strip(" .,;:!?…-")
+
+
+def _quoted_literals(title: str) -> frozenset:
+    found = (_norm_literal(m.group(1)) for m in _QUOTED_RE.finditer(title))
+    return frozenset(x for x in found if x)
+
+
+def quoted_literals_differ(title_a: str, title_b: str) -> bool:
+    """True when both titles quote a literal and the quoted sets differ."""
+    try:
+        qa, qb = _quoted_literals(str(title_a)), _quoted_literals(str(title_b))
+        return bool(qa) and bool(qb) and qa != qb
+    except _UNTRUSTED_ERRORS:  # pragma: no cover
         return False

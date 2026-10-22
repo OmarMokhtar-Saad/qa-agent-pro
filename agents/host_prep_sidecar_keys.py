@@ -10,6 +10,9 @@ from tools import atomic_checklist
 
 logger = logging.getLogger("agents.host_mode")
 
+# K-09 / K-13: the host's answers to the submit gates. They are
+# sidecar fields on their own, so an answer-only call reaches the gate.
+GATE_ANSWER_KEYS = ("duplicate_justifications", "confirm_quality_warnings")
 _SIDECAR_KEYS = ("duplicate_groups", "acceptance_criteria", "ambiguity_result")
 
 # What a sidecar-only submit may leave on the prep for a later finalize (F3).
@@ -22,7 +25,7 @@ _SIDECAR_RETAINABLE = (
     "ambiguity_result",
     "checklist_items",
     "image_descriptions",
-)
+) + GATE_ANSWER_KEYS
 SIDECAR_RETAINABLE = _SIDECAR_RETAINABLE  # public alias (additive)
 
 # [sidecar_keys]
@@ -61,7 +64,7 @@ def sidecar_keys(meta: object = None) -> tuple:
     # pragma: no cover
     with never_raise(logger, "_sidecar_keys flag read failed", exc_info=True):
         keys: tuple[str, ...] = _SIDECAR_KEYS
-        keys = keys + ("image_descriptions",)
+        keys = keys + ("image_descriptions",) + GATE_ANSWER_KEYS
         if _checklist_recognised(meta):
             keys = keys + ("checklist_items",)
         return keys

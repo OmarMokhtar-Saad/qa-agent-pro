@@ -2,18 +2,64 @@
 
 from __future__ import annotations
 
+import logging
+import re
 import sys
 
 from agents.host_gen_args import GateProbe
 from agents.host_gen_types import _Beat1, _GateCtx
+from config.settings_guard import never_raise
 from handlers import _common, image_gate
 from handlers.generate_args import Beat1Args
 from handlers.generate_host import host
 from handlers.seam_alias import alias
+from tools.device_manager import list_devices
+
+logger = logging.getLogger("agents.host_mode")
+
+
+_DESIGN_LINK = re.compile(
+    r"(?:figma|zeplin|invisionapp|sketch\.cloud|miro)\.|adobe\.com/\S*xd", re.I
+)
+
+
+def _has_design_source(ctx: _GateCtx) -> bool:
+    """True when the request or ticket names a design-tool link (Figma etc.)."""
+    return bool(_DESIGN_LINK.search(f"{ctx.text}\n{ctx.jira_content_json}"))
+
+
+async def _no_capture_source(ctx: _GateCtx) -> bool:
+    """True only when "ticket text only" is the one possible answer: the Jira
+    images are unreadable (why the gate fires), no uploaded screens (else the
+    gate would not fire), no design link, AND no device. Any doubt asks."""
+    return not _has_design_source(ctx) and await _devices_found_none()
+
+
+async def _devices_found_none() -> bool:
+    """True only when device discovery SUCCEEDED with an empty list. Never raises."""
+    with never_raise(logger, "no-capture-source probe failed", exc_info=True):
+        found = await list_devices()
+        return bool(
+            not found.get("error")
+            and isinstance(found.get("content"), list)
+            and not found["content"]
+        )
+    return False
+
+
+async def _beat1_text_only() -> _Beat1:
+    """Skip the question: audit it and proceed on the ticket text."""
+    await _common.audit(
+        "mcp_image_gate_beat1",
+        detail={"resolved": True, "plan": "jira", "skip_reason": "no_capture_source"},
+    )
+    return _Beat1("jira", None)
 
 
 async def _beat1_fire(args: Beat1Args) -> _Beat1:
     """The gate fires: ask for the source plan, or hand back the menu clarify."""
+    if await _no_capture_source(args.ctx):
+        return await _beat1_text_only()
     picked, status = await image_gate.elicit_source_plan_status(
         args.choose, args.ask_text
     )

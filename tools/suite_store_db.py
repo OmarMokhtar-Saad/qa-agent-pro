@@ -12,6 +12,7 @@ import sqlite3
 from pathlib import Path
 
 from tools import sqlite_store
+from tools.suite_store_family import ensure_family_columns
 
 logger = logging.getLogger("tools.suite_store")
 
@@ -43,6 +44,7 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
     """Add what a NEWER build declares to an ALREADY-created suites table."""
     _ensure_prep_id(conn)
     _ensure_provenance(conn)
+    ensure_family_columns(conn)
 
 
 def _ensure_prep_id(conn: sqlite3.Connection) -> None:

@@ -57,7 +57,6 @@ from handlers.submit_category_dup import (
     dup_shortlist_note,  # noqa: F401
 )
 from handlers.submit_category_gen_notes import (
-    _recent_suite_gen_notes,  # noqa: F401
     _skipped_attachments_gen_notes,  # noqa: F401
     checklist_gap_gen_notes,  # noqa: F401
     early_gen_notes,  # noqa: F401

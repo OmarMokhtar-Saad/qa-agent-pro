@@ -10,6 +10,7 @@ from agents import (
     host_submit_dup_notes,
     host_submit_finalize,
     host_submit_quality,
+    host_submit_suite_gate,
 )
 from agents.host_submit_finalize import VolumeIn
 from agents.host_submit_pipeline_run import SubmitCall
@@ -28,6 +29,15 @@ def _dup_note(run: SubRun, fin: SubFinal, ports: SubmitPorts) -> str:
     return host_submit_dup_notes.section_note(sect_in, ports)
 
 
+async def _suite_gates(run: SubRun, fin: SubFinal, ports: SubmitPorts) -> str | None:
+    """K-09 / K-13: refuse once on a contradicted duplicate review or risky warnings."""
+    gate = host_submit_suite_gate
+    ctx = gate.GateCtx(run.prep, fin.suite, run.read.parsed, run.dup)
+    return await gate.dup_gate(ctx, ports) or await gate.quality_gate(
+        ctx, ports, fin.summary
+    )
+
+
 async def finish(call: SubmitCall, run: SubRun, ports: SubmitPorts) -> SubPost | str:
     """Finalize, then volume-note and quality-gate; a str is a ready refusal."""
     progress = call.cbs[1]
@@ -40,4 +50,7 @@ async def finish(call: SubmitCall, run: SubRun, ports: SubmitPorts) -> SubPost |
     quality = await host_submit_quality.gate(gate_in, ports)
     if isinstance(quality, str):
         return quality
+    refusal = await _suite_gates(run, fin, ports)
+    if refusal:
+        return refusal
     return SubPost(fin, volume_note, quality.note, _dup_note(run, fin, ports))

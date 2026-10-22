@@ -105,7 +105,14 @@ from tools import (
     dispatch_guard,  # noqa: F401
 )
 from tools.build_fingerprint import code_fingerprint  # noqa: F401
-from tools.suite_store import load_suite, save_checklist, save_suite  # noqa: F401
+from tools.suite_store import (  # noqa: F401
+    earlier_suites,
+    family_of,
+    load_suite,
+    save_checklist,
+    save_suite,
+    set_export_path,
+)
 
 logger = logging.getLogger("tools.mcp_handlers")
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from config.settings_guard import never_raise
 
@@ -34,12 +35,20 @@ logger = logging.getLogger("tools.mcp_handlers")
 # NOT a settings flag either (CLAUDE.md flag policy): a per-install toggle has
 # no right answer here, and the behaviour is self-correcting.
 
-# Two, not one. With the v1.56.2 per-call fix a single tool call produces at
-# most ONE timeout, so two strikes means two SEPARATE calls -- ~110s worst case
-# before a client is gated. One strike would let a single slow human cost their
-# whole session's dialogs. Two consecutive timeouts with zero answers in
-# between is the signal.
-_ELICIT_GATE_STRIKES = 2
+# One. A dead dialog cost the full ELICIT_TIMEOUT_S on every
+# call until two separate timeouts had piled up, so two calls paid 20s each.
+# The record is per CLIENT NAME and per PROCESS (not per chat), self-corrects
+# on any answered dialog, and is never persisted, so one strike is enough.
+# A strike also EXPIRES after ELICIT_GATE_TTL_S, so a slow answer (or a client
+# that was only briefly unattended) is re-probed instead of closing the gate
+# for the whole process.
+_ELICIT_GATE_STRIKES = 1
+ELICIT_GATE_TTL_S = 600.0
+
+# Public clock seam: tests replace elicit_clock["now"] instead of sleeping.
+elicit_clock = {"now": time.monotonic}
+# client name -> clock time of its latest timeout.
+_elicit_strike_at: dict[str, float] = {}
 
 # client name (lower-cased, from the handshake) -> CONSECUTIVE timeouts.
 # Any answer resets the entry to 0, so this counts a run, not a lifetime total.
@@ -57,6 +66,8 @@ def _reset_elicit_client_state() -> None:
     is module-global and a leaked strike would gate the "" client for whatever
     test runs next."""
     _elicit_client_strikes.clear()
+    _elicit_strike_at.clear()
+    elicit_clock["now"] = time.monotonic
     elicit_client_current["name"] = ""
 
 
@@ -82,9 +93,11 @@ def elicit_client_gated(name=None) -> bool:
     hand back None and let the existing markdown-menu fallback run.
     Never raises -- a read failure means "not gated", so the dialog is asked."""
     with never_raise(logger, "elicit gate read failed", exc_info=True):
-        return _elicit_client_strikes.get(_elicit_client_key(name), 0) >= (
-            _ELICIT_GATE_STRIKES
-        )
+        key = _elicit_client_key(name)
+        if _elicit_client_strikes.get(key, 0) < _ELICIT_GATE_STRIKES:
+            return False
+        now = elicit_clock["now"]()
+        return now - _elicit_strike_at.get(key, now) < ELICIT_GATE_TTL_S
     return False
 
 
@@ -96,12 +109,13 @@ def note_elicit_timeout(name=None) -> None:
     with never_raise(logger, "elicit strike failed", exc_info=True):
         key = _elicit_client_key(name)
         strikes = _elicit_client_strikes.get(key, 0) + 1
+        _elicit_strike_at[key] = elicit_clock["now"]()
         _elicit_client_strikes[key] = strikes
         if strikes == _ELICIT_GATE_STRIKES:
             logger.info(
                 "mcp elicitation gated for client %r after %d consecutive "
-                "unanswered dialogs -- no further dialogs this process; the "
-                "markdown menu is used instead. Any answered dialog clears it.",
+                "unanswered dialogs -- no further dialogs for ~10 minutes; the "
+                "markdown menu is used instead. An answered dialog or the expiry clears it.",
                 key or "<unknown>",
                 strikes,
             )
@@ -114,3 +128,4 @@ def note_elicit_answered(name=None) -> None:
     matter how many earlier timeouts it accumulated. Never raises."""
     with never_raise(logger, "elicit answer note failed", exc_info=True):
         _elicit_client_strikes[_elicit_client_key(name)] = 0
+        _elicit_strike_at.pop(_elicit_client_key(name), None)

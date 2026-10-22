@@ -5,8 +5,8 @@ client's chooser). A mobile run may ask several questions, and a client that
 cannot show dialogs would make each one wait out its own timeout. After ONE
 timed-out question for a client, every later question for that client returns
 ``None`` at once, so the caller shows its text menu instead of paying the wait
-again. ``mcp_handlers._ELICIT_GATE_STRIKES`` (two strikes, process wide) is NOT
-changed: this is a stricter rule that only the mobile lane uses.
+again. ``mcp_handlers._ELICIT_GATE_STRIKES`` (one strike, 600 s TTL, process wide) is
+NOT changed: this module keeps its own per-client rule for the mobile lane.
 
 This module imports nothing from ``handlers``: the host injects the
 elicit function and the client key.

@@ -125,10 +125,21 @@ def still_changing_note(body: dict) -> str:
     return ""
 
 
+ASSERT_OUTCOMES = ("assert_pass", "assert_fail")
 NO_ASSERT_NOTE = (
     "no assert was replayed (none in the script, or replay stopped before it): "
     "no verdict this turn; end scripts with an assert"
 )
+
+
+def _is_assert(entry: object) -> bool:
+    """True for a trace entry that is an assert (op, nested action op, or assert outcome)."""
+    if not isinstance(entry, dict):
+        return False
+    action = entry.get("action")
+    inner = action.get("op") if isinstance(action, dict) else None
+    outcome = str(entry.get("outcome") or "")
+    return "assert" in (entry.get("op"), inner) or outcome in ASSERT_OUTCOMES
 
 
 def no_assert_note(body: dict) -> str:
@@ -137,5 +148,4 @@ def no_assert_note(body: dict) -> str:
     trace = case.get("trace") if isinstance(case, dict) else None
     if not isinstance(trace, list) or not trace:
         return ""
-    ops = {e.get("op") for e in trace if isinstance(e, dict)}
-    return "" if "assert" in ops else "\n" + NO_ASSERT_NOTE
+    return "" if any(_is_assert(e) for e in trace) else "\n" + NO_ASSERT_NOTE

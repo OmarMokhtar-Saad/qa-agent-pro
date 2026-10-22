@@ -111,6 +111,9 @@ def _workbook_name(suite, source_url: str) -> str:
     # consumer are unchanged. "" for a non-Jira source -> the
     # previous name exactly.
     ticket = _export_ticket_slug(source_url)
+    version = getattr(suite, "_family_version", 1)
+    if version > 1:
+        frag = f"{frag}_v{version}"
     if ticket:
         return f"qa_test_cases_{ticket}_{frag}_{stamp}.xlsx"
     return f"qa_test_cases_{frag}_{stamp}.xlsx"

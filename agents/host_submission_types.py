@@ -70,3 +70,7 @@ class ParsedSubmission:
     # validated later in extract_host_checklist. Absent means NO checklist: the
     # server does not decompose the ticket to fill the gap.
     raw_checklist_items: object = None
+    # K-09/K-13: the host's per-pair duplicate justifications and its
+    # confirmation of the quality warnings, raw; read only by host_submit_suite_gate.
+    raw_duplicate_justifications: object = None
+    raw_confirm_warnings: object = None

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from tools.models import TestSuite
+from tools.suite_store_family import stamp_family
 
 logger = logging.getLogger("tools.suite_store")
 
@@ -60,6 +61,7 @@ def save(conn: sqlite3.Connection, suite: TestSuite, meta: SuiteMeta) -> str:
         )
         target_id = surviving_suite_id(conn, suite.suite_id, meta.prep_id)
         insert_case_rows(conn, CaseStamp(target_id, now), suite)
+        stamp_family(conn, target_id, meta.source_url or meta.feature_text)
     return target_id
 
 

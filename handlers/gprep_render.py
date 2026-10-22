@@ -5,7 +5,13 @@ from __future__ import annotations
 import json
 import logging
 
-from handlers import generate, gprep_budget, gprep_nextcall
+from handlers import (
+    generate,
+    gprep_budget,
+    gprep_nextcall,
+    gprep_readmap,
+    gprep_ticket_flags,
+)
 from tools import handover_cost
 from tools.tool_briefs import FLOW_BRIEF
 
@@ -15,21 +21,26 @@ logger = logging.getLogger("tools.mcp_handlers")
 def _render_head(result: generate.PreparePayloadResult) -> list[str]:
     """The header, next-call block, flow brief and fenced JSON body lines."""
     body = json.dumps(result.payload, ensure_ascii=False, indent=2)
-    return [
+    top = [
         "## Host-mode generation -- run this in your own chat, then submit it back",
         "",
         f"**prep_id:** `{result.prep_id}` (pass this to `qa_submit_suite`).",
+        *gprep_ticket_flags.flag_lines(result.payload),
         *gprep_nextcall._next_call_block(result.payload, str(result.prep_id or "")),
         "",
         FLOW_BRIEF.strip(),
         "",
         "Generate the suite from the payload below, then call `qa_submit_suite` "
         "with this prep_id and your merged JSON:",
-        "",
-        "```json",
-        body,
-        "```",
     ]
+    return [*top, *_map_and_body(body, len("\n".join(top).split("\n")))]
+
+
+def _map_and_body(body: str, above: int) -> list[str]:
+    """Reading map (when long), then the fence: its reply line is known here."""
+    first = gprep_readmap.reading_map(body, 0)
+    fence_at = above + len("\n".join(first).split("\n")) + 2 if first else above + 2
+    return [*gprep_readmap.reading_map(body, fence_at), "", "```json", body, "```"]
 
 
 # What this handover will cost the TESTER's own chat model. Computed from

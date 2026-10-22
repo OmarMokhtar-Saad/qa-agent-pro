@@ -15,6 +15,7 @@ from handlers.gprep_pre import (
     _plan_nudge_if_due,
     _revive_shelved,
 )
+from handlers.gprep_suite_gate import existing_suite_gate
 
 logger = logging.getLogger("tools.mcp_handlers")
 
@@ -74,6 +75,9 @@ async def _prepare_front(
     refusal, carry = await _prepare_early_refusal(a, stage_token)
     if refusal is not None:
         return refusal
+    early = await existing_suite_gate(a, stage_token)
+    if early is not None:
+        return early
     i = _front_intake(a)
     staged = bool(stage_token.strip() and a.jira_content_json.strip())
     early, b1 = await _gate_beats(a, i, staged)

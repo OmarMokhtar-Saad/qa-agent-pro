@@ -1,13 +1,13 @@
 """Tool descriptions of the core and corpus MCP wrappers, attached as ``__doc__``."""
 
 # The description of `qa_generate_test_cases`, verbatim (continuation lines keep their indent).
-GENERATE_DOC = """Generate a test suite via the host-mode flow of qa_prepare_test_cases (same arguments; for a Jira URL fetch the ticket first via the directive, THEN ASK the USER where its screens come from and pass `source_plan`). Omit feature_or_url if the user did not say. Returns a PREPARE PAYLOAD YOU write cases for; relay the .xlsx path."""
+GENERATE_DOC = """Generate a suite: qa_prepare_test_cases flow, same args (Jira: fetch, THEN ASK the USER `source_plan`); omit feature_or_url if unsaid. Returns a PREPARE PAYLOAD YOU write cases for; relay the .xlsx path."""
 
 # The description of `qa_stage_jira`, verbatim (continuation lines keep their indent).
 STAGE_JIRA_DOC = """Stage a Jira result: part='issue'|'parent'|'siblings'; `json` = it stringified, or `path` = absolute file (big)."""
 
 # The description of `qa_prepare_test_cases`, verbatim (continuation lines keep their indent).
-PREPARE_DOC = """HOST-MODE generation: returns a payload YOU run (no server LLM); call first for any test-case request. feature_or_url: text or a Jira/web/Swagger URL (Jira: a DIRECTIVE comes first). For a Jira URL follow the directive and fetch the ticket FIRST, then ASK the USER where its screens come from and pass `source_plan`. Rules arrive in the reply."""
+PREPARE_DOC = """HOST-MODE generation: returns a payload YOU run (no server LLM); call first for any test-case request. Existing suites: ASK reuse/open/regenerate (regenerate = proceed_anyway=true). feature_or_url: text or Jira/web/Swagger URL (Jira: follow the DIRECTIVE, fetch FIRST, then ASK the USER the screen source (`source_plan`)). Rules arrive in the reply."""
 
 # The description of `qa_search_corpus`, verbatim (continuation lines keep their indent).
 SEARCH_CORPUS_DOC = """Search the RAG corpus for similar past test cases or bug reports. entry_type is 'test_case' or 'bug_report'; pass

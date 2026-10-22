@@ -2,7 +2,12 @@
 
 from typing import Any
 
-from handlers import export, prep_status, submit_category, submit_suite
+from handlers import (
+    export,
+    prep_status,
+    submit_category_batch,
+    submit_suite,
+)
 
 
 def register_suite_tools(mcp, kit, rt) -> None:
@@ -26,7 +31,7 @@ def _register_submit_suite_tool(mcp, kit, rt) -> None:
         step_assertion_ack: bool = False,
         quality_gate_ack: bool = False,
     ) -> str:
-        """Submit the host-generated suite (BACK half of host mode): `prep_id` from qa_prepare_test_cases and `suite_json` (merged test_cases), or a review sidecar after qa_submit_category. Reply: the finished suite + file path (relay it), or refusals: fix them and call again with the SAME prep_id. *_ack args only on the USER's word."""
+        """Submit the host-generated suite: `prep_id` from qa_prepare_test_cases and `suite_json` (merged test_cases), or a review sidecar after qa_submit_category. Reply: the finished suite + file path (relay it), or refusals: fix them and call again with the SAME prep_id. *_ack args only on the USER's word."""
         return await rt._tracked(
             "qa_submit_suite",
             ctx,
@@ -107,19 +112,13 @@ def _register_category_and_export_tools(mcp, kit, rt) -> None:
         category_name: str = "",
         suite_json: str | dict = "",
         replace_smaller: bool = False,
+        categories: list | str | None = None,
     ) -> str:
-        """Submit ONE category's cases (Path A): `prep_id`, category name, `suite_json` for it. Re-submitting REPLACES it; check `qa_prep_status` first. When all are staged call qa_submit_suite with the same prep_id and an empty suite_json or a review sidecar."""
-        return await rt._tracked(
-            "qa_submit_category",
-            ctx,
-            submit_category.handle_submit_category(
-                prep_id,
-                category_name,
-                suite_json,
-                progress=rt._make_progress(ctx),
-                replace_smaller=replace_smaller,
-            ),
-        )
+        """Submit ONE category's cases (Path A): `prep_id`, category name, `suite_json`; or many via `categories` [{category_name, suite_json}]. Re-submitting REPLACES it; check `qa_prep_status` first. When all are staged call qa_submit_suite with the same prep_id and an empty suite_json or a review sidecar."""
+        opts = submit_category_batch.Opts(rt._make_progress(ctx), replace_smaller)
+        single = (prep_id, category_name, suite_json)
+        work = submit_category_batch.route(categories, single, opts)
+        return await rt._tracked("qa_submit_category", ctx, work)
 
     @mcp.tool()
     async def qa_export_suite(  # noqa: PLR0913 - MCP tool schema

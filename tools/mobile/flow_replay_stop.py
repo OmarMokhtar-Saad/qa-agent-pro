@@ -9,6 +9,7 @@ from tools.mobile.replay.screen_has import _screen_has
 from tools.mobile.replay.settle_cut import Cut, CutView, _cut_detail, _cut_of
 
 #: Start of the stop reason when the step took the foreground away from the app.
+DID_NOT_RUN = "the step did not run as planned"
 LEFT_APP = "the replay left the app under test"
 #: The stop reason when the screen after a step is not one the flow recorded.
 UNRECORDED = "the screen after it never matched any screen the flow recorded"
@@ -28,8 +29,7 @@ def failed_why(content: dict) -> str:
         return "%s (%s): %s" % (LEFT_APP, outcome, detail)
     if outcome == "screen_mismatch" and detail:
         return detail
-    base = "the step did not run as planned"
-    return "%s (%s)" % (base, outcome) if outcome else base
+    return "%s (%s)" % (DID_NOT_RUN, outcome) if outcome else DID_NOT_RUN
 
 
 def cut_why(ctx: Any, screen: Any, step: dict) -> str:

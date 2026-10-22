@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
-from handlers import gprep_limits, gprep_nextcall
+from handlers import gprep_limits, gprep_nextcall, gprep_ticket_flags
 from tools.tool_briefs import FLOW_BRIEF
 
 logger = logging.getLogger("tools.mcp_handlers")
@@ -36,6 +36,7 @@ def _split_header(payload: dict, prep_id: str, n_cats: int) -> list[str]:
         f"## Host-mode generation payload -- delivered across {4 + n_cats} labeled parts",
         "",
         f"**prep_id:** `{prep_id}` (pass this to `qa_submit_suite`).",
+        *gprep_ticket_flags.flag_lines(payload),
         *gprep_nextcall._next_call_block(payload, str(prep_id or "")),
         "",
         FLOW_BRIEF.strip(),

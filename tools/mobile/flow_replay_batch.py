@@ -35,18 +35,40 @@ def build(template: dict, inputs: dict, pos: int) -> Batch:
     steps: list = []
     origin: list = []
     flow = template["steps"]
-    inputs = flow_replay_inputs.resolve(template, inputs)
+    found, inputs = _aliased(template, inputs)
     at = pos
     while at < len(flow):
         if not flow_nochange.skip_at(template, at):
             if _missing(flow[at], inputs):
                 break
-            steps.append(flow_replay_match.fill(flow[at], inputs))
+            steps.append(_ready(flow[at], inputs, found))
             origin.append(at)
             if flow_replay_anchor.ends_batch(flow, at):
                 return Batch(steps, origin, at + 1)
         at += 1
     return Batch(steps, origin, at)
+
+
+def _aliased(template: dict, inputs: dict) -> tuple:
+    """``(aliases, inputs)``: the inputs plus each need an input stands in for."""
+    found = flow_replay_inputs.aliases(template, inputs)
+    return found, {**{n: inputs[k] for n, k in found.items()}, **inputs}
+
+
+def _ready(step: dict, inputs: dict, found: dict) -> dict:
+    return _held_field(flow_replay_match.fill(step, inputs), found)
+
+
+def _held_field(step: dict, found: dict) -> dict:
+    """A secret step aimed at the tester input that stands in for its field.
+
+    The executor types the value held under the step's ``field``; an aliased need
+    (flow ``account_number``, tester ``user_ref``) would find none and fail.
+    """
+    field = str(step.get("field") or "")
+    if step.get("secret") and field in found:
+        return dict(step, field=found[field])
+    return step
 
 
 def _missing(step: dict, inputs: dict) -> bool:

@@ -37,7 +37,7 @@ FLOW_TOOL_DETAIL = """
 
 TOOL DETAIL
 
-qa_prepare_test_cases: feature_or_url is a description, a Jira/issue URL, a web page URL or a Swagger/OpenAPI URL. After a Jira DIRECTIVE call again with the SAME feature_or_url and `stage_token` (or `jira_content_json` as a JSON STRING, json.dumps(result)). `source_plan` is one of jira, jira_attach, jira_device, jira_both, device; never send image_gate_ack=true unless the user explicitly said the screens do not matter. Under-specified ticket: relay the questions, or pass proceed_anyway=true.
+qa_prepare_test_cases: feature_or_url is a description, a Jira/issue URL, a web page URL or a Swagger/OpenAPI URL. After a Jira DIRECTIVE call again with the SAME feature_or_url and `stage_token` (or `jira_content_json` as a JSON STRING, json.dumps(result)). `source_plan` is one of jira, jira_attach, jira_device, jira_both, device; never send image_gate_ack=true unless the user explicitly said the screens do not matter. Under-specified ticket: relay the questions, or pass proceed_anyway=true. If suites already exist for the source (Jira key match, any age) the first reply is a notice listing them; only for regenerate call again with proceed_anyway=true (saved as the next version).
 
 qa_generate_test_cases: continue exactly as for qa_prepare_test_cases (qa_get_category_job(prep_id, "all") once, qa_submit_category per category, qa_submit_suite to finalize). Relay the .xlsx path; do NOT ask which export format or offer to push.
 
@@ -45,7 +45,7 @@ qa_stage_jira: call it after each getJiraIssue/JQL call the directive asked for;
 
 qa_get_category_job: generation runs 6.5-24 minutes per category in your own chat model: tell the tester "Generating <category>..." before you start writing each one, so a long gap is never silent.
 
-qa_submit_category: Path A, recommended: stage each category as soon as it is written. Fewer cases than staged is REFUSED; replace_smaller=true only when deliberate. Do not re-submit a staged category unless a reply asked (check `qa_prep_status`).
+qa_submit_category: Path A, recommended: stage each category as soon as it is written. To stage several in ONE call pass `categories=[{category_name, suite_json}, ...]` (each is checked like a single call). Fewer cases than staged is REFUSED; replace_smaller=true only when deliberate. Do not re-submit a staged category unless a reply asked (check `qa_prep_status`).
 
 qa_submit_suite: `suite_json` is one JSON object with a merged `test_cases` array per the payload's response_schema (an object, or a JSON string). Path A sidecar: a JSON object with `duplicate_groups` (empty list if none) and NO `test_cases`; suite_json="" also finalizes but forfeits that review. Relay the exported file path; do not ask which format. The acks (volume_floor_ack, image_relevance_ack, step_assertion_ack, quality_gate_ack) work only after the matching refusal and only on the USER's word, never your own judgement.
 

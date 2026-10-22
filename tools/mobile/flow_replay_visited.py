@@ -18,6 +18,8 @@ from tools.mobile import (
     host_flow_goal,
 )
 
+#: Tags a flow listed for the host but kept out of auto-replay (saved for another goal).
+FOREIGN_TAG = " [saved for another goal, not auto-replayed]"
 _KEEP_RUNS = 64
 _KEEP_PACKAGES = 12
 #: run id -> packages seen in that run, oldest first.
@@ -77,7 +79,7 @@ def pick_first(ref: tuple, key: Any, body: dict) -> tuple:
     if paused[2]:
         return paused
     for package in packages(run_id, ctx, screen):
-        skip = host_flow_goal.skip(package, body)
+        skip = host_flow_goal.skip(package, body, run_id)
         name, template, at = flow_replay_match.pick_first(package, key, skip)
         if template:
             return package, name, template, at
@@ -93,8 +95,13 @@ def alternatives(ref: tuple, key: Any, body: dict) -> list:
     chosen = tuple(pick_first(ref, key, body)[:2])
     rows = []
     for package in packages(run_id, ctx, screen):
-        skip = host_flow_goal.skip(package, body)
-        for name, template, _at in flow_replay_match.first_fits(package, key, skip):
-            rows.append((package, name, template))
+        tried = host_flow_goal.tried(body)
+        other = host_flow_goal.skipped(package, body, run_id)
+        for name, template, _at in flow_replay_match.first_fits(package, key, tried):
+            rows.append((package, name, template, name in other))
     rows.sort(key=lambda r: flow_replay_match.rank((r[1], r[2], 0)), reverse=True)
-    return [flow_replay_note.labelled(n, t) for p, n, t in rows if (p, n) != chosen]
+    return [
+        flow_replay_note.labelled(n, t) + (FOREIGN_TAG if f else "")
+        for p, n, t, f in rows
+        if (p, n) != chosen
+    ]

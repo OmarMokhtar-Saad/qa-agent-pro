@@ -34,6 +34,7 @@ async def mobile_grant_stage(req: _MobileTestRequest, serial: str, target: str) 
     run_grant_note.remember(
         serial, (result.get("content") or {}).get("granted") or [], denied
     )
+    run_grant_note.mention(serial, req.goal + "\n" + req.cases)
     return await _revoke_stage(serial, target, denied) if denied else ""
 
 

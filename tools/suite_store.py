@@ -119,6 +119,21 @@ async def save_suite(suite: TestSuite, meta: SuiteMeta | None = None) -> dict:
     return await suite_store_api.save_suite(_run, suite, meta or SuiteMeta())
 
 
+async def earlier_suites(source: str, skip_id: str = "") -> list:
+    """Every earlier suite saved for `source` (no age limit), oldest first."""
+    return await suite_store_api.earlier_suites(_run, source, skip_id)
+
+
+async def family_of(suite_id: str) -> dict | None:
+    """{version, prev_suite_id, family_id} of a stored suite, or None."""
+    return await suite_store_api.family_of(_run, suite_id)
+
+
+async def set_export_path(suite_id: str, path: str) -> None:
+    """Record the workbook path of a stored suite."""
+    await suite_store_api.set_export_path(_run, suite_id, path)
+
+
 async def load_suite(suite_id: str) -> dict:
     """Load a suite by id. Returns {"content": TestSuite|None} (None if unknown)."""
     return await suite_store_api.load_suite(_run, suite_id)

@@ -32,14 +32,80 @@ _BLOCKED_PASS = (
 )
 
 
+_WEAK_PASS = (
+    " Note: this pass is weakly backed -- it rests on %s. Check it "
+    "against what the case claims before relying on it."
+)
+
+
+def _typed_texts(trace: list[dict]) -> list[str]:
+    """The text of every ``type``/``fill`` step recorded in *trace*."""
+    found = []
+    for item in trace:
+        action = item.get("action") if isinstance(item, dict) else None
+        if isinstance(action, dict) and action.get("op") in ("type", "fill"):
+            found.append(str(action.get("text") or ""))
+    return [text for text in found if text]
+
+
+_MIN_TYPED = 3
+
+
+def _names_typed(want: str, typed: str) -> bool:
+    """Whether asserted text *want* is the typed value, or contains all of it.
+
+    A short typed value ("1") would match any text holding it, so containment
+    needs ``_MIN_TYPED`` characters.
+    """
+    return want == typed or (len(typed) >= _MIN_TYPED and typed in want)
+
+
+def _asserts_typed_text(trace: list[dict]) -> bool:
+    """True when a passed ``text_present`` names text this trace typed.
+
+    The turn then proves its own typing, so an earlier turn's failure to type
+    must not demote it.
+    """
+    typed = _typed_texts(trace)
+    for item in trace:
+        action = item.get("action") if isinstance(item, dict) else None
+        if not isinstance(action, dict) or item.get("outcome") != "assert_pass":
+            continue
+        want = str(action.get("text") or "")
+        if action.get("kind") == "text_present" and want:
+            if any(_names_typed(want, text) for text in typed):
+                return True
+    return False
+
+
+def _weak_basis(trace: list[dict]) -> str:
+    """What a pass rests on when that is thin, else an empty string."""
+    kinds = [
+        str((i.get("action") or {}).get("kind") or "")
+        for i in trace
+        if isinstance(i, dict) and i.get("outcome") == "assert_pass"
+    ]
+    if kinds and all(kind == "text_absent" for kind in kinds):
+        return (
+            "text_absent only (something is missing, not that the right screen shows)"
+        )
+    return ""
+
+
 def _downgraded(run: _ReplayRun, verdict: str, reason: str) -> tuple[str, str]:
     """A ``pass`` nothing verified is downgraded to unverified, with why."""
     if verdict != "pass":
         return verdict, reason
     if not _verified(run.trace, run.ctx):
         return STATUS_UNVERIFIED, (_UNVERIFIED_PASS + reason).strip()
-    if run.ctx.prior_turn_blocked and not _asserts_new_element(run.trace):
+    blocked = run.ctx.prior_turn_blocked
+    if blocked and not (
+        _asserts_new_element(run.trace) or _asserts_typed_text(run.trace)
+    ):
         return STATUS_UNVERIFIED, (_BLOCKED_PASS + reason).strip()
+    weak = _weak_basis(run.trace)
+    if weak:
+        reason = (reason + _WEAK_PASS % weak).strip()
     return verdict, reason
 
 

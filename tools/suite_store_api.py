@@ -12,7 +12,12 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from tools import suite_store_load, suite_store_query, suite_store_write
+from tools import (
+    suite_store_family,
+    suite_store_load,
+    suite_store_query,
+    suite_store_write,
+)
 from tools.models import TestSuite
 from tools.suite_store_write import SuiteMeta
 
@@ -131,3 +136,30 @@ async def load_checklist(run: Run, suite_id: str) -> dict:
     except Exception as exc:
         logger.exception("suite_store.load_checklist failed")
         return {"error": str(exc), "content": None}
+
+
+async def earlier_suites(run: Run, source: str, skip_id: str) -> list:
+    """Earlier suites of *source* (oldest first); [] on any failure."""
+    try:
+        fn = suite_store_family.earlier_suites
+        return await asyncio.to_thread(run, fn, source, skip_id)
+    except Exception:
+        logger.exception("suite_store.earlier_suites failed")
+        return []
+
+
+async def family_of(run: Run, suite_id: str) -> dict | None:
+    """Version stamp of a stored suite, or None."""
+    try:
+        return await asyncio.to_thread(run, suite_store_family.family_of, suite_id)
+    except Exception:
+        logger.exception("suite_store.family_of failed")
+        return None
+
+
+async def set_export_path(run: Run, suite_id: str, path: str) -> None:
+    """Record where a suite's workbook was written; never raises."""
+    try:
+        await asyncio.to_thread(run, suite_store_family.set_export_path, suite_id, path)
+    except Exception:
+        logger.exception("suite_store.set_export_path failed")

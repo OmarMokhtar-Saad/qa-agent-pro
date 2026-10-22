@@ -7,7 +7,7 @@ import sys
 
 from agents.host_category_calls import EarlyNotesIn
 from config.settings_guard import never_raise
-from handlers import _elicit, _reply, generate, generate_prepare, prep_status
+from handlers import _elicit, _reply, generate_prepare, prep_status
 from handlers.seam_alias import alias
 from tools import step_assertion
 from tools.suite_quality_signals import (
@@ -26,16 +26,6 @@ def _skipped_attachments_gen_notes(meta: dict) -> list:
     return []
 
 
-async def _recent_suite_gen_notes(source_text: str) -> list:
-    """Generation note: a suite for this same source was saved recently."""
-    with never_raise(logger, "recent-suite gen note failed", exc_info=True):
-        note = await generate.gen_recent_suite_warning_note(
-            source_text, generate._RECENT_SUITE_WARN_WINDOW_S
-        )
-        return [("Recent suite for this source", note)] if note else []
-    return []
-
-
 # A1 (2026-09-26): signals that already exist server-side but never reached the
 # Generation Notes sheet, up to the volume shortfall. Each is independent and
 # best-effort; the order is the sheet's order.
@@ -44,7 +34,9 @@ async def early_gen_notes(args: EarlyNotesIn) -> list:
     notes = _skipped_attachments_gen_notes(meta)
     if args.dup_note:
         notes.append(("Duplicate cases", args.dup_note))
-    notes += await _recent_suite_gen_notes(args.source_text)
+    family = getattr(suite, "_family_note", None)
+    if family:
+        notes.insert(0, ("Earlier versions of this suite", family))
     provenance_detail = _elicit._provenance_gen_note_detail(args.provenance)
     if provenance_detail:
         notes.append(("Session provenance", provenance_detail))

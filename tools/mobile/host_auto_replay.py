@@ -118,8 +118,10 @@ def _declined(ref: _Ref, body: dict) -> bool:
 async def _fit_then_replay(ref: _Ref, screen: dict, body: dict) -> tuple:
     """Replay the fitting flow; with inputs owed, name them in the packet note (B15)."""
     template = host_replay_ready.fitting(ref, screen, body)
-    if not template:
-        return screen, ""
+    if not template:  # a flow kept out as foreign is still named (never silent)
+        listed = host_replay_ready.others(ref, screen, body)
+        more = host_flow_goal.unnamed(body, listed)
+        return screen, host_replay_ready.choose_note(more) if more else ""
     owed = host_replay_ready.missing(ref, template)
     more = host_replay_ready.others(ref, screen, body)
     if owed:

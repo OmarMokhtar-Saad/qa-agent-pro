@@ -11,6 +11,8 @@ from tools.mobile.replay.context import (
     _result,
     _Step,
 )
+from tools.mobile.replay.screen import _screen_package
+from tools.mobile.replay.screen_pkg import LEAVES_ON_PURPOSE
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
 from tools.mobile.replay.stop_shot import defer_shot
 from tools.mobile.replay.verdicts import AssertView, _evaluate_assert
@@ -37,6 +39,27 @@ def _visual_check(run: _ReplayRun, step: _Step, at: StepAt) -> dict:
     return _reply(_result(stop, visual_check=True))
 
 
+def _left_on_purpose(trace: list[dict]) -> bool:
+    """True when an earlier step left the app on purpose (``home``, ``open_url``)."""
+    ops = (i.get("action") for i in trace if isinstance(i, dict))
+    return any(isinstance(a, dict) and a.get("op") in LEAVES_ON_PURPOSE for a in ops)
+
+
+def _left_note(run: _ReplayRun, screen: object) -> str:
+    """Why a failed assert may be about the wrong app, else an empty string."""
+    package = _screen_package(screen)
+    expected = run.ctx.package
+    if not package or not expected or package == expected:
+        return ""
+    if package in tuple(run.ctx.expect_apps or ()) or _left_on_purpose(run.trace):
+        return ""
+    return (
+        " (The foreground app is %s, not %s, so this text was looked for in "
+        "the wrong app. Send `launch` to return before asserting again.)"
+        % (package[:80], expected[:80])
+    )
+
+
 async def _assert_step(run: _ReplayRun, step: _Step, seen: Seen) -> dict | None:
     """An ``assert`` step: ``None`` when it passed and the replay goes on, else
     the reply that stops it (a failed assert, or a visual check)."""
@@ -47,6 +70,8 @@ async def _assert_step(run: _ReplayRun, step: _Step, seen: Seen) -> dict | None:
     ok, detail = _evaluate_assert(step.action, view)
     if not ok:
         ok, detail, at = await recheck_after_wait(run, step, (view, at))
+    if not ok:
+        detail += _left_note(run, at.screen)
     step.entry.update(outcome="assert_pass" if ok else "assert_fail", detail=detail)
     _close(run, at)
     if ok:

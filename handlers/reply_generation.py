@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, NamedTuple
 
 from handlers.reply_consts import _SUMMARY_CAP
@@ -91,15 +92,13 @@ _GENERATION_STATUS_TEXT = {
 
 
 # What the marker may promise depends on WHAT was cut. The claim
-# above is about CASES, and it is true of them. It is false of the
-# advisory sections the summary also carries -- Suite Consistency,
-# Test Data, the grounding notes -- because none of those is written
-# into the workbook: the export carries the cases and (since F06)
-# their requirement ids, and no advisory at all. F14 measured the
-# Suite Consistency block alone at 4173 bytes against a 4000
-# _SUMMARY_CAP, so a squeeze reaching an advisory heading is
-# reachable, not theoretical. Telling that tester the export has it
-# sends them to look for something that is not there.
+# above is about CASES, and it is true of them. The advisory sections
+# the summary also carries -- Suite Consistency, Test Data, the
+# grounding notes -- reach the workbook only as the "Full generation
+# advisory" row of its Generation Notes sheet, written when the
+# summary is over _SUMMARY_CAP (submit_category_gen_notes). Without
+# an auto-export there is no workbook, so the marker must not send
+# the tester to look for them there.
 def _truncation_tail(cut: str, auto_export: bool) -> str:
     """The marker's promise, worded for what was cut."""
     tail = (
@@ -119,12 +118,53 @@ def _truncation_tail(cut: str, auto_export: bool) -> str:
     return tail
 
 
+# K-12: the summary used to be cut by POSITION, so the last sections
+# went first whatever they said. These headings are the low-value reading (a
+# deliberate-tradeoff disclosure, per-case data hints); they leave first, whole,
+# so the warnings above them are never the part that is cut.
+_LOW_VALUE_HEADINGS = ("## Server-Side Review Steps Not Run", "## Test Data")
+
+
+def _left_out_note(names: list[str]) -> str:
+    """The note naming the dropped blocks and where (not) to read them."""
+    return (
+        f"\n\n> ℹ️  Left out to keep this reply readable: {', '.join(names)}. "
+        "They are advisory text; a smaller suite shows the rest in full."
+    )
+
+
+_NOTE_ROOM = len(_left_out_note(["Server-Side Review Steps Not Run", "Test Data"]))
+
+
+def _drop_low_value(body: str, summary_cap: int) -> tuple[str, str]:
+    """(*body* minus low-value blocks dropped last-first, the Left-out note).
+
+    The note's room is reserved before the fit test, so it is never the part cut.
+    """
+    blocks = re.split(r"(?=\n\n## )", body)
+    names: list[str] = []
+    for idx in range(len(blocks) - 1, -1, -1):
+        if names and len(body) + _NOTE_ROOM <= summary_cap:
+            break
+        if blocks[idx].lstrip().startswith(_LOW_VALUE_HEADINGS):
+            names.append(blocks[idx].strip().splitlines()[0].lstrip("# "))
+            del blocks[idx]
+            body = "".join(blocks)
+    return body, (_left_out_note(names) if names else "")
+
+
 def _truncate_summary(body: str, summary_cap: int, auto_export: bool) -> str:
     """*body* cut to *summary_cap* with an honest truncation marker."""
     if len(body) <= summary_cap:
         return body
-    tail = _truncation_tail(body[summary_cap:], auto_export)
-    return body[:summary_cap].rstrip() + f"\n\n…(truncated — {tail})"
+    body, note = _drop_low_value(body, summary_cap)
+    if len(body) + len(note) <= summary_cap:
+        return body + note
+    marker_len = len(_truncation_tail("\n## x", auto_export)) + 16
+    room = max(0, summary_cap - marker_len - len(note))
+    tail = _truncation_tail(body[room:], auto_export)
+    out = body[:room].rstrip() + f"\n\n…(truncated — {tail})" + note
+    return out[:summary_cap] if len(out) > summary_cap else out
 
 
 def shape_export_result(item: ExportedFile) -> str:

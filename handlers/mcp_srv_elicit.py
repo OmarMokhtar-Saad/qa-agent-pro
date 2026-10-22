@@ -14,8 +14,8 @@ from handlers.wizard_request import GenerateRequest
 def _gated_off() -> bool:
     """True when no dialog may be offered (client gated)."""
     # 2026-08-21: and no dialog at all for a client whose elicitation transport
-    # has proven unanswerable in this process (two consecutive timeouts, no
-    # answer between them). None is the existing, tested "render the markdown
+    # has proven unanswerable in this process (one timeout; gated for the
+    # 600 s TTL unless an answer arrives). None is the existing, tested "render the markdown
     # menu" path, so the caller degrades exactly as it does for a client with no
     # elicitation support -- but at 0s instead of 55s. Gated HERE rather than in
     # _make_elicitors so the single-sided call sites are covered too.

@@ -124,7 +124,7 @@ class PermissionHandler:
         text = _message(ctx.xml, texts)
         if not button:
             # A denied permission must never be allowed for want of a button.
-            return _unclear(text) if ctx.package in _CONTROLLER else _ALLOW.decide(ctx)
+            return _unclear(text) if ctx.package in CONTROLLERS else _ALLOW.decide(ctx)
         groups = perm_keywords.groups_in(_without_app(text))
         hit = groups & ctx.deny_permissions
         if not groups or (hit and hit != groups) or _ungrouped(ctx, hit, groups):
@@ -143,14 +143,16 @@ def is_permission_button(text: object) -> bool:
 
 
 #: The packages of the permission-controller dialog (not the legacy installer).
-_CONTROLLER = frozenset(p for p in PERMISSION_PACKAGES if "permissioncontroller" in p)
+CONTROLLERS = frozenset(p for p in PERMISSION_PACKAGES if "permissioncontroller" in p)
 
 GRANT_HINT = (
-    " The front window is the runtime-permission dialog: answer it now with its "
-    "own Allow or Deny button, and rerun with `grant_permissions=true` (the "
-    "default) to grant the app's permissions up front (test setup, not a "
-    "settings change); pass `false` only when the test is the permission "
-    "prompt itself."
+    " The front window is a system permission prompt. Tapping Allow or "
+    "'Only this time' CHANGES the device's permissions. If the prompt names "
+    "another app (not the app under test), do not answer it unless the brief "
+    "allows permission changes: ask the user, or use Deny or `back`. For the "
+    "app under test, rerun with `grant_permissions=true` (the default) to "
+    "grant up front (test setup, not a settings change); pass `false` only when the test is the "
+    "permission prompt itself."
 )
 
 
@@ -158,4 +160,4 @@ def front_hint(screen: object) -> str:
     """``GRANT_HINT`` when *screen*'s front window is the permission controller."""
     body = screen if isinstance(screen, dict) else {}
     front = {str(body.get("package") or ""), str(body.get("dialog_package") or "")}
-    return GRANT_HINT if front & _CONTROLLER else ""
+    return GRANT_HINT if front & CONTROLLERS else ""

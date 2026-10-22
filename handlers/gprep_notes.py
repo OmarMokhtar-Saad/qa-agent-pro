@@ -30,7 +30,9 @@ def text_only_image_skip_note(meta: dict) -> str:
             return ""
         return (
             f"\n> \u2139\ufe0f {_n} screen(s) referenced by this ticket were not "
-            f"read -- the tester chose ticket text only.{_skip_names_note(meta)}"
+            "read -- generated from the ticket text only (the tester chose it, "
+            f"or no screens or design link were provided and no device is "
+            f"attached; attach screenshots to include them).{_skip_names_note(meta)}"
         )
     return ""
 

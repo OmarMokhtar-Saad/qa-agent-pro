@@ -69,6 +69,10 @@ class TestSuite(BaseModel):
     # model, and must not be serialized.
     _generation_notes: Optional[list] = PrivateAttr(default=None)
 
+    # Version stamp of a regenerated suite (earlier versions + overlap), set after save.
+    _family_note: Optional[str] = PrivateAttr(default=None)
+    _family_version: int = PrivateAttr(default=1)
+
     # Rows for the "Requirements Traceability" sheet: one per acceptance
     # criterion, with the case COUNT and the linked tc_ids. Attached by
     # agents.test_scenario_agent._finalize_generation -- the one place holding

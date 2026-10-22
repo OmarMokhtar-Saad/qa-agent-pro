@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 
 from agents.host_dedup_consts import _UNTRUSTED_ERRORS
-from agents.host_dedup_contrast import _is_boundary_contrast
+from agents.host_dedup_contrast import _is_boundary_contrast, quoted_literals_differ
 
 # --- Server-assisted duplicate shortlist (QA_DUP_SHORTLIST_ENABLED, OFF) -- #
 # Lexical PRESCREEN over the merged, globally renumbered cases. Pairs are
@@ -111,7 +111,7 @@ def _shortlist_pairs(entries: list) -> list:
     for i in range(len(entries)):
         for j in range(i + 1, len(entries)):
             ratio = _pair_ratio(entries[i][2], entries[j][2])
-            if not ratio:
+            if not ratio or quoted_literals_differ(entries[i][1], entries[j][1]):
                 continue
             pairs.append(
                 {

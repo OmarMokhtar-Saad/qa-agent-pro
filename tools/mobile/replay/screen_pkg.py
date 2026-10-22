@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tools.mobile import perception
+from tools.mobile.dialog_permission import CONTROLLERS
 
 #: Packages whose screen is an OVERLAY: the app under test is still running
 #: underneath, so `back` dismisses this and the case continues. A permission
@@ -73,14 +74,22 @@ def system_dialog_package(screen: object) -> str:
     return whole if whole in SYSTEM_DIALOG_PACKAGES else ""
 
 
+_PERMISSION_WARNING = (
+    " This is a system permission prompt: Allow or 'Only this time' changes "
+    "the device's permissions. If it is for another app, ask the user or use "
+    "Deny or `back` unless the brief allows permission changes."
+)
+
+
 def system_dialog_detail(package: str) -> str:
-    return (
+    base = (
         "a system dialog from "
         + str(package)[:80]
         + " is in front of the app, so nothing further was replayed against it. "
         "The app is still running underneath: answer the dialog, or send `back` "
         "to dismiss it, then continue the case."
     )
+    return base + (_PERMISSION_WARNING if package in CONTROLLERS else "")
 
 
 #: Windows that belong to the platform rather than to an app: an ANR ("X isn't

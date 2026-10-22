@@ -57,10 +57,7 @@ _CAUSE_NO_CHANNEL = (
     "channel (your client offered none for this call)"
 )
 _CAUSE_DECLINED = "was shown inline and dismissed"
-_CAUSE_GATED = (
-    "was not asked again -- an earlier dialog this session was dismissed "
-    "without an answer, so I stopped spending round trips on dialogs"
-)
+_CAUSE_GATED = "was not shown inline because pop-up dialogs aren't available here"
 _CAUSE_UNSUPPORTED = (
     "could not be shown inline because your MCP client does not support "
     "elicitation dialogs"

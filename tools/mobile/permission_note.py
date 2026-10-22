@@ -29,7 +29,7 @@ def _asker(body: dict) -> str:
     """The asking package, else a generic name. Never the dialog's own text."""
     for key in ("dialog_package", "package"):
         app = str(body.get(key) or "")
-        if app not in dialog_permission._CONTROLLER and _PACKAGE.fullmatch(app):
+        if app not in dialog_permission.CONTROLLERS and _PACKAGE.fullmatch(app):
             return " (" + app[:80] + " is asking)"
     return GENERIC_ASKER
 

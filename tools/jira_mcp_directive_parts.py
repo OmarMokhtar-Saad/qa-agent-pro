@@ -31,7 +31,7 @@ def _step_parent(prefix: str, token: str, step: int) -> str:
         "usually lives there, and its one-line link title is not "
         "enough. Send at most one. Immediately call "
         f"`qa_stage_jira(stage_token='{token}', part='parent', "
-        "json=<STRINGIFIED result of THIS fetch only>)` before doing "
+        "json=<STRINGIFIED result of THIS fetch only>)` (or, if your host spilled this result to a file, `path=<absolute file>` instead of retyping it) before doing "
         "anything else."
     )
 
@@ -52,7 +52,7 @@ def _step_sibling(prefix: str, token: str, step: int) -> str:
         "ticket inherits, and their one-line titles alone are not "
         "enough. Skip this step when there is no parent. Immediately "
         f"call `qa_stage_jira(stage_token='{token}', part='siblings', "
-        "json=<STRINGIFIED result of THIS fetch only>)` when you do "
+        "json=<STRINGIFIED result of THIS fetch only>)` (or `path=<absolute file>` if your host spilled the result to a file - never retype a large result) when you do "
         "run it."
     )
 

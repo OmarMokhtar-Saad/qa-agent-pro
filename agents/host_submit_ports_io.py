@@ -20,6 +20,9 @@ class IoPort(Protocol):
     save_suite: AFn
     save_checklist: AFn
     load_suite: AFn
+    earlier_suites: AFn
+    family_of: AFn
+    set_export_path: AFn
     finalize_generation: AFn
     deserialize_prepared: Fn
     parse_host_suite: Fn

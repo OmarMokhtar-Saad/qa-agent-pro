@@ -69,8 +69,25 @@ def _read_capped(path: str) -> tuple[bytes | None, str]:
     return raw, ""
 
 
-def _load_json(path: str) -> tuple[dict | None, str]:
-    """(parsed Jira issue object, refusal). Path must be a bounded regular file."""
+def _shape_refusal(data: object, part: str) -> str:
+    """ "" when *data* has the shape of the staged *part*, else the refusal."""
+    if part == "siblings":
+        if isinstance(data, dict) and isinstance(data.get("issues"), list):
+            return ""
+        return (
+            "That file is not a Jira search result (no `issues` list) -- "
+            "save the raw searchJiraIssuesUsingJql result."
+        )
+    if isinstance(data, dict) and isinstance(data.get("fields"), dict):
+        return ""
+    return (
+        "That file is not a Jira issue (no `fields` object) -- save the raw "
+        "getJiraIssue result."
+    )
+
+
+def _load_json(path: str, part: str = "issue") -> tuple[dict | None, str]:
+    """(parsed Jira issue or search object, refusal); path must be a bounded file."""
     raw, refusal = _read_capped(path)
     if raw is None:
         return None, refusal
@@ -81,17 +98,20 @@ def _load_json(path: str) -> tuple[dict | None, str]:
             None,
             "That file is not valid JSON -- save the raw fetch result unchanged.",
         )
-    if not isinstance(data, dict) or not isinstance(data.get("fields"), dict):
-        return (
-            None,
-            "That file is not a Jira issue (no `fields` object) -- save the raw getJiraIssue result.",
-        )
-    return data, ""
+    refusal = _shape_refusal(data, part)
+    return (None, refusal) if refusal else (data, "")
+
+
+def _part_text(part: str, data: dict) -> str:
+    """Siblings are small search results stored whole; issues are trimmed."""
+    if part == "siblings":
+        return json.dumps(data, ensure_ascii=False)
+    return _trim_issue(data)
 
 
 def _stage_text(token: str, part: str, data: dict) -> str:
     """Store the trimmed issue, or say it is still too big."""
-    text = _trim_issue(data)
+    text = _part_text(part, data)
     if len(text.encode("utf-8", "ignore")) > _STAGED_MAX_BYTES:
         return (
             "That ticket is still over 200 KB after trimming (comments cut to "
@@ -100,7 +120,7 @@ def _stage_text(token: str, part: str, data: dict) -> str:
         )
     tray._store_stage_part(token, part, text)
     note = ""
-    if not isinstance(data["fields"].get("updated"), str):
+    if part != "siblings" and not isinstance(data["fields"].get("updated"), str):
         note = (
             " Note: that file has no `fields.updated`, so freshness cannot "
             "be shown -- request the `updated` field."
@@ -119,7 +139,7 @@ async def handle_stage_jira_file(stage_token: str, part: str, path: str) -> str:
         if refusal:
             return refusal
         tray._sweep_jira_stage_tray()
-        data, refusal = await asyncio.to_thread(_load_json, str(path or ""))
+        data, refusal = await asyncio.to_thread(_load_json, str(path or ""), part)
         if data is None:
             return refusal
         return _stage_text(token, part, data)

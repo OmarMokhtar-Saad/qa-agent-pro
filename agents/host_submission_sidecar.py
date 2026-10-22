@@ -52,6 +52,8 @@ def _pop_sidecar_fields(data) -> tuple[dict, _Sidecar]:
         "raw_ambiguity_result": data.pop("ambiguity_result", None),
         "raw_image_descriptions": data.pop("image_descriptions", None),
         "raw_checklist_items": data.pop("checklist_items", None),
+        "raw_duplicate_justifications": data.pop("duplicate_justifications", None),
+        "raw_confirm_warnings": data.pop("confirm_quality_warnings", None),
     }
     data.pop("risk_scores", None)
     data.pop("test_plan_report", None)

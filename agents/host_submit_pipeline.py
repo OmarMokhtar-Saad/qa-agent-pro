@@ -15,6 +15,7 @@ from agents import (
     host_submit_audit,
     host_submit_dup_notes,
     host_submit_export,
+    host_submit_family,
     host_submit_load,
     host_submit_persist,
     host_submit_persist_notes,
@@ -40,6 +41,8 @@ async def persist(st: Staged, ports: SubmitPorts) -> SubSaved:
         run.prep, run.read.rows, fin.suite, st.call.cbs[1]
     )
     saved = await host_submit_persist.save_submitted_suite(save_in, ports)
+    fam_in = host_submit_family.FamilyIn(run.prep, fin.suite, saved.suite_id)
+    await host_submit_family.stamp_versions(fam_in, ports)
     notes_in = host_submit_persist_notes.NotesIn(run, fin, saved)
     await host_submit_persist_notes.attach_generation_notes(notes_in, ports)
     art_in = host_submit_persist.ArtifactsIn(run.prep, saved, fin.suite)
@@ -71,6 +74,9 @@ async def publish(st: Staged, ports: SubmitPorts) -> str:
     exp_in = host_submit_export.ExportIn(run.prep, suite, ask_text, progress)
     export = await host_submit_export.export_submitted_suite(exp_in, ports)
     tail = build_tail(st, ports)
+    await host_submit_family.record_export(
+        getattr(saved, "suite_id", ""), export.paths, ports
+    )
     await host_submit_export.stamp_prep_finalized(run.prep, suite, export.paths)
     reply_in = host_submit_reply.ReplyIn(run, st.post, saved, export, tail)
     return host_submit_reply.submit_reply(reply_in, ports)

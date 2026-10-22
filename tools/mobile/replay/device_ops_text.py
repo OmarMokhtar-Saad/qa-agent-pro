@@ -59,15 +59,46 @@ def _clear_refusal(fallback: str) -> dict:
     }
 
 
-async def _focus_field(serial: str, element: object) -> dict | None:
-    """Tap the field to focus it; an error reply, or None once it is focused."""
-    if isinstance(element, dict) and element.get("focused") is True:
+async def _focus_field(
+    serial: str, element: object, force: bool = False
+) -> dict | None:
+    """Tap the field to focus it; an error reply, or None once it is focused.
+
+    *force* taps even when the tree shows the field focused: a ``clear`` re-renders
+    some fields (a search bar re-filters) and leaves the flag set while the keyboard's
+    input connection is stale, so the text typed next is dropped (M-03).
+    """
+    if not force and isinstance(element, dict) and element.get("focused") is True:
         return None  # the tree already shows it focused: a tap adds a round trip
     center = _center(element) if isinstance(element, dict) else None
     if not center:
         return {"error": "That field has no usable bounds.", "content": None}
     focused = await adb.tap(serial, center[0], center[1])
     return focused if focused.get("error") else None
+
+
+# Serials whose last text-entry op was a ``clear``. Kept here, not on the per-call
+# Context, so a ``clear`` in one submit still re-focuses the ``type`` of the next.
+_CLEARED: set[str] = set()
+
+
+def _take_cleared(serial: str, op: str) -> bool:
+    """Whether the step before cleared a field; consumed by a ``type`` / ``fill``."""
+    if op == "clear":
+        return False
+    cleared = serial in _CLEARED
+    _CLEARED.discard(serial)
+    return cleared
+
+
+async def _clear_field(serial: str) -> dict:
+    """Clear the focused field and remember it, so the next type re-focuses it."""
+    reply = await ime.clear(serial, receiver_known=True)
+    if reply.get("error"):
+        _CLEARED.discard(serial)
+    else:
+        _CLEARED.add(serial)
+    return reply
 
 
 # For `clear`: `replay` ran keyboard_up (its one QUERY) for every script
@@ -81,11 +112,11 @@ async def _text_entry_op(spec: TouchSpec, ctx: Context) -> dict:
     blocked = None if fallback else await _qa_ime_blocker(serial)
     if blocked is not None:
         return blocked
-    failed = await _focus_field(serial, spec.element)
+    failed = await _focus_field(serial, spec.element, _take_cleared(serial, spec.op))
     if failed is not None:
         return failed
     if spec.op == "clear":
-        return await ime.clear(serial, receiver_known=True)
+        return await _clear_field(serial)
     refused = _password_refusal(spec.action, spec.element)
     if refused is not None:
         return refused

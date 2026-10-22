@@ -18,7 +18,7 @@ twice.
 
 from __future__ import annotations
 
-from tools.mobile import case_label
+from tools.mobile import case_label, flow_replay_record
 from tools.mobile.render_crash import crash_note
 from tools.mobile.render_field import _field
 from tools.mobile.render_status_word import status_label, status_word
@@ -63,7 +63,16 @@ def _verdict_head(body: dict) -> str:
         + (shown or "unknown")
         + "**"
         + ((" — " + reason) if reason else "")
+        + _replay_stop(body, verdict)
     )
+
+
+def _replay_stop(body: dict, verdict: str) -> str:
+    """Qualifies a ``pass`` headline over a saved-flow replay that stopped (never vetoes it)."""
+    at = flow_replay_record.stopped_at(body)
+    if not at or verdict != "pass":
+        return ""
+    return " — but the saved-flow replay stopped at step %d" % at
 
 
 def verdict_line(case: object, screen: object = None, previous_id: str = "") -> str:
