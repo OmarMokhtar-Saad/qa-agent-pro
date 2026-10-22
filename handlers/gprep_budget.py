@@ -26,7 +26,7 @@ def _classify(img, used: int, slots: int) -> tuple[str, str, int]:
 
 # POSITIONAL verdicts for the per-result image budget: ``(flags, dropped)``.
 #
-# Split out of _select_prepare_images (2026-08-09, review M1) so the PREPARE
+# Split out of the old reply-image selector (2026-08-09, review M1) so the PREPARE
 # stamp can ask "how many of these will actually ship?" using the very code
 # that later decides it, instead of a second copy that drifts. ``flags[i]`` is
 # True when ``images[i]`` rides on the reply; ``dropped`` names the images
@@ -83,7 +83,7 @@ def _kept_image_bytes(images: list) -> tuple[int, int]:
 # How many DEVICE-captured screens actually ride on this reply.
 #
 # 2026-08-09 (review M1). The prepare envelope used to stamp the count read off
-# the capture tray, but _select_prepare_images caps the reply at
+# the capture tray, but `_budget_keep_flags` caps the reply at
 # jira_max_images (default 3) -- so a 5-screen capture stamped 5, shipped 3,
 # and the submit-side attested_image_gap_note reported a shortfall that no
 # action could ever clear. Matched by OBJECT IDENTITY, because the captured

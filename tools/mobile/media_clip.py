@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from config.settings_guard import never_raise
 from tools.mobile import adb, media_run
@@ -61,6 +62,7 @@ async def _launch(ref: ClipRef, handle: dict, remote: str) -> None:
     handle["proc"] = started["content"]["proc"]
     handle["pid"] = started["content"].get("pid")
     handle["remote"] = remote
+    handle["t0"] = time.monotonic()
     handle["state"] = OK
 
 

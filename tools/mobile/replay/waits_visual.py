@@ -8,7 +8,7 @@ it, and the miss sentence names every source that was read.
 
 from __future__ import annotations
 
-from tools.mobile import a11y_confirm
+from tools.mobile import a11y_confirm, dump_latency
 from tools.mobile.replay.context import Context
 from tools.mobile.replay.context_consts import FRESH_READ_BUDGET_S
 from tools.mobile.replay.dump_screen import _observed
@@ -18,11 +18,15 @@ _TREE = "the accessibility tree"
 _FRESH = " and a fresh uiautomator read"
 
 
-async def fresh_screen(ctx: Context) -> object:
-    """A fresh non-accessibility read, pruned like a poll, or ``None`` if it failed."""
-    raw = await a11y_confirm.uiautomator_aside(
-        ctx.serial, "text_recheck", FRESH_READ_BUDGET_S
-    )
+def recheck_reserve_ms(ms: int, serial: str) -> int:
+    """Budget ms kept for the final fresh read: p90 x1.5 (1 s..3 s), at most half of *ms*."""
+    want = max(1000, int((dump_latency.p90_ms(serial) or 0) * 1.5))
+    return max(0, min(want, int(FRESH_READ_BUDGET_S * 1000), ms // 2))
+
+
+async def fresh_screen(ctx: Context, cap_s: float = FRESH_READ_BUDGET_S) -> object:
+    """A fresh non-accessibility read (cap *cap_s*), pruned like a poll, or ``None``."""
+    raw = await a11y_confirm.uiautomator_aside(ctx.serial, "text_recheck", cap_s)
     if raw.get("error"):
         return None
     seen = await _observed(ctx, raw)

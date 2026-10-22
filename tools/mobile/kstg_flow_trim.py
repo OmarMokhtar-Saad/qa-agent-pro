@@ -39,3 +39,15 @@ def trim(recs: list, package: str) -> list:
     body = recs[_route_start(recs, package) :] if package else recs
     kept = [r for r in body if not foreign_decline(r, package)]
     return kept if len(kept) >= MIN_STEPS else recs
+
+
+def without_approach(recs: list) -> list:
+    """*recs* without the leading transient-screen steps (installer, App Tester).
+
+    Used only when the route is too long: a replay cannot start there once the app is
+    installed. Kept whole when that would leave fewer than ``MIN_STEPS`` steps.
+    """
+    start = 0
+    while start < len(recs) and target_pin.transient(observed(recs[start])):
+        start += 1
+    return recs[start:] if len(recs) - start >= MIN_STEPS else recs

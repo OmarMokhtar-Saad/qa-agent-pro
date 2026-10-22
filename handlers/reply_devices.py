@@ -6,6 +6,7 @@ from typing import NamedTuple
 
 from handlers import _lane_tools
 from handlers.reply_adb import _adb_notice, _attached_devices_lines
+from handlers.reply_device_fit import fit_note
 
 
 class DeviceListing(NamedTuple):
@@ -50,7 +51,9 @@ def shape_devices(listing: DeviceListing) -> str:
     notice = _adb_notice(listing.adb_dropped_lines, listing.adb_problem)
     if not devices and not attached:
         return _no_devices_reply(listing.booting, listing.empty_hint) + notice
-    return "\n".join(_listing_lines(devices, attached)) + notice
+    note = fit_note(devices)
+    body = "\n".join(_listing_lines(devices, attached))
+    return body + ("\n\n" + note if note else "") + notice
 
 
 def _no_devices_reply(booting: list | None, empty_hint: str) -> str:

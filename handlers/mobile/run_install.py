@@ -13,6 +13,7 @@ from tools import device_manager as _device_manager
 from tools.mobile import adb as mobile_adb
 from tools.mobile import prerun_timing
 from tools.mobile import run_store as _run_store
+from tools.mobile.render_install import where_word
 
 logger = logging.getLogger("tools.mcp_handlers")
 
@@ -67,7 +68,9 @@ async def _mobile_not_installed_reply(
     return (
         "⚠️ `"
         + (target or "(none given)")
-        + "` is not installed on the emulator, so there is nothing to run."
+        + "` is not installed on "
+        + where_word(serial)
+        + ", so there is nothing to run."
         + hint
         + "\n\nPick another install source, or install it and try again."
     )
@@ -84,9 +87,11 @@ async def _app_stage_not_installed(call: _AppCall, target: str, probe: tuple) ->
         return (
             "⚠️ Could not check whether `"
             + (target or "(none given)")
-            + "` is on the emulator -- the device did not answer, so this "
-            "server will not say either way. Check the emulator is still "
-            "running (`qa_list_devices`) and call `qa_mobile_test` again. "
+            + "` is on "
+            + where_word(call.serial)
+            + " -- the device did not answer, so this "
+            "server will not say either way. Check the device is still "
+            "connected (`qa_list_devices`) and call `qa_mobile_test` again. "
             "Nothing was installed or started.",
             target,
         )
@@ -106,11 +111,13 @@ def _store_url(install_source: str, value: str, target: str) -> str:
     return url
 
 
-def _store_opened_markdown() -> str:
-    """The reply once the store page is open on the emulator."""
+def _store_opened_markdown(serial: str) -> str:
+    """The reply once the store page is open on the device."""
 
     return (
-        "## Opened on the emulator\n\nFinish the install in the emulator's own "
+        "## Opened on "
+        + where_word(serial)
+        + "\n\nFinish the install in the device's own "
         "UI, then call `qa_mobile_test` again with the app's `package` name and "
         "`source=installed_package`. Nothing was downloaded by this server."
     )
@@ -119,7 +126,7 @@ def _store_opened_markdown() -> str:
 async def _app_stage_open_store(
     call: _AppCall, install_source: str, target: str
 ) -> tuple:
-    """Open the Play Store page, or drive Firebase App Tester, in the emulator."""
+    """Open the Play Store page, or drive Firebase App Tester, on the device."""
 
     if install_source == "app_tester":
         return await prerun_timing.timed(
@@ -129,7 +136,7 @@ async def _app_stage_open_store(
     opened = await mobile_adb.open_url(call.serial, url)
     if opened.get("error"):
         return "⚠️ " + str(opened["error"])[:300], target
-    return _store_opened_markdown(), target
+    return _store_opened_markdown(call.serial), target
 
 
 def _installing_reply(target: str) -> tuple:

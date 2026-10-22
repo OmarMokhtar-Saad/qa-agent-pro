@@ -89,7 +89,8 @@ class Script(BaseModel):
             ):
                 raise ValueError(
                     "assert visual must be the LAST action of a script: the "
-                    "replay stops there and hands you the screenshot to judge"
+                    "replay stops there and the server saves the screenshot for the "
+                    "report (you do not receive the picture)"
                 )
         return self
 

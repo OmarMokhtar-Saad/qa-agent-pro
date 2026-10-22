@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from handlers.mobile import run_grant_note
 from handlers.mobile.run_request import _MobileTestRequest
 from tools.mobile import adb_grant
 from tools.mobile import render as mobile_render
@@ -19,6 +20,7 @@ logger = logging.getLogger("handlers.mobile.run")
 # permission dialog is still answered the ordinary way when it shows.
 async def mobile_grant_stage(req: _MobileTestRequest, serial: str, target: str) -> str:
     """Grant the app's runtime permissions up front; a refusal or ``""``."""
+    run_grant_note.remember(serial, [], frozenset())  # drop a stale earlier note
     if not req.grant_permissions or not target:
         return ""
     if not req.apply:
@@ -29,6 +31,9 @@ async def mobile_grant_stage(req: _MobileTestRequest, serial: str, target: str) 
     denied = frozenset(perms_of(parse_deny(getattr(req, "deny_permissions", None))[0]))
     result = await adb_grant.grant_runtime(serial, target, denied)
     _log("grant", result)
+    run_grant_note.remember(
+        serial, (result.get("content") or {}).get("granted") or [], denied
+    )
     return await _revoke_stage(serial, target, denied) if denied else ""
 
 

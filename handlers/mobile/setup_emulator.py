@@ -64,6 +64,16 @@ async def _physical_attached() -> bool:
     return any(not str(x).startswith("emulator-") for x in serials)
 
 
+def _avd_extra_lines(names: list, physical: bool) -> list:
+    """Heavy-AVD and host-load rows; none with a phone attached (they blame an
+    emulator the run is not using, G12 and the O-4 doctor noise)."""
+    if physical:
+        return []
+    lines = _avd_weight_lines(names, sdk_locator, avd_guard)
+    loaded = avd_guard.assess(avd_guard.Panel(load_per_core=avd_guard.host_load()))
+    return lines + (["- ⚠️ " + loaded] if loaded else [])
+
+
 async def _mobile_avd_rows() -> list:
     """The AVD lines of the mobile doctor section: configured emulators, heavy
     AVDs and host load."""
@@ -71,15 +81,7 @@ async def _mobile_avd_rows() -> list:
     avds = await _list_avds(emulator)
     names = list(avds.get("content") or [])
     lines = [_avd_summary_line(avds, names, doctor_render)]
-    lines += _avd_weight_lines(names, sdk_locator, avd_guard)
-    loaded = ""
-    if not await _physical_attached():
-        # The load warning is about AVD speed; on a physical phone it blames
-        # an emulator the run is not using (G12).
-        loaded = avd_guard.assess(avd_guard.Panel(load_per_core=avd_guard.host_load()))
-    if loaded:
-        lines.append("- ⚠️ " + loaded)
-    return lines
+    return lines + _avd_extra_lines(names, await _physical_attached())
 
 
 # `provisioner` went with the AVD_NAME filter below: this probe no
@@ -103,7 +105,8 @@ async def _mobile_emulator_lines() -> list:
         found = await asyncio.wait_for(
             emulator.list_running(), timeout=_reply.MOBILE_PROBE_S
         )
-        lines += _emulator_found_lines(found, sdk_locator)
+        physical = await _physical_attached()
+        lines += _emulator_found_lines(found, sdk_locator, physical)
     if g.failed:
         lines.append(
             "- ⬜ Emulator state not checked (the device probe did not answer "
@@ -112,10 +115,12 @@ async def _mobile_emulator_lines() -> list:
     return lines
 
 
-def _emulator_found_lines(found: dict, sdk_locator) -> list:
+def _emulator_found_lines(found: dict, sdk_locator, physical: bool = False) -> list:
     if found.get("error"):
         return ["- ⚠️ Could not ask adb what is running: " + str(found["error"])[:160]]
     booted = found.get("content") or []
+    if not booted and physical:
+        return []
     if not booted:
         return ["- ⬜ No emulator running — `qa_mobile_test` starts one"]
     return _running_emulator_rows(booted, sdk_locator)

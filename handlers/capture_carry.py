@@ -36,7 +36,7 @@ def _carry_verdict(
     """``(note, refusal)`` for a plan with a recovery or a shortfall."""
     if plan.short_total <= 0:
         # W4: recovered_cap counts screens RESTORED to the tray, not screens that
-        # will fit the reply; _select_prepare_images names every image it drops.
+        # will fit the reply; `_budget_keep_flags` names every image it drops.
         # The count here is deliberately the RECOVERY, not the shipment.
         return (
             f"> \U0001f4f8 Carried forward {plan.recovered_cap} device "

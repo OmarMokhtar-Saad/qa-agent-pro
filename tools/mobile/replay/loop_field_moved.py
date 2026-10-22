@@ -7,6 +7,11 @@ device's dump latency. Moving on is STRUCTURAL: another package or activity, a
 different structural screen key (anchor resource ids, never text), or fewer
 editable fields. The raw content hash is NOT a signal: a toast or an error line
 changes it and the field is still dead.
+
+A transient frame (degraded key, under ``TRANSIENT_MAX_ANCHORS`` anchors) is not
+proof: the next non-transient dump ends the poll and is returned as ``settled``.
+An OTP that ends on a bare, transient-looking screen therefore costs the
+deadline (``AUTO_SETTLE_MAX_S``, scaled by dump latency) once; the outcome is unchanged.
 """
 
 from __future__ import annotations
@@ -22,16 +27,22 @@ from tools.mobile.replay.dump_stamp import live_focus
 from tools.mobile.replay.waits_gate import Gate, hold, token_of
 from tools.mobile.screen_key import screen_key
 
+#: A degraded frame with fewer anchors than this is a transient, not a screen.
+TRANSIENT_MAX_ANCHORS = 2
+
 
 class Moved(NamedTuple):
     """Whether the app moved on, and the post-action screen read that proved it.
 
     ``screen`` is ``None`` when the proof was the focus probe alone (nothing was
-    read) or the app did not move.
+    read) or the app did not move. ``settled`` marks a screen read AFTER a
+    transient (near-empty) frame: the first witness that is not mid re-layout,
+    so ``moved`` says whether it is genuinely another screen.
     """
 
     moved: bool
     screen: Any = None
+    settled: bool = False
 
 
 def _fields(screen: dict) -> int:
@@ -80,15 +91,39 @@ async def _focus_left(ctx: Context, focus: str, deadline: float) -> bool:
     return False
 
 
+def _transient(content: object) -> bool:
+    """Whether *content* is a near-empty frame (a screen mid re-layout)."""
+    if not isinstance(content, dict):
+        return False
+    key = screen_key(content)
+    return key.degraded and len(key.anchors) < TRANSIENT_MAX_ANCHORS
+
+
+def _verdict(before: object, content: object, seen_transient: bool) -> Moved | None:
+    """The result for one good dump, or ``None`` to keep polling."""
+    if seen_transient and not _transient(content):
+        return Moved(_moved_on(before, content), content, True)
+    if _moved_on(before, content) and not _transient(content):
+        return Moved(True, content)
+    return None
+
+
 async def _read_moved(ctx: Context, before: object, deadline: float) -> Moved:
     """Dump (the dump is the poll) until the app moved on or *deadline*; a failed
-    dump (no window while the app transitions) is retried, not read as "did not move"."""
+    dump (no window while the app transitions) is retried, not read as "did not move".
+    A transient moved-on frame is polled past; at the deadline it still counts."""
+    transient: Any = None
     while time.monotonic() < deadline:
         dumped = await _dump(ctx, deadline=deadline)
         content = dumped.get("content")
-        if not dumped.get("error") and _moved_on(before, content):
-            return Moved(True, content)
-    return Moved(False)
+        if dumped.get("error"):
+            continue
+        done = _verdict(before, content, transient is not None)
+        if done is not None:
+            return done
+        if _moved_on(before, content):
+            transient = content
+    return Moved(True, transient) if transient is not None else Moved(False)
 
 
 def _heard_event(serial: str, base: a11y_events.EventClock | None) -> bool:

@@ -62,7 +62,7 @@ def _job_keys(run: _PrepRun) -> dict:
 # compares it with the returned image_descriptions and says so when nothing
 # came back.
 # captured_image_count: the SHIPPED count (review M1, 2026-08-09), not the
-# pre-budget tray count, because _select_prepare_images caps the reply at
+# pre-budget tray count, because `_budget_keep_flags` caps the reply at
 # jira_max_images; the forwarded-screens guard sums it with the attested count
 # and carry-forward reports it as the prior prep's promise.
 # captured_image_read: the pre-budget count, forensics only.

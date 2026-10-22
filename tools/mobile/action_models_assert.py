@@ -75,7 +75,7 @@ class AssertAction(_Base):
     contains: str = Field(default="", max_length=200)
     target: Optional[Target] = None
     # What to judge from the picture, for ``visual`` only. The server cannot
-    # judge it: the replay stops here and the next reply carries the screenshot.
+    # judge it: the replay stops here and the screenshot goes to the report.
     note: str = Field(default="", max_length=300)
 
     @model_validator(mode="after")

@@ -24,7 +24,7 @@ MOBILE_TOOL_DETAIL = (
 
 MOBILE TOOL DETAIL
 
-qa_mobile_test: one call does the preflight itself (device, unlock, install), no list_devices first. Install, launch and grants happen by default (`dry_run=true` previews); grants are test setup, not a settings change. `note`: JSON {"text","kind":wait|avoid,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app. Batch ops (`tap_text_if_present` for popups). Once the device is released there is no status/stop. Never mark an unexercised check passed; ask before skipping a step. Prove the destination, not only text_absent. Credentials never go in the goal. Never use raw adb: this tool owns the destructive guard + evidence.
+qa_mobile_test: one call does the preflight itself (device, unlock, install), no list_devices first. Install, launch and grants happen by default (`dry_run=true` previews); grants are test setup, not a settings change. `note`: JSON {"text","kind":wait|avoid|fact,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app; fact = known issue/lesson, shown at later starts. Once the device is released there is no status/stop. Never mark an unexercised check passed; ask before skipping a step. Prove the destination, not only text_absent. Credentials never go in the goal. Never use raw adb: this tool owns the destructive guard + evidence.
 
 qa_submit_mobile_step: `note`: as on `qa_mobile_test`. `finding`: explore runs only, one observation per turn.
 

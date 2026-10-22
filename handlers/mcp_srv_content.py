@@ -36,9 +36,12 @@ def _target_of(fields: dict) -> "_lane.host_way_on.Target":
 
 
 SCREENSHOT_NOT_SHARED = (
-    "\n\n> Screenshots are never shared with you (`screenshot` is accepted "
-    "but yields nothing you can view). Describe the screen from the dump "
-    "above; do not look for a PNG file."
+    "\n\n> Screenshots are never shared with you (`screenshot` is accepted but "
+    "yields nothing you can view). The server saves this turn's picture in the "
+    "run report: cite the Screen id. For layout, colour or imagery use the "
+    "element list and the assert kinds, and flag what only a picture can show "
+    "with `finding=...` so the tester reviews it in the report. Do not look "
+    "for a PNG file."
 )
 
 

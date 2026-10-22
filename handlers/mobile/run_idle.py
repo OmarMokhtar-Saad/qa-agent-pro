@@ -9,6 +9,7 @@ from handlers.mobile import step as mobile_step
 from tools.mobile import adb as mobile_adb
 from tools.mobile import app_tools, avd_guard, device_lock, lock_reaper, run_store
 from tools.mobile import session_finish as finish
+from tools.mobile.dump_latency import is_emulator
 from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger("tools.mcp_handlers")
@@ -91,7 +92,7 @@ def _idle_if_ended(device_lock, idle: _Idle, ended: bool) -> dict:
 #
 async def _mobile_heavy_avd_note(serial: str) -> str:
     """The heavy-AVD warning to put above a run-start reply, or ``""``."""
-    if not serial:
+    if not serial or not is_emulator(serial):
         return ""
     try:
         size = (await mobile_adb.display_size(serial) or {}).get("content") or [0, 0]

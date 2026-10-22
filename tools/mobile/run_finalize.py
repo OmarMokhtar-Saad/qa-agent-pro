@@ -65,7 +65,7 @@ def _final_of(verdict: object, stop: str) -> dict:
         "evidence": [_clip(line) for line in lines[:MAX_EVIDENCE]],
         "stop": _clip(stop),
     }
-    for key in ("failed_turns", "interrupted_turns"):
+    for key in ("failed_turns", "interrupted_turns", "unconfirmed_inputs"):
         count = getattr(verdict, key, 0)
         if isinstance(count, int) and count > 0:
             final[key] = count

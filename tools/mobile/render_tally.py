@@ -91,6 +91,11 @@ def _typed_outcomes(rows: list[dict]) -> tuple[int, list[str], int]:
     return verified, failed, unconfirmed
 
 
+def unconfirmed_inputs(rows: list[dict]) -> int:
+    """How many typed inputs could not be read back (masked fields, unknown read-back)."""
+    return _typed_outcomes(rows)[2]
+
+
 def _is_explore(rows: list[dict]) -> bool:
     """Whether every row is an explore turn (the Exploration module)."""
     return bool(rows) and all(r.get("module") == EXPLORE_MODULE for r in rows)

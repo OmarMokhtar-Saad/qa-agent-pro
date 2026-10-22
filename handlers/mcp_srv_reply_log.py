@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from config.settings_guard import never_raise
 from handlers import _lane
+from handlers.mcp_srv_reply_spool import spool
 from handlers.mcp_srv_state import logger
 
 #: Longest excerpt of one reply that reaches the log; the rest is counted, not kept.
@@ -35,7 +36,9 @@ def excerpt(text: str) -> str:
 def log_reply(name: str, result: object) -> object:
     """Log what *name* told the host and hand *result* back; never raises, never leaks."""
     with never_raise(logger, "tool reply log failed"):
-        line = excerpt(reply_text(result))
+        text = reply_text(result)
+        line = excerpt(text)
         if line:
-            logger.info("tool reply %s: %s", name, line)
+            more = spool(name, text) if len(text) > REPLY_EXCERPT_CHARS else ""
+            logger.info("tool reply %s: %s%s", name, line, more)
     return result

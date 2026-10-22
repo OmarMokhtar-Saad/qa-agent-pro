@@ -20,10 +20,12 @@ from tools.mobile.media_consts import (
     record,
 )
 from tools.mobile.media_defer import defer
+from tools.mobile.media_ready import file_open
 from tools.mobile.media_stop import _stop_recorder, reap_recorder, signal_recorder
 from tools.mobile.media_store import remember
 
 logger = logging.getLogger("tools.mobile.media")
+SHORT_STEP_NOTE = " (step ended before the recorder opened its file)"
 
 
 def _base(step: _Step) -> dict:
@@ -39,6 +41,7 @@ async def _recorded_clip(step: _Step, clipped: dict) -> dict | None:
     """Pull a recorded clip now, or defer it (then there is no record yet)."""
     name = "clip-" + _safe(step.ref.tc_id) + "-" + str(clipped["seq"]) + ".mp4"
     job = _PullJob(step.ref.serial, step.held, step.directory / name, clipped)
+    await file_open(step.ref.serial, step.held)
     if not step.ref.defer:
         await _finish_step_pull(job)
         return clipped
@@ -128,7 +131,6 @@ def _pull_note(seq: object, pulled: dict, size: int) -> str:
 def _set_pull_failed(clipped: dict, pulled: dict, size: int) -> None:
     clipped["state"] = PULL_FAILED
     clipped["note"] = _pull_note(clipped.get("seq"), pulled, size)
-    logger.warning("media pull failed: %s", clipped["note"])
 
 
 async def _pull_into(job: _PullJob, closed: bool) -> None:
@@ -142,6 +144,9 @@ async def _pull_into(job: _PullJob, closed: bool) -> None:
         target.unlink(missing_ok=True)
     if _pull_failed(pulled, size) or size > MAX_CLIP_BYTES:
         _set_pull_failed(clipped, pulled, size)
+        if held.get("short_step"):
+            clipped["note"] += SHORT_STEP_NOTE
+        logger.warning("media pull failed: %s", clipped["note"])
     else:
         clipped["state"] = OK if closed else TRUNCATED
         clipped["file"] = target.name

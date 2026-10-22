@@ -21,6 +21,7 @@ from tools.mobile import (
 )
 from tools.mobile import render as mobile_render
 from tools.mobile.install_source_infer import infer_install_source
+from tools.mobile.render_install import where_word
 
 
 # Notes for ``_installed_package_target`` (moved out of the body to keep it short):
@@ -153,7 +154,9 @@ async def _app_stage_install(call: _AppCall, st: tuple, probe: tuple) -> tuple:
     install_source = install_source or _inferred_source(call)
     install_source = install_source or await _only_viable_source(call, target)
     if not install_source:
-        return mobile_render.install_menu_markdown(target, probed=probed), target
+        where = where_word(call.serial)
+        menu = mobile_render.install_menu_markdown(target, probed=probed, where=where)
+        return menu, target
     if not call.apply:
         refusal = "Installing the app (" + install_source + ")"
         return mobile_render.apply_refusal(refusal, call.value), target

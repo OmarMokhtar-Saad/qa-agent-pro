@@ -91,7 +91,7 @@ def revive_captures(capture_ids: list | None) -> list:
     untouched, so this is a no-op for a live tray. The original ``created_at`` is
     preserved, so a revived screen keeps expiring on its own capture clock
     instead of getting a fresh TTL, and everything downstream (peek_captures,
-    the labels, the _select_prepare_images byte budget, _drop_captures) is
+    the labels, the `_budget_keep_flags` byte budget, _drop_captures) is
     byte-identical to a host that re-sent the ids itself. Never raises."""
     revived: list = []
     with never_raise(logger, "reviving captured screens failed", exc_info=True):

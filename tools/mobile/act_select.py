@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tools.mobile.text_fold import fold
+
 
 def _norm(value: object) -> str:
     return " ".join(str(value or "").split()).strip().lower()
@@ -96,8 +98,9 @@ def _bounded(label: str, want: str) -> bool:
 
 def match_class(label: object, want: str) -> int:
     """3 = the label equals *want*, 2 = *want* is a whole word of it,
-    1 = a bare substring (last resort), 0 = absent."""
-    have = _norm(label)
+    1 = a bare substring (last resort), 0 = absent. Both sides are NFKC-folded
+    (text paths only; resource ids keep :func:`_norm`)."""
+    have, want = fold(label), fold(want)
     if not want or want not in have:
         return 0
     if have == want:

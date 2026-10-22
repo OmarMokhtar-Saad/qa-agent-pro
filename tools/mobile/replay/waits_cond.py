@@ -12,6 +12,7 @@ from tools.mobile.replay.context import (
     _result,
 )
 from tools.mobile.replay.context_consts import STATUS_NEEDS_MODEL
+from tools.mobile.replay.dead_tap_note import note_dead_tap
 from tools.mobile.replay.near_miss import near_miss
 from tools.mobile.replay.screen import _stamp_after
 from tools.mobile.replay.settle_mark import SettleJob, SettleOpts
@@ -155,6 +156,17 @@ def _refused(run: _ReplayRun, step: CondStep, seen: tuple) -> tuple:
     return screen, needs_model_reply(run, screen, entry)
 
 
+def _finish_wait(run: _ReplayRun, entry: dict, seen: tuple) -> tuple:
+    """Record a polled wait; on a miss annotate a dead tap and hand it to the model."""
+    screen, found = seen
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    if found:
+        return screen, None
+    note_dead_tap(run.trace)
+    return screen, needs_model_reply(run, screen, entry)
+
+
 async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tuple:
     """A wait on a text, element or idle condition: ``(screen, reply)``.
 
@@ -172,6 +184,4 @@ async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tu
             return screen, stop
     else:
         _miss(entry, _pair(run.ctx, (interruption, label, missed)), (started, spec[2]))
-    _stamp_after(entry, screen)
-    _append(run.trace, entry)
-    return screen, (None if found else needs_model_reply(run, screen, entry))
+    return _finish_wait(run, entry, (screen, found))

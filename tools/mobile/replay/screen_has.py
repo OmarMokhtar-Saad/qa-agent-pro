@@ -6,6 +6,7 @@ import re
 
 from tools.mobile.act_select import match_class
 from tools.mobile.replay.context_ctx import Context
+from tools.mobile.text_fold import fold
 
 #: A wait or presence check needs an exact or whole-word label, never a bare substring.
 WORD_CLASS = 2
@@ -27,7 +28,7 @@ def absent_from(screen: object, present: bool) -> bool:
 
 
 def _screen_has(screen: object, needle: str) -> bool:
-    want = " ".join(str(needle or "").split()).lower()
+    want = fold(needle)
     if not want or not isinstance(screen, dict):
         return False
     for element in screen.get("elements") or []:
@@ -44,7 +45,7 @@ def _screen_has_element(screen: object, rid: str, text: str = "") -> bool:
     is the id without its package prefix), and, when *text* is given, a label
     (text or desc) containing it. ``resend`` never matches ``send``."""
     want = " ".join(str(rid or "").split()).lower()
-    needle = " ".join(str(text or "").split()).lower()
+    needle = fold(text)
     if not want or not isinstance(screen, dict):
         return False
     for element in screen.get("elements") or []:
@@ -56,7 +57,7 @@ def _screen_has_element(screen: object, rid: str, text: str = "") -> bool:
         if not needle:
             return True
         for field in ("text", "desc"):
-            if needle in " ".join(str(element.get(field) or "").split()).lower():
+            if needle in fold(element.get(field)):
                 return True
     return False
 

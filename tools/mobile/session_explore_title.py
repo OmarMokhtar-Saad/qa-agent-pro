@@ -32,13 +32,17 @@ def titled_state(before: object, folded: object) -> dict:
 
 
 def _replay_tag(replay: object) -> str:
-    """`` (auto-replay `flow` steps 2-6 of 9)`` for a turn that ran a flow, else ``""``."""
+    """`` (auto-replay `a`, `b`; last steps 2-6 of 9)`` for a turn that ran flows, else ``""``.
+
+    With one flow only it reads `` (auto-replay `flow` steps 2-6 of 9)``.
+    """
     if not isinstance(replay, dict) or not replay.get("note"):
         return ""
     first, last = int(replay.get("start") or 0) + 1, int(replay.get("pos") or 0)
-    return " (auto-replay `%s` steps %d-%d of %d)" % (
-        str(replay.get("name") or "")[:60],
-        first,
-        max(first, last),
-        int(replay.get("total") or 0),
-    )
+    steps = "%d-%d of %d" % (first, max(first, last), int(replay.get("total") or 0))
+    done = [str(n)[:60] for n in replay.get("done") or [] if n]
+    if len(done) < 2:
+        name = str(replay.get("name") or "")[:60]
+        return " (auto-replay `%s` steps %s)" % (name, steps)
+    chain = ", ".join("`%s`" % n for n in done)
+    return " (auto-replay %s; last steps %s)" % (chain, steps)

@@ -16,7 +16,7 @@ from __future__ import annotations
 # handle_prepare_test_cases(capture_ids=[...]). The MCP server is ONE
 # long-running stdio process, so the dict survives between the two tool calls.
 # Deliberately NOT persisted: bytes on disk are a liability, and
-# _select_prepare_images already bounds what can ride on a reply.
+# `_budget_keep_flags` already bounds what can ride on a reply.
 #
 # READ-then-DROP, never consume-on-read. A Jira source ALWAYS costs at least two
 # prepare calls -- the first returns the fetch DIRECTIVE -- so popping the tray

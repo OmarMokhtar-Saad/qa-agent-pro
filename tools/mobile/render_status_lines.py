@@ -40,6 +40,20 @@ from tools.mobile.render_capture import capture_line
 from tools.mobile.render_field import _field
 
 
+def _caveats(final: dict) -> str:
+    """``" [caveats: 7 failed turns, ...]"`` for a pass that hid trouble, else ``""``."""
+    parts = []
+    for key, what in (
+        ("failed_turns", "failed turns"),
+        ("interrupted_turns", "interrupted turns"),
+        ("unconfirmed_inputs", "typed inputs unconfirmed"),
+    ):
+        count = final.get(key)
+        if isinstance(count, int) and count > 0:
+            parts.append("%d %s" % (count, what))
+    return " [caveats: " + ", ".join(parts) + "]" if parts else ""
+
+
 def _final_lines(final: object) -> list[str]:
     """The recorded verdict of an ended run as a one-row list, or ``[]``."""
     if not isinstance(final, dict) or not final:
@@ -50,6 +64,7 @@ def _final_lines(final: object) -> list[str]:
         "- result: **"
         + _field(final.get("outcome"), "unknown")
         + "**"
+        + _caveats(final)
         + (" — " + reason if reason else "")
         + (" (`" + stop + "`)" if stop else "")
     ]

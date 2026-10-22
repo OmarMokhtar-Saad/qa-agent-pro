@@ -54,6 +54,8 @@ class Verdict:
     #: "pass" that hid failures is told apart without parsing ``reason``.
     failed_turns: int = 0
     interrupted_turns: int = 0
+    #: Typed inputs whose read-back was unknown (OTP, passwords); recorded when set.
+    unconfirmed_inputs: int = 0
 
     def line(self) -> str:
         return self.outcome + ": " + self.reason

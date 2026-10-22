@@ -27,6 +27,7 @@ naturally, and the existing single-argument callers are unchanged.
 
 from __future__ import annotations
 
+from tools.mobile.dump_latency import is_emulator
 from tools.mobile.render_menu import INSTALL_SOURCES, _count_word, _keyed
 
 _INSTALL_ASK = "Ask the user how they want it installed -- present EXACTLY these "
@@ -53,23 +54,32 @@ _NO_APP_NOTE = (
 )
 
 
-def _install_head(package: str, probed: bool) -> str:
+def where_word(serial: str) -> str:
+    """ "the emulator" for an emulator serial, else "this device"."""
+    return "the emulator" if is_emulator(serial) else "this device"
+
+
+def _install_head(package: str, probed: bool, where: str) -> str:
     head = "## Which app should this run test?\n\n" + _NO_APP_NOTE
     if package and probed:
-        head = "## `" + str(package)[:80] + "` is not installed on the emulator\n\n"
+        head = "## `" + str(package)[:80] + "` is not installed on " + where + "\n\n"
     elif package:
         head = (
             "## Could not check whether `"
             + str(package)[:80]
-            + "` is on the emulator\n\n"
+            + "` is on "
+            + where
+            + "\n\n"
         )
     return head
 
 
-def install_menu_markdown(package: str = "", *, probed: bool = True) -> str:
+def install_menu_markdown(
+    package: str = "", *, probed: bool = True, where: str = "the emulator"
+) -> str:
     """The install-source menu, keyed like the start menu (see module doc)."""
     return (
-        _install_head(package, probed)
+        _install_head(package, probed, where)
         + _INSTALL_ASK
         + _count_word(len(INSTALL_SOURCES))
         + _INSTALL_MID

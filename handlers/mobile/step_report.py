@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Any
 
+from handlers.mobile import finish_note_hint
 from tools.mobile import (
     act_scrub,
     finish_evidence,
@@ -124,10 +125,12 @@ def _summary_kwargs(run_id: str, coverage: str) -> dict[str, Any]:
 def _finish_extras_sync(run_id: str, rows: list) -> str:
     know = knowledge_close.learn_line(run_id)
     know = "\n\nKnowledge: " + know if know else ""
+    found = (session_runs.resolve(run_id) or {}).get("content") or {}
     return (
         finish_secret_scan.scan_line(run_id)
         + finish_evidence.evidence_table(run_id, rows)
         + know
+        + finish_note_hint.hint(rows, str(found.get("package") or ""))
     )
 
 

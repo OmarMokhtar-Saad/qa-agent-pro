@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.152.0] - 2026-10-21
+## [1.153.0] - 2026-10-22
 
 ### Added
 
@@ -183,6 +183,54 @@ project adheres to [Semantic Versioning](https://semver.org/).
   whose server died is closed on the next start; the report says why.
 - screen_changed after only waits is judged by the wait's own result,
   and the reply says it is weak and to use assert text_absent.
+- A run that passed but had failed turns, or typed inputs (OTP,
+  passwords) that could not be read back, now says so on the result
+  line as a caveat, and the final verdict records the unconfirmed
+  input count.
+- When a wait times out right after a tap that changed nothing on
+  screen, the tap and the wait now say so, so the tap is not mistaken
+  for a working one.
+- Packages not installed now name the device you are actually using
+  (phone or emulator), and the install menu says device, not emulator.
+- A physical phone no longer gets emulator (AVD) speed advice in the
+  start reply, and qa-doctor no longer prints emulator-weight or
+  'emulator not running' lines when a phone is attached.
+- The start reply lists which runtime permissions were pre-granted and
+  how to test the prompt instead; a run that pre-grants nothing no
+  longer shows a note left over from an earlier aborted start.
+- Plain qa-doctor no longer says 'Ready, with warnings' only because
+  Jira's MCP entry was not checked.
+- qa_list_devices says which listed devices the Android-only run lane
+  can use when several are attached.
+- The full text of long tool replies is now kept on disk in a separate,
+  bounded log next to the server log (scrubbed of secrets, readable
+  only by you, mode 0600, up to 64,000 characters per reply); the
+  server log points to it and logs which saved flows it offered.
+- When a screenshot is requested the tool says the picture goes to the
+  run report and how to flag visual issues with finding=..., instead
+  of only saying it is not shared.
+- An assert right after a screen change, or on a half-drawn screen,
+  waits up to 3 s for the element or text; if it still fails it names
+  the ids on screen.
+- A typed field that read back empty mid-transition is re-read from
+  the settled screen and reported as typed when the text is there.
+- Text waits, taps and asserts match Arabic text drawn in
+  presentation-form glyphs; a near match in another Arabic or Persian
+  letter form is named as a hint only.
+- Waits that never match stop within their max_s, and give up after
+  10 s of an unchanged screen even without the accessibility service.
+- Very short steps no longer leave a missing or unplayable screen clip:
+  recording is stopped only after its file exists. The 'step ended
+  before the recorder opened its file' note now shows only when the
+  step really was that short.
+- Text matching folds look-alike characters (superscripts, full-width
+  forms), so a tap on "2" may be reported as ambiguous with "²"
+  instead of picking one.
+- A long run now saves its first flow packets, marked not reached,
+  instead of saving nothing.
+- After a failed or warned run, the finish reply tells the chat how to
+  save a known issue, and fact notes show at later starts.
+- An explore turn title names every auto-replayed flow.
 - Programs the server starts (adb, the screen recorder, ffmpeg) no
   longer share its input with the editor, so they cannot swallow tool
   calls any more. A tool call that gets no answer within 110 s is now

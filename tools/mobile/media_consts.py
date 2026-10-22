@@ -40,6 +40,10 @@ MAX_CLIPS_PER_CASE = 40
 #: cap with no ceiling.
 MAX_STOP_WAIT_S = 4
 
+#: Seconds a fresh recorder gets to open its output file before a step may stop
+#: it (``media_ready``): a shorter step waits for the file, a longer one pays nothing.
+RECORDER_OPEN_S = 3
+
 #: Seconds of one segment of the run-long recording (``media_run``). The
 #: device's own screenrecord limit is 180 s, so a segment ends under it and the
 #: next one starts.

@@ -23,6 +23,7 @@ from tools.mobile import (
     kstg_flow_build,
     kstg_flow_cut,
     kstg_flow_dedupe,
+    kstg_flow_fit,
     kstg_flow_gate,
     kstg_flow_goal,
     kstg_flow_merge,
@@ -71,24 +72,6 @@ def _save(package: str, packet: _Packet) -> _Outcome:
     return _Outcome("", note, packet.name)
 
 
-def _packets(recs: list) -> tuple:
-    """``(packets, why)``: the replayable prefix packets, or why nothing is saved.
-
-    A run whose every step is kept (it reached the goal) may take up to
-    ``MAX_REACHED_PACKETS`` packets; a partial prefix keeps ``MAX_FLOW_PACKETS``.
-    """
-    packets = kstg_flow_packets.chunk([r["flow_action"] for r in recs])
-    if not packets:
-        return [], "the first step cannot be replayed on its own; nothing saved"
-    limit = kstg_flow_packets.MAX_FLOW_PACKETS
-    if kstg_flow_meta.all_kept(recs, packets):
-        limit = kstg_flow_packets.MAX_REACHED_PACKETS
-    if len(packets) > limit:
-        why = "flow needs %d packets (%d steps), over the %d-packet limit"
-        return [], why % (len(packets), len(recs), limit) + "; nothing saved"
-    return packets, ""
-
-
 def _plan(goal: str, recs: list, packets: list) -> list:
     done = kstg_flow_meta.all_kept(recs, packets)
     metas = kstg_flow_meta.packet_metas(recs, packets, done)
@@ -118,9 +101,11 @@ def _save_all(lc, goal_recs: tuple, result: StageResult) -> None:
     if refused:
         result.notes.append("%s: not saved, %s" % (lc.package, refused))
         return
-    packets, why = _packets(recs)
+    recs, packets, why = kstg_flow_fit.fit(recs)
     if why:
         result.notes.append("%s: %s" % (lc.package, why))
+    if not packets:
+        result.notes.append("%s: no replayable first step; nothing saved" % lc.package)
         return
     _commit(lc.package, (goal, recs, packets), result)
 

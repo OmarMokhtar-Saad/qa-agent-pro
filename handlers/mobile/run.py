@@ -12,7 +12,7 @@ import logging
 from typing import Any
 
 from handlers import _common, _elicit, mobile_gate
-from handlers.mobile import run_background
+from handlers.mobile import run_background, run_grant_note
 from handlers.mobile.run_app import _mobile_app_stage as mobile_app_stage
 from handlers.mobile.run_capture import _CaptureCall, _mobile_capture_stage
 from handlers.mobile.run_device import (  # noqa: F401
@@ -157,8 +157,9 @@ async def _mobile_prepare_app(
 
 
 async def _start_notes(serial: str) -> str:
-    """Notes that go before the start reply: skipped install, heavy AVD."""
-    return await take_note(serial) + await _mobile_heavy_avd_note(serial)
+    """Notes before the start reply: skipped install, pre-grant, heavy AVD."""
+    notes = await take_note(serial) + run_grant_note.take(serial)
+    return notes + await _mobile_heavy_avd_note(serial)
 
 
 async def _mobile_new_run(req: _MobileTestRequest) -> str:

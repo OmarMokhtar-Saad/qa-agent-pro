@@ -22,7 +22,7 @@ def _no_package_row() -> dict:
             "no target app package was given",
             "Tell the mobile lane which app to test: a local APK "
             "path, a download URL, a Play Store listing, or the "
-            "package name of an app already on the emulator.",
+            "package name of an app already on the device.",
         ),
     )
 
@@ -77,7 +77,7 @@ async def _package_row(package: str, dev: _Dev) -> dict:
         if present
         else "Install the app first: give the mobile lane an "
         "APK path or a download URL, or open its Play Store "
-        "listing on the emulator."
+        "listing on the device."
     )
     return rows.record_row("package_installed", rows._Row(present, detail, fix))
 

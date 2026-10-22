@@ -14,6 +14,7 @@ from tools.mobile.replay.screen import (
     _typed_by_script,
 )
 from tools.mobile.replay.verdicts_wait_evidence import change_evidence, wait_verdict
+from tools.mobile.text_fold import fold
 
 
 class AssertView(NamedTuple):
@@ -116,7 +117,7 @@ def _assert_new_text(action: Any, view: AssertView) -> tuple[bool, str]:
     contains = " ".join(str(getattr(action, "contains", "") or "").split())
     added = _new_text_added(view.screen, view.trace, view.baseline)
     if contains:
-        added = [item for item in added if contains.lower() in item.lower()]
+        added = [item for item in added if fold(contains) in fold(item)]
     if added:
         return True, _new_text_reply(added)
     return False, (

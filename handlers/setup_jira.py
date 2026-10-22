@@ -79,7 +79,7 @@ async def _atlassian_part(run: setup_state._SetupRun) -> tuple[bool, list[str]]:
         )
     else:
         _atlassian_lines, _atlassian_advisories = [], []
-    run.recommended.extend(_atlassian_advisories)
+    (run.recommended if run.fix else run.optional).extend(_atlassian_advisories)
     _hint = (
         connect_hint_line(workspace_roots=run.workspace_roots, verify_offered=True)
         if _jira_used

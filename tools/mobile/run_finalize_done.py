@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from tools.mobile import run_finalize, run_idle_words, session_records
+from tools.mobile import render_tally, run_finalize, run_idle_words, session_records
 from tools.mobile.run_verdict import Verdict
 
 logger = logging.getLogger("tools.mobile.session")
@@ -63,12 +63,19 @@ def _reason(word: str, rows: list) -> str:
     return _count_line(word, rows, done)
 
 
+def _hurt(word: str, rows: list) -> tuple[int, int, int]:
+    """(failed, interrupted, unconfirmed inputs) of a passed run, else zeros."""
+    if word != "pass":
+        return 0, 0, 0
+    return (*_counts(rows), render_tally.unconfirmed_inputs(rows))
+
+
 def record(run_id: str, resolved: Any, rows: Any) -> bool:
     """Finalize *run_id* with the verdict its report states. True when written."""
     listed = [r for r in list(rows or []) if isinstance(r, dict)]
     word = session_records.run_verdict(resolved, listed)
-    failed, stopped = _counts(listed) if word == "pass" else (0, 0)
-    verdict = Verdict(word, _reason(word, listed), ("run report",), failed, stopped)
+    hurt = _hurt(word, listed)
+    verdict = Verdict(word, _reason(word, listed), ("run report",), *hurt)
     try:
         written = run_finalize.finalize(run_id, verdict, stop=STOP_COMPLETED)
     except RuntimeError:  # finalize raises this; the report must still reach the tester

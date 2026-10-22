@@ -6,6 +6,7 @@ Part of the ``tools.log_setup`` facade; see its docstring for the design.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -35,6 +36,25 @@ class FileLoggingOptions:
     backup_count: int | None = None
     pid: int | None = None
     target: logging.Logger | None = None
+    private: bool = False  # every file the handler creates is 0600 from creation
+
+
+def _private_opener(path: str, flags: int) -> int:
+    """``open`` opener: the file is created 0600, whatever the umask."""
+    return os.open(path, flags, 0o600)
+
+
+class PrivateRotatingFileHandler(RotatingFileHandler):
+    """A rotating handler whose live file, and each rotated re-creation, is 0600."""
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        return open(
+            self.baseFilename,
+            self.mode,
+            encoding=self.encoding,
+            errors=self.errors,
+            opener=_private_opener,
+        )
 
 
 def _attached(owner: logging.Logger, path: Path) -> logging.Handler | None:
@@ -50,7 +70,8 @@ def _open_handler(
 ) -> RotatingFileHandler:
     """A configured rotating handler for *path* (budgets default to the module's)."""
 
-    handler = RotatingFileHandler(
+    kind = PrivateRotatingFileHandler if opts.private else RotatingFileHandler
+    handler = kind(
         str(path),
         maxBytes=MAX_BYTES if opts.max_bytes is None else int(opts.max_bytes),
         backupCount=(

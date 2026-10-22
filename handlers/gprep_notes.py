@@ -122,7 +122,7 @@ def _image_gap_message(g: _GapMsg) -> str:
 #     is evidence the host's model read them. Saying "you told me" about those
 #     would be an over-claim in the other direction. It is deliberately NOT
 #     phrased as "the host received N": the per-result byte/count budget in
-#     _select_prepare_images runs after the stamp and NAMES anything it drops,
+#     `_budget_keep_flags` runs after the stamp and NAMES anything it drops,
 #     so this note points at that disclosure instead of contradicting it.
 #
 # Until 2026-08-09 this bailed on ``attested <= 0``, which made the strong

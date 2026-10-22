@@ -7,6 +7,7 @@ import time
 from tools.mobile import step_timing
 from tools.mobile.replay.context import ReplayStop, _append, _ReplayRun, _result
 from tools.mobile.replay.context_consts import STATUS_NEEDS_MODEL
+from tools.mobile.replay.dead_tap_note import note_dead_tap
 from tools.mobile.replay.screen import _stamp_after
 from tools.mobile.replay.settle_mark import SettleJob, SettleOpts
 from tools.mobile.replay.settle_run import _settle
@@ -49,6 +50,7 @@ def _wait_timeout_stop(run: _ReplayRun, view: StopView) -> dict:
     entry, screen = view
     entry["outcome"] = "wait_timeout"
     _append(run.trace, entry)
+    note_dead_tap(run.trace)
     stop = ReplayStop(
         STATUS_NEEDS_MODEL, run.trace, screen, "", entry["detail"], entry["index"]
     )

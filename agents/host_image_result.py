@@ -9,7 +9,7 @@ from agents.host_ac_result import _AC_URL_RE
 from config.settings_guard import never_raise
 
 # Shape caps on the UNTRUSTED `image_descriptions` field. Corpus-independent:
-# _select_prepare_images caps how many images can be forwarded in the first
+# `_budget_keep_flags` caps how many images can be forwarded in the first
 # place, so a list far longer than that is a malformed field, not a richer
 # ticket. The per-description cap is generous (a UI screenshot legitimately
 # enumerates many controls) but finite.

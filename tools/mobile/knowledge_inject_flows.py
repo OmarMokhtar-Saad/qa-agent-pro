@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from tools.mobile import flow_goal_fit, knowledge_inject, kstg_flow_packets
 
+logger = logging.getLogger(__name__)
 _PRIO = 1
 #: Most saved flows told in the start block (one per route shape, best first).
 MAX_FLOWS = 3
@@ -110,6 +113,12 @@ def _why(got: list) -> str:
     return " Offered because " + " and ".join(bits) + "."
 
 
+def _log_offered(items: list) -> None:
+    """Say in the log which saved flows this run was offered (first = auto-replay)."""
+    if items:
+        logger.info("offered flows: %s", ", ".join(str(i["id"]) for i in items))
+
+
 def flows(snap: dict, key) -> list:
     """The best saved flows, one per route shape (packets grouped), said why; stable block only."""
     if key is not None:
@@ -119,6 +128,7 @@ def flows(snap: dict, key) -> list:
     ranked = sorted(best.items(), key=lambda kv: _rank(kv[1], run), reverse=True)
     items = [_item(base, got) for base, got in ranked[:MAX_FLOWS]]
     out = [dict(i, text=i["text"] + _why(g)) for i, (_, g) in zip(items, ranked)]
+    _log_offered(out)
     return out[:1] + [dict(i, text=i["text"].replace(_AUTO, " ")) for i in out[1:]]
 
 

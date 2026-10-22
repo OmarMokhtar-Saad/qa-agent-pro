@@ -22,15 +22,15 @@ MOBILE_SOURCES: tuple[tuple[str, str], ...] = (
     ("resume", "Resume a run that is already in progress"),
 )
 
-#: How the app under test gets onto the emulator. Every one of these needs
+#: How the app under test gets onto the device. Every one of these needs
 #: ``apply=true``. ``local_apk`` installs from here and ``app_tester`` taps App
 #: Tester's own Download button and the system installer; ``download_url`` and
-#: ``play_store`` hand the tester the emulator's own UI.
+#: ``play_store`` hand the tester the device's own UI.
 INSTALL_SOURCES: tuple[tuple[str, str], ...] = (
     ("local_apk", "Install an .apk from a path on this machine"),
-    ("download_url", "Open a download link inside the emulator's browser"),
+    ("download_url", "Open a download link in the device's browser"),
     ("app_tester", "Install from Firebase App Tester on the device"),
-    ("play_store", "Open the Play Store inside the emulator and install from there"),
+    ("play_store", "Open the Play Store on the device and install from there"),
     (
         "installed_package",
         "Use an app that is already installed (give its package name)",

@@ -5,11 +5,16 @@ from __future__ import annotations
 import time
 
 from tools.mobile.replay.context import Context
+from tools.mobile.replay.context_consts import DEFAULT_WAIT_UNTIL_TEXT_S
 from tools.mobile.replay.screen import _screen_has, _screen_hash, absent_from
 from tools.mobile.replay.waits_idle import probe_idle
 from tools.mobile.replay.waits_poll import _wait_for
 from tools.mobile.replay.waits_types import Probe, TextWait
-from tools.mobile.replay.waits_visual import fresh_screen, note_source
+from tools.mobile.replay.waits_visual import (
+    fresh_screen,
+    note_source,
+    recheck_reserve_ms,
+)
 
 
 async def _wait_until_text(ctx: Context, screen: object, want: TextWait) -> tuple:
@@ -36,11 +41,13 @@ async def _wait_until_text(ctx: Context, screen: object, want: TextWait) -> tupl
 
 async def _recheck(ctx: Context, screen: object, probe: Probe) -> tuple:
     """Poll; a timed-out text wait looks once more at a fresh non-accessibility read (G03)."""
-    done = await _wait_for(ctx, screen, probe)
+    ms = probe.ms or int(DEFAULT_WAIT_UNTIL_TEXT_S * 1000)
+    reserve = recheck_reserve_ms(ms, ctx.serial)  # the fresh read stays inside max_s
+    done = await _wait_for(ctx, screen, probe._replace(ms=ms - reserve))
     found, _screen, timed_out = done
     if found or ctx.wait_interruption or not timed_out:
         return done
-    fresh = await fresh_screen(ctx)
+    fresh = await fresh_screen(ctx, reserve / 1000)
     if fresh is not None and probe.met(None, fresh):
         return True, fresh, False
     note_source(ctx, fresh is not None)

@@ -94,8 +94,9 @@ def _wait_until_tail() -> str:
         ", ".join(ASSERT_KINDS)
         + ". text_present/text_absent: the string in `text` OR `target.text` "
         "(`text` wins). assert visual takes `note` (what to judge), must be "
-        "the LAST action, and your next reply carries the screenshot; use it "
-        "only for what the element list cannot say (layout, colour, image, chart)."
+        "the LAST action; the server saves the screenshot for the report and the "
+        "tester judges it (you do not receive the picture). Use it only for what "
+        "the element list cannot say (layout, colour, image, chart)."
     )
 
 
